@@ -292,7 +292,10 @@ jobs:
   build-arch:
     needs: validate
     runs-on: ubuntu-24.04
-    container: archlinux:latest
+    container:
+      image: archlinux:latest
+      # Reap command children orphaned during the process-group lifecycle tests, as main CI does.
+      options: --init
     steps:
       # Install Git before checkout. Otherwise actions/checkout falls back to a
       # REST archive, and the exact-SHA source tarball cannot be produced.

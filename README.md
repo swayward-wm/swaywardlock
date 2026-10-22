@@ -16,10 +16,10 @@ EGL/OpenGL ES.
 The migration aids `swaywardlock-swaylock-to-kdl` and `swaywardlock-hyprlock-to-kdl`
 convert your current config to swaywardlock's and report omissions.
 
-**Status: early.** The swaylock-style process conventions and the widgets described here are
-implemented and tested headless; this is not a claim of complete hyprlock parity.
-Nobody uses it daily on real hardware yet, including the maintainer, who is mostly busy writing
-tests.
+**Status: beta.** The maintainer now uses swaywardlock on a real swayward desktop, with the
+ring glow-up layout and working PAM authentication. That is one installation, not a hardware
+survey. The widgets and swaylock-style process conventions are tested headless too; this is
+not a claim of complete hyprlock parity. The maintainer is still mostly busy writing tests.
 
 ## Why it exists
 

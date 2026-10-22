@@ -2583,7 +2583,7 @@ dependencies = [
 
 [[package]]
 name = "swaywardlock"
-version = "0.1.0"
+version = "26.10.0-beta.1"
 dependencies = [
  "anyhow",
  "calloop",

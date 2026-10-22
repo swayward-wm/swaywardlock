@@ -1,6 +1,6 @@
 [package]
 name = "swaywardlock"
-version = "0.1.0"
+version = "26.10.0-beta.1"
 description = "Screen locker for the swayward-wm family"
 authors = ["Martin Trojer"]
 license = "GPL-3.0-or-later"

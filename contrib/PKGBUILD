@@ -26,8 +26,8 @@
 # waits until the release packages have survived real installations.
 
 pkgname=swaywardlock
-pkgver=0.1.0
-_tagver=0.1.0
+pkgver=26.10.0beta1
+_tagver=26.10.0-beta.1
 pkgrel=1
 pkgdesc="Screen locker for the swayward-wm family (ext-session-lock-v1, hyprlock-style widgets)"
 arch=('x86_64' 'aarch64')
