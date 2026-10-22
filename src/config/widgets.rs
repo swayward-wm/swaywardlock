@@ -5,8 +5,9 @@ use std::str::FromStr;
 
 use knuffel::errors::DecodeError;
 
-use super::copied::color::Color;
+use super::copied::color::{Color, CornerRadius, Gradient};
 use super::copied::effects::{Blur, BlurPart};
+use super::copied::shadow::{Shadow, ShadowRule};
 use super::copied::utils::{FloatOrInt, MergeWith as _};
 
 // A handful of widgets, decoded once: the size difference does not matter.
@@ -15,6 +16,10 @@ use super::copied::utils::{FloatOrInt, MergeWith as _};
 pub enum Widget {
     Background(Background),
     RingIndicator(RingIndicator),
+    Shape(Shape),
+    Label(Label),
+    Image(ImageWidget),
+    InputField(InputField),
 }
 
 impl Widget {
@@ -22,8 +27,193 @@ impl Widget {
         match self {
             Widget::Background(w) => &w.common,
             Widget::RingIndicator(w) => &w.common,
+            Widget::Shape(w) => &w.common,
+            Widget::Label(w) => &w.common,
+            Widget::Image(w) => &w.common,
+            Widget::InputField(w) => &w.common,
         }
     }
+}
+
+/// Text (hyprlock's `label`). `text` is a template: `$VARIABLES` and an optional `cmd[...]`
+/// prefix, in hyprlock's syntax.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Label {
+    pub common: Common,
+    pub text: String,
+    /// Pango font description, e.g. "Sans Bold 24".
+    pub font: String,
+    pub color: Color,
+    pub align: TextAlign,
+    /// Pango markup is on by default, as in hyprlock.
+    pub markup: bool,
+}
+
+impl Default for Label {
+    fn default() -> Self {
+        Self {
+            common: Common::with_z(0),
+            text: String::new(),
+            font: "Sans 16".into(),
+            color: hex(0xffffffff),
+            align: TextAlign::Center,
+            markup: true,
+        }
+    }
+}
+
+#[derive(knuffel::DecodeScalar, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextAlign {
+    Left,
+    Center,
+    Right,
+}
+
+/// hyprlock's password field: a rounded box with an outline, dots for typed characters, and
+/// placeholder / checking / failure text. Colour precedence follows hyprlock's `updateColors`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InputField {
+    pub common: Common,
+    pub size: (Length, Length),
+    /// `None` means fully round (hyprlock's `rounding -1`, its default).
+    pub corner_radius: Option<CornerRadius>,
+    pub inner_color: Color,
+    /// Outline width and its idle colour/gradient (hyprlock's outline_thickness/outer_color).
+    pub outline: Border,
+    pub font: String,
+    pub font_color: Color,
+    pub placeholder: String,
+    pub dots: Dots,
+    pub hide_input: Option<Color>,
+    pub fade_on_empty: Option<u32>,
+    pub check: StateStyle,
+    pub fail: StateStyle,
+    pub capslock_color: Option<Gradient>,
+    pub numlock_color: Option<Gradient>,
+    pub bothlock_color: Option<Gradient>,
+    pub invert_numlock: bool,
+    pub swap_font_color: bool,
+    pub shadow: Shadow,
+}
+
+/// The colour and text shown in a state (checking, failed).
+#[derive(Debug, Clone, PartialEq)]
+pub struct StateStyle {
+    pub color: Gradient,
+    pub text: String,
+}
+
+/// Dot rounding, with hyprlock's `dots_rounding` sentinels.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DotRadius {
+    /// `-1`: round dots.
+    Round,
+    /// `-2`: follow the field's rounding, scaled by the dot size.
+    Inherit,
+    Px(f64),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Dots {
+    /// Dot size as a fraction of the field height (hyprlock clamps to 0.001..0.8).
+    pub size: f64,
+    /// Gap as a fraction of the dot size (hyprlock: -1..1).
+    pub spacing: f64,
+    pub center: bool,
+    pub corner_radius: DotRadius,
+    /// Draw this text per character instead of a dot (hyprlock's dots_text_format).
+    pub text: Option<String>,
+}
+
+impl Default for InputField {
+    /// hyprlock's defaults (ConfigManager.cpp).
+    fn default() -> Self {
+        Self {
+            common: Common::with_z(0),
+            size: (Length::Px(400.), Length::Px(90.)),
+            corner_radius: None,
+            inner_color: hex(0xddddddff),
+            outline: Border {
+                width: 4.,
+                gradient: Gradient::from(hex(0x111111ff)),
+            },
+            font: "Sans".into(),
+            font_color: hex(0x000000ff),
+            placeholder: "<i>Input Password</i>".into(),
+            dots: Dots {
+                size: 0.25,
+                spacing: 0.2,
+                center: true,
+                corner_radius: DotRadius::Round,
+                text: None,
+            },
+            hide_input: None,
+            fade_on_empty: Some(2000),
+            check: StateStyle {
+                color: Gradient::from(hex(0x22cc88ff)),
+                text: String::new(),
+            },
+            fail: StateStyle {
+                color: Gradient::from(hex(0xcc2222ff)),
+                text: "<i>$FAIL</i>".into(),
+            },
+            capslock_color: None,
+            numlock_color: None,
+            bothlock_color: None,
+            invert_numlock: false,
+            swap_font_color: false,
+            shadow: Shadow::default(),
+        }
+    }
+}
+
+/// A picture, e.g. an avatar (hyprlock's `image`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImageWidget {
+    pub common: Common,
+    pub path: PathBuf,
+    /// The shorter side after scaling, in logical pixels (hyprlock's `size`); the image keeps
+    /// its aspect ratio.
+    pub size: f64,
+    /// `None` means a circle (hyprlock's `rounding -1`, its default).
+    pub corner_radius: Option<CornerRadius>,
+    pub border: Option<Border>,
+    pub shadow: Shadow,
+}
+
+/// A rectangle with optional rounded corners, border and shadow (hyprlock's `shape`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Shape {
+    pub common: Common,
+    pub size: (Length, Length),
+    pub color: Color,
+    /// `None` means fully round (hyprlock's `rounding -1`): half the shorter side.
+    pub corner_radius: Option<CornerRadius>,
+    pub border: Option<Border>,
+    pub shadow: Shadow,
+    /// Cut through to the background instead of painting (hyprlock's `xray`).
+    pub xray: bool,
+}
+
+impl Default for Shape {
+    fn default() -> Self {
+        Self {
+            common: Common::with_z(0),
+            size: (Length::Px(100.), Length::Px(100.)),
+            color: hex(0x111111ff),
+            corner_radius: Some(CornerRadius::default()),
+            border: None,
+            shadow: Shadow::default(),
+            xray: false,
+        }
+    }
+}
+
+/// A border line: width plus a colour or a gradient, in swayward's syntax.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Border {
+    pub width: f64,
+    pub gradient: Gradient,
 }
 
 /// Properties every widget accepts.
@@ -129,9 +319,15 @@ pub enum Fit {
 pub struct Background {
     pub common: Common,
     pub color: Color,
+    /// Use a screenshot of the output taken before locking (hyprlock's `path screenshot`).
+    pub screenshot: bool,
     pub path: Option<PathBuf>,
     pub fit: Fit,
     pub blur: Blur,
+    /// hyprlock's blur prepare/finish adjustments: contrast and brightness (>1 brightens) before
+    /// the blur, brightness (<1 dims) after it. 1.0 leaves the image alone.
+    pub contrast: f64,
+    pub brightness: f64,
 }
 
 impl Default for Background {
@@ -140,12 +336,15 @@ impl Default for Background {
             common: Common::with_z(-1),
             // swaylock's default background colour.
             color: Color::from_rgba8_unpremul(0xa3, 0xa3, 0xa3, 0xff),
+            screenshot: false,
             path: None,
             fit: Fit::default(),
             blur: Blur {
                 off: true,
                 ..Blur::default()
             },
+            contrast: 1.,
+            brightness: 1.,
         }
     }
 }
@@ -402,11 +601,14 @@ impl<S: knuffel::traits::ErrorSpan> knuffel::Decode<S> for Background {
         for child in decode_common(node, ctx, &mut bg.common)? {
             match &**child.node_name {
                 "color" => bg.color = color(child, ctx)?,
+                "screenshot" => bg.screenshot = flag(child, ctx)?,
                 "path" => {
                     let path: PathBuf = arg(child, ctx)?;
                     bg.path = Some(expand_home(path));
                 }
                 "fit" => bg.fit = arg(child, ctx)?,
+                "contrast" => bg.contrast = arg::<_, FloatOrInt<0, 10>>(child, ctx)?.0,
+                "brightness" => bg.brightness = arg::<_, FloatOrInt<0, 10>>(child, ctx)?.0,
                 "blur" => {
                     // A `blur` block turns blur on unless it says `off`.
                     let part: BlurPart = knuffel::Decode::decode_node(child, ctx)?;
@@ -556,4 +758,263 @@ fn decode_state<S: knuffel::traits::ErrorSpan>(
         *set.get_mut(state) = c;
     }
     Ok(())
+}
+
+/// `corner-radius 12`, `corner-radius 1 2 3 4` (swayward's syntax) or `corner-radius "full"`.
+fn decode_corner_radius<S: knuffel::traits::ErrorSpan>(
+    node: &Node<S>,
+    ctx: &mut Ctx<S>,
+) -> Result<Option<CornerRadius>, DecodeError<S>> {
+    if let [only] = &node.arguments[..] {
+        if let knuffel::ast::Literal::String(s) = &*only.literal {
+            return if &**s == "full" {
+                Ok(None)
+            } else {
+                Err(DecodeError::conversion(
+                    &only.literal,
+                    "expected a number or \"full\"",
+                ))
+            };
+        }
+    }
+    Ok(Some(knuffel::Decode::decode_node(node, ctx)?))
+}
+
+/// `border { width 2; color "#fff"; }` or `border { width 2; gradient from=.. to=..; }`.
+fn decode_border<S: knuffel::traits::ErrorSpan>(
+    node: &Node<S>,
+    ctx: &mut Ctx<S>,
+) -> Result<Border, DecodeError<S>> {
+    super::copied::utils::expect_only_children(node, ctx);
+    let mut width = 2.;
+    let mut gradient = None;
+    for child in node.children() {
+        match &**child.node_name {
+            "width" => width = arg::<_, FloatOrInt<0, 1000>>(child, ctx)?.0,
+            "color" => gradient = Some(Gradient::from(color(child, ctx)?)),
+            "gradient" => gradient = Some(knuffel::Decode::decode_node(child, ctx)?),
+            _ => unexpected(child, ctx),
+        }
+    }
+    let gradient =
+        gradient.ok_or_else(|| DecodeError::missing(node, "border needs `color` or `gradient`"))?;
+    Ok(Border { width, gradient })
+}
+
+/// A `shadow { ... }` block in swayward's syntax; present means on unless it says `off`.
+fn decode_shadow<S: knuffel::traits::ErrorSpan>(
+    node: &Node<S>,
+    ctx: &mut Ctx<S>,
+    shadow: &mut Shadow,
+) -> Result<(), DecodeError<S>> {
+    let part: ShadowRule = knuffel::Decode::decode_node(node, ctx)?;
+    if part.draw_behind_window.is_some() || part.inactive_color.is_some() {
+        ctx.emit_error(DecodeError::unexpected(
+            node,
+            "node",
+            "draw-behind-window and inactive-color apply to swayward windows only",
+        ));
+    }
+    shadow.on = true;
+    shadow.merge_with(&part);
+    Ok(())
+}
+
+impl<S: knuffel::traits::ErrorSpan> knuffel::Decode<S> for Shape {
+    fn decode_node(node: &Node<S>, ctx: &mut Ctx<S>) -> Result<Self, DecodeError<S>> {
+        let mut shape = Shape::default();
+        for child in decode_common(node, ctx, &mut shape.common)? {
+            match &**child.node_name {
+                "size" => shape.size = decode_pair(child, ctx)?,
+                "color" => shape.color = color(child, ctx)?,
+                "corner-radius" => shape.corner_radius = decode_corner_radius(child, ctx)?,
+                "border" => shape.border = Some(decode_border(child, ctx)?),
+                "shadow" => decode_shadow(child, ctx, &mut shape.shadow)?,
+                "xray" => shape.xray = flag(child, ctx)?,
+                _ => unexpected(child, ctx),
+            }
+        }
+        Ok(shape)
+    }
+}
+
+impl<S: knuffel::traits::ErrorSpan> knuffel::Decode<S> for Label {
+    fn decode_node(node: &Node<S>, ctx: &mut Ctx<S>) -> Result<Self, DecodeError<S>> {
+        let mut label = Label::default();
+        let mut has_text = false;
+        for child in decode_common(node, ctx, &mut label.common)? {
+            match &**child.node_name {
+                "text" => {
+                    label.text = arg(child, ctx)?;
+                    has_text = true;
+                }
+                "font" => label.font = arg(child, ctx)?,
+                "color" => label.color = color(child, ctx)?,
+                "align" => label.align = arg(child, ctx)?,
+                "markup" => label.markup = flag(child, ctx)?,
+                _ => unexpected(child, ctx),
+            }
+        }
+        if !has_text {
+            return Err(DecodeError::missing(node, "label needs `text`"));
+        }
+        Ok(label)
+    }
+}
+
+impl<S: knuffel::traits::ErrorSpan> knuffel::Decode<S> for ImageWidget {
+    fn decode_node(node: &Node<S>, ctx: &mut Ctx<S>) -> Result<Self, DecodeError<S>> {
+        let mut common = Common::with_z(0);
+        let mut path = None;
+        let mut size = 150.;
+        let mut corner_radius = None;
+        let mut border = None;
+        let mut shadow = Shadow::default();
+        for child in decode_common(node, ctx, &mut common)? {
+            match &**child.node_name {
+                "path" => path = Some(expand_home(arg(child, ctx)?)),
+                "size" => size = arg::<_, FloatOrInt<1, 10000>>(child, ctx)?.0,
+                "corner-radius" => corner_radius = decode_corner_radius(child, ctx)?,
+                "border" => border = Some(decode_border(child, ctx)?),
+                "shadow" => decode_shadow(child, ctx, &mut shadow)?,
+                _ => unexpected(child, ctx),
+            }
+        }
+        let path = path.ok_or_else(|| DecodeError::missing(node, "image needs `path`"))?;
+        Ok(ImageWidget {
+            common,
+            path,
+            size,
+            corner_radius,
+            border,
+            shadow,
+        })
+    }
+}
+
+/// `color "#.."` or `gradient from=.. to=..` among a node's children.
+fn colour_or_gradient<S: knuffel::traits::ErrorSpan>(
+    node: &Node<S>,
+    ctx: &mut Ctx<S>,
+) -> Result<Gradient, DecodeError<S>> {
+    match &*node.node_name {
+        n if n.ends_with("gradient") => knuffel::Decode::decode_node(node, ctx),
+        _ => Ok(Gradient::from(color(node, ctx)?)),
+    }
+}
+
+/// `check { color ..; text ..; }` / `fail { gradient ..; text ..; }`
+fn decode_state_style<S: knuffel::traits::ErrorSpan>(
+    node: &Node<S>,
+    ctx: &mut Ctx<S>,
+    style: &mut StateStyle,
+) -> Result<(), DecodeError<S>> {
+    super::copied::utils::expect_only_children(node, ctx);
+    for child in node.children() {
+        match &**child.node_name {
+            "color" | "gradient" => style.color = colour_or_gradient(child, ctx)?,
+            "text" => style.text = arg(child, ctx)?,
+            _ => unexpected(child, ctx),
+        }
+    }
+    Ok(())
+}
+
+impl<S: knuffel::traits::ErrorSpan> knuffel::Decode<S> for InputField {
+    fn decode_node(node: &Node<S>, ctx: &mut Ctx<S>) -> Result<Self, DecodeError<S>> {
+        let mut f = InputField::default();
+        for child in decode_common(node, ctx, &mut f.common)? {
+            match &**child.node_name {
+                "size" => f.size = decode_pair(child, ctx)?,
+                "corner-radius" => f.corner_radius = decode_corner_radius(child, ctx)?,
+                "inner-color" => f.inner_color = color(child, ctx)?,
+                "outline" => f.outline = decode_border(child, ctx)?,
+                "font" => f.font = arg(child, ctx)?,
+                "font-color" => f.font_color = color(child, ctx)?,
+                "placeholder-text" => f.placeholder = arg(child, ctx)?,
+                "dots" => {
+                    for (name, val) in &child.properties {
+                        match &***name {
+                            "size" => {
+                                let v: FloatOrInt<0, 1> = knuffel::traits::DecodeScalar::decode(val, ctx)?;
+                                f.dots.size = v.0.clamp(0.001, 0.8);
+                            }
+                            "spacing" => {
+                                let v: FloatOrInt<-1, 1> = knuffel::traits::DecodeScalar::decode(val, ctx)?;
+                                f.dots.spacing = v.0;
+                            }
+                            "center" => f.dots.center = knuffel::traits::DecodeScalar::decode(val, ctx)?,
+                            "corner-radius" => {
+                                let v: FloatOrInt<-2, 1000> = knuffel::traits::DecodeScalar::decode(val, ctx)?;
+                                f.dots.corner_radius = match v.0 {
+                                    -1. => DotRadius::Round,
+                                    -2. => DotRadius::Inherit,
+                                    r if r >= 0. => DotRadius::Px(r),
+                                    _ => {
+                                        ctx.emit_error(DecodeError::conversion(
+                                            &val.literal,
+                                            "dot corner-radius must be >= 0, -1 (round) or -2 (follow the field)",
+                                        ));
+                                        DotRadius::Round
+                                    }
+                                };
+                            }
+                            "text" => f.dots.text = Some(knuffel::traits::DecodeScalar::decode(val, ctx)?),
+                            other => ctx.emit_error(DecodeError::unexpected(
+                                name,
+                                "property",
+                                format!("unexpected property `{other}`; expected size, spacing, center, corner-radius or text"),
+                            )),
+                        }
+                    }
+                }
+                "hide-input" => {
+                    // `hide-input` alone uses hyprlock's base colour; `hide-input "#..."` sets it.
+                    f.hide_input = Some(if child.arguments.is_empty() {
+                        hex(0x00ff99ee)
+                    } else {
+                        color(child, ctx)?
+                    });
+                }
+                "fade-on-empty" => {
+                    if child
+                        .arguments
+                        .first()
+                        .is_some_and(|a| matches!(&*a.literal, knuffel::ast::Literal::Bool(false)))
+                    {
+                        f.fade_on_empty = None;
+                    }
+                    for (name, val) in &child.properties {
+                        match &***name {
+                            "timeout-ms" => {
+                                f.fade_on_empty =
+                                    Some(knuffel::traits::DecodeScalar::decode(val, ctx)?)
+                            }
+                            other => ctx.emit_error(DecodeError::unexpected(
+                                name,
+                                "property",
+                                format!("unexpected property `{other}`"),
+                            )),
+                        }
+                    }
+                }
+                "check" => decode_state_style(child, ctx, &mut f.check)?,
+                "fail" => decode_state_style(child, ctx, &mut f.fail)?,
+                "capslock-color" | "capslock-gradient" => {
+                    f.capslock_color = Some(colour_or_gradient(child, ctx)?)
+                }
+                "numlock-color" | "numlock-gradient" => {
+                    f.numlock_color = Some(colour_or_gradient(child, ctx)?)
+                }
+                "bothlock-color" | "bothlock-gradient" => {
+                    f.bothlock_color = Some(colour_or_gradient(child, ctx)?)
+                }
+                "invert-numlock" => f.invert_numlock = flag(child, ctx)?,
+                "swap-font-color" => f.swap_font_color = flag(child, ctx)?,
+                "shadow" => decode_shadow(child, ctx, &mut f.shadow)?,
+                _ => unexpected(child, ctx),
+            }
+        }
+        Ok(f)
+    }
 }

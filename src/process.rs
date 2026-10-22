@@ -76,6 +76,17 @@ impl Daemon {
     }
 }
 
+/// Mark `fd` close-on-exec. Inherited descriptors such as `--ready-fd` arrive without it.
+pub fn set_cloexec(fd: i32) {
+    // SAFETY: fcntl on a caller-supplied descriptor; an invalid one just fails.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFD);
+        if flags >= 0 {
+            libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+        }
+    }
+}
+
 /// Write `\n` to the ready fd and close it, as swaylock does.
 pub fn notify_ready(fd: Option<i32>) -> anyhow::Result<()> {
     if let Some(fd) = fd {

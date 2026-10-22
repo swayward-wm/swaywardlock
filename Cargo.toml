@@ -14,6 +14,9 @@ calloop = { version = "0.14", features = ["signals"] }
 clap = { version = "4.6", features = ["derive", "env"] }
 csscolorparser = "0.9"
 fastrand = "2"
+glam = "0.33"
+keyframe = { version = "1.1.1", default-features = false }
+zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp"] }
 knuffel = "3.2.0"
 libc = "0.2"

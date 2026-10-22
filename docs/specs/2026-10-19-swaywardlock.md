@@ -74,10 +74,12 @@ swaywardlock completions <SHELL>
 | `-c, --config PATH` | both | Config path. Also `SWAYWARDLOCK_CONFIG`. Flag wins |
 | `-f, --daemonize` | swaylock | Fork into the background once locked |
 | `--ready-fd FD` | swaylock | Write `\n` to FD once locked, then close it |
-| `-g, --grace SECONDS` | hyprlock | Any key, pointer motion or touch unlocks within this window, without auth |
+| `-g, --grace SECONDS` | hyprlock | Any key, pointer button or motion unlocks within this window, without auth |
 | `--no-fade-in` | hyprlock | Skip the fade-in animation |
 | `--immediate-render` | hyprlock | Lock before screenshots and images finish loading |
 | `--display NAME` | hyprlock | Wayland display to connect to |
+| `--preview` | new | Draw in an xdg-shell window instead of locking; reload on config change (see below) |
+| `--preview-output NAME` | new | With `--preview`, the output name the window matches as |
 | `-v, --verbose` / `-q, --quiet` | hyprlock | Log level. `RUST_LOG` also works |
 | `-V, --version`, `-h, --help` | both | |
 
@@ -102,6 +104,16 @@ Exit codes:
 `swaywardlock validate` parses the config, prints miette diagnostics and
 exits 0 or 1 without connecting to Wayland.
 
+### Preview mode
+
+Added during Phase 2 for iterating on layouts. `--preview` uses the same widgets, renderer and
+input state machine as the lock, but the surface is an xdg toplevel rather than a lock surface.
+It never calls `lock()`, never starts PAM and has no unlock path; Enter runs a fake 600 ms check
+that always fails, so the verifying and wrong styling can be seen. It polls the config file and
+its includes twice a second and rebuilds on change. A parse error keeps the previous config on
+screen and prints the diagnostic. The window stands in for one output; `--preview-output` names
+it for `output=` matching. It conflicts with `-f` and `--ready-fd`.
+
 ## Config
 
 Path: `--config`, then `SWAYWARDLOCK_CONFIG`, then
@@ -117,21 +129,24 @@ Each of these decodes exactly as in swayward, from copied code:
 
 - **Colour:** any CSS colour string, `"#rrggbbaa"`, `"rgb(...)"`, names.
 - **Gradient:** `from=... to=... angle=180 in="oklch longer hue"`. Same
-  as swayward's `active-gradient`. `relative-to` does not apply and is
-  rejected.
+  as swayward's `active-gradient`, with CSS angles: 0 points up, 90 runs
+  left to right. hyprlock's angles are 90° behind (its 0 runs left to
+  right, 90 top to bottom), so a hyprlock `45deg` is `angle=135` here.
+  `relative-to` does not apply and is rejected.
 - **Blur:** `blur { passes 3; offset 3.0; noise 0.02; saturation 1.5; }`,
   swayward's dual-Kawase blur.
 - **Shadow:** `shadow { softness 30; spread 5; offset x=0 y=5; color "#00000070"; }`.
 - **Animation:** `{ duration-ms 200; curve "ease-out-cubic"; }`, or
-  `curve "cubic-bezier" a b c d`, or `spring damping-ratio=1 stiffness=800 epsilon=0.001`.
+  `curve "cubic-bezier" a b c d`, or `spring damping-ratio=1.0 stiffness=800 epsilon=0.001`
+  (the damping ratio must be written as a float).
   `off` disables one.
 - **include:** `include "path"` and `include optional=true "path"`, with
   the same recursion and error rules.
 
-hyprlock's background `contrast`, `brightness`, `vibrancy` and
-`vibrancy_darkness` do not exist in swayward's blur. They are added to the
-swaywardlock `background` node as post-process uniforms (next section).
-They are not part of the shared vocabulary.
+hyprlock's background `contrast` and `brightness` do not exist in swayward's
+blur. They are added to the swaywardlock `background` node (next section)
+and are not part of the shared vocabulary. `vibrancy` and
+`vibrancy-darkness` are Phase 3 leftovers.
 
 ### Top-level nodes
 
@@ -141,7 +156,6 @@ general {
     ignore-empty-input
     fail-timeout-ms 2000        // how long the fail state shows
     clear-input-after-ms 10000  // swaylock clears a stale buffer after 10 s
-    fractional-scale true       // false = integer scale only
 }
 
 auth {
@@ -157,12 +171,12 @@ animations {
     off                         // disables all
     fade-in   { duration-ms 200; curve "ease-out-cubic"; }
     fade-out  { duration-ms 200; curve "ease-out-cubic"; }
-    input-field-colors { duration-ms 150; curve "linear"; }
-    input-field-width  { spring damping-ratio=1 stiffness=800 epsilon=0.001; }
-    input-field-dots   { duration-ms 100; curve "ease-out-quad"; }
-    input-field-fade   { duration-ms 300; curve "ease-out-cubic"; }
+    input-field-fade { duration-ms 300; curve "ease-out-cubic"; }  // accepted; unused until fade-on-empty
 }
 ```
+
+`fractional-scale` and the `input-field-colors`, `input-field-width` and
+`input-field-dots` animations are Phase 3 leftovers and are rejected for now.
 
 Widgets follow, in any order. Any number of each kind is allowed.
 
@@ -177,10 +191,12 @@ Every widget node accepts these:
 | `halign` | `"left" "center" "right" "none"` | `"center"` | Horizontal anchor |
 | `valign` | `"top" "center" "bottom" "none"` | `"center"` | Vertical anchor |
 | `z-index` | integer | `0` (`background` -1) | Draw order. Equal z-index keeps file order |
-| `rotate` | degrees | `0` | Not on `input-field`, `ring-indicator`, `background` |
-| `shadow { ... }` | shared shadow | off | Not on `background` |
+| `shadow { ... }` | shared shadow | off | On `image`, `shape` and `input-field` |
 
-`position` uses logical pixels. Positive `y` moves up, as in hyprlock.
+`position` uses logical pixels. Positive `y` moves up, as in hyprlock. With
+`halign`/`valign "none"` the position alone places the widget, measured from
+the left / bottom edge. `rotate` (hyprlock's `rotate` on labels, images and
+shapes) is a Phase 3 leftover; label shadows are too.
 
 ### Widgets
 
@@ -194,13 +210,11 @@ background output="DP-1" {
     blur { passes 3; offset 3.0; noise 0.0117; saturation 1.0; }
     contrast 0.8917
     brightness 0.8172
-    vibrancy 0.1686
-    vibrancy-darkness 0.05
-    reload-ms 60000            // re-read path (or run reload-cmd) every N ms
-    reload-cmd "random-wallpaper"   // stdout = new path
-    crossfade-ms 500
 }
 ```
+
+hyprlock's `vibrancy`, `vibrancy_darkness`, `reload_time`, `reload_cmd` and
+`crossfade_time` are Phase 3 leftovers.
 
 **`label`**
 
@@ -209,7 +223,7 @@ label {
     text "$TIME"               // see "Text substitution"
     font "Sans 16"             // Pango font description
     color "#ffffff"
-    align "center"             // left | center | right (multi-line)
+    align "center"             // left | center | right (multi-line; `<br/>` breaks a line)
     position 0 80; valign "top"
 }
 ```
@@ -219,13 +233,13 @@ label {
 ```kdl
 image {
     path "~/.face"
-    size 150                   // longer side, px
-    corner-radius -1           // -1 = circle (hyprlock's rounding -1)
+    size 150                   // shorter side, px (hyprlock's)
+    corner-radius "full"       // the default: a circle (hyprlock's rounding -1); or px, or 4 values
     border { width 4; color "#dddddd"; }   // or gradient from=... to=...
-    reload-ms -1
-    reload-cmd ""
 }
 ```
+
+Image `reload_time`/`reload_cmd` are Phase 3 leftovers.
 
 **`shape`**
 
@@ -235,25 +249,28 @@ shape {
     color "#11111180"
     corner-radius 12
     border { width 2; gradient from="#80c8ff" to="#c7ff7f" angle=45; }
-    xray                       // cut through to the background (hyprlock's xray)
+    xray                       // no fill, so the background shows (see below)
 }
 ```
+
+`xray` differs from hyprlock: hyprlock clears the box to transparent, wiping
+lower widgets too; here the shape just has no fill, so lower widgets still
+show through. Over a plain background the two look the same.
 
 **`input-field`**: hyprlock's password field.
 
 ```kdl
 input-field {
     size 400 90
-    corner-radius -1
+    corner-radius "full"                        // the default (hyprlock's rounding -1)
     inner-color "#dddddd"
-    border { width 4; color "#111111"; }        // or gradient
+    outline { width 4; color "#111111"; }       // or gradient
     font "Sans"; font-color "#000000"
     placeholder-text "<i>Input Password</i>"    // Pango markup
-    dots size=0.25 spacing=0.2 center=true corner-radius=-1
-    dots-text-format ""                         // e.g. "*": draw text instead of dots
-    hide-input                                  // random colour per key instead of dots
-    hide-input-base-color "#00ff99ee"
-    fade-on-empty timeout-ms=2000
+    dots size=0.25 spacing=0.2 center=true corner-radius=-1   // -1 round, -2 follow the field
+    // dots text="*"                            // draw text at its own size instead of dots
+    hide-input "#00ff99ee"                      // random colour per key instead of dots; colour optional
+    fade-on-empty false                         // accepted; Phase 3 (fade-on-empty timeout-ms=2000)
     check { color "#22cc88"; text "<i>Checking…</i>"; }
     fail  { color "#cc2222"; text "<i>$FAIL ($ATTEMPTS)</i>"; }
     capslock-color "#ffaa00"
@@ -311,12 +328,12 @@ These apply to `label text`, `input-field` `placeholder-text`,
 | `$ATTEMPTS` / `$ATTEMPTS[text]` | failed attempts; the bracket text replaces `0` |
 | `$LAYOUT` / `$LAYOUT[us,de,!]` | active xkb layout name; the bracket list maps layout index to text, `!` hides it |
 | `$FAIL` | last failure message (PAM or fprintd) |
-| `$PAMPROMPT` / `$PAMFAIL` | PAM conversation prompt / failure |
+| `$PAMPROMPT` / `$PAMFAIL` | PAM's password prompt / last PAM failure |
 | `$FPRINTPROMPT` / `$FPRINTFAIL` | fprintd prompt / failure |
 
 `cmd[update:MS] <shell>` (hyprlock's syntax, kept unchanged so users can
-copy it): run `<shell>` with `sh -c` every MS milliseconds and use stdout,
-trimmed. `cmd[update:MS:1]` also refreshes on SIGUSR2. Commands run as the
+copy it): substitute the tokens above into `<shell>`, run it with `sh -c`
+every MS milliseconds and show stdout, trimmed, as is. `cmd[update:MS:1]` also refreshes on SIGUSR2. Commands run as the
 user with the user's environment. They run on a worker thread, so a slow
 command never blocks rendering. A command still running when the next tick
 comes is not started again. All children are killed on unlock.
@@ -392,7 +409,8 @@ renderer surface and damage tracker. Widgets re-lay out on `configure`
   new fragment shader written for swaywardlock, in the copied
   `postprocess.frag` style. It runs once per resource and per blur
   change, and the result is cached in an offscreen texture.
-- Fade in and out: a global alpha applied to the whole output's elements.
+- Fade in and out: a black overlay over the whole output at `1 - opacity`, so the lock
+  screen fades in from black and out to black.
 
 ### Auth
 
@@ -433,8 +451,8 @@ enum AuthEvent { Prompt(Source, String), Success(Source), Failure(Source, String
 - While a check is running, keys are ignored, as in hyprlock.
 - Caps/Num lock state and the active layout come from xkb state after each
   `modifiers` event.
-- Grace period: until it ends, any key press, pointer motion or touch calls
-  `request_unlock(Grace)`.
+- Grace period: until it ends, any key press, pointer button or motion calls
+  `request_unlock(Grace)`. Touch is not handled.
 - `hide-cursor`: set a null cursor on pointer enter.
   Otherwise use cursor-shape `default` when present.
 
@@ -445,11 +463,9 @@ swayward, the source sha and how far it was trimmed. `contrib/copied-diff <swayw
 that verbatim copies still match their source and lists upstream changes since the sha. It is
 run by hand, not in CI.
 
-Planned copies for Phase 2, not yet taken: swayward's border and shadow shader elements
-(`render_helpers/{border,shadow,shader_element}.rs` with their shaders) for `shape` and
-`input-field`, and the animation runtime (`src/animation/`) and animation KDL
-(`swayward-config/src/animations/`) for fades. Their `TtyRenderer` impls get removed, and
-`NiriRenderer` becomes plain `GlesRenderer`.
+Phase 2 copied swayward's border, shadow and shader-element code with their shaders, and the
+animation runtime and its KDL. Their `TtyRenderer` impls are removed and `NiriRenderer` is plain
+`GlesRenderer`; `COPIED.md` has the details.
 
 Keep the niri/swayward copyright and GPL-3.0-or-later lines. No per-file AI markers, following
 swayward's AGENTS.md.
@@ -560,6 +576,95 @@ Recorded after the spike; the sections above are unchanged.
 - Headless sway has no keyboard until a virtual one exists. Each `wtype` run
   creates and destroys its own, so tests leave a delay (`wtype -s`) before
   typing.
+
+## Phase 2 notes (2026-10-19)
+
+- `label`: `text`, `font` (a Pango description such as "Sans Bold 24"), `color`, `align`,
+  `markup` (on by default, as in hyprlock). There is no separate `font-size`: Pango descriptions
+  carry the size. Invalid markup is drawn as literal text with a warning. Label shadows from the
+  spec sketch are not implemented: the shadow shader draws a box, and a text shadow needs a
+  blurred copy of the glyphs. Deferred.
+- `image`: `size` is the shorter side after scaling, keeping the aspect ratio (hyprlock scales by
+  `max(size / w, size / h)`, which is the same thing). Circular by default, like hyprlock's
+  `rounding -1`. The border and shadow are drawn by the shape renderer, so they match `shape`.
+- `cmd[]` children run in their own process group, and the whole group is killed on unlock. With
+  only `sh` killed, a pipeline such as `sleep 30 | cat` would leave `sleep` behind. A unit test
+  fails with plain `Child::kill`.
+- SIGUSR2 has to be blocked in all threads early, for the same reason as SIGUSR1.
+- `input-field` follows hyprlock's `updateColors`/`updatePlaceholder`/`draw`: colour
+  precedence (caps+num > caps > num, then checking and failed override), the fail colour as the
+  caps-lock fallback, borderless fields recolouring the inner box, and dot sizing and capping.
+  Implemented as the pure `Look::new` plus geometry in `dot_rects`, with unit tests per rule.
+  Renamed for KDL: `outline { width; color|gradient }` (hyprlock's `outline_thickness` and
+  `outer_color`), `dots size= spacing= center= corner-radius= text=`, `check { color; text }`,
+  `fail { color; text }`. "Failed" means swaylock's invalid state (until `fail-timeout-ms`).
+  hyprlock instead shows the fail text until the next key.
+- Hide-input colours are seeded by a keystroke counter, never by the typed characters, so the
+  animation cannot leak anything about the password. A unit test checks that two different
+  characters at the same position look identical.
+- Not yet: the width animation that grows the field to fit long placeholder text, and
+  fade-on-empty (parsed, drawn fully opaque until fades land in 2e). Both are animations.
+- `background { screenshot }` captures every output through wlr-screencopy before `lock()`, waits
+  at most 2 s, and falls back to the colour for outputs that fail or time out.
+  `--immediate-render` skips the capture. shm (A|X)(RGB|BGR)8888 and 2101010 and y-invert are
+  handled; if none is offered the capture gives up at `buffer_done`.
+  ext-image-copy-capture stays in Phase 3.
+- `contrast` and `brightness` follow hyprlock's FRAGBLURPREPARE (gain curve, brighten above 1)
+  and FRAGBLURFINISH (dim below 1), applied on the CPU once per background. `vibrancy` is not
+  implemented: it is a saturation boost inside hyprlock's own blur shader, and swaywardlock uses
+  swayward's blur. Noise comes from swayward's blur options.
+- Animations: swayward's runtime (`src/animation/`) and KDL (`duration-ms` + `curve`, `spring`,
+  `off`) are copied. swaywardlock's named animations are `fade-in`, `fade-out` and
+  `input-field-fade` (accepted, unused until `fade-on-empty`); `animations { off }` disables all.
+  A zero-length fade-out unlocks at once. Fade in starts on `locked`. Fade out
+  runs before the unlock: `request_unlock` starts it, and `finish_unlock`, the only caller of
+  `unlock_and_destroy`, runs when it ends. An unlock never skips past the fade-out except when it
+  is off. A redraw timer at about 60 Hz runs only while something animates.
+- `--grace N`: within N seconds of `locked`, a key press, pointer motion or button unlocks without
+  a password, as in hyprlock. It is off by default. The grace window opens on `locked`, not at
+  start, so slow screenshots cannot use it up.
+- Fingerprint: fprintd over zbus's blocking API on a worker thread, following hyprlock's
+  `CFingerprint`. It claims the default device, runs `VerifyStart("any")`, and follows
+  `VerifyStatus` through retry prompts, up to three non-matches with `retry-delay-ms` between
+  them, and logind `PrepareForSleep`. Only `verify-match` requests an unlock, through the same
+  `request_unlock` as PAM. It is off by default (`auth { fingerprint {} }` enables it) and never
+  runs in preview. A missing fprintd or device is a warning. The worker releases the device when
+  its loop ends; on a normal unlock the process exits and fprintd drops the claim with the
+  connection. e2e tests use `contrib/fake-fprintd` on a private bus set as
+  `DBUS_SYSTEM_BUS_ADDRESS`.
+- Signal trust (fixed after the Phase 2 review): fprintd and logind signals are accepted only
+  from the unique name that owned `net.reactivated.Fprint` / `org.freedesktop.login1` at start.
+  The system bus policy lets any client send a signal addressed to another connection, and
+  zbus cannot match a well-known sender name locally, so filtering by the well-known name let
+  any local process forge `verify-match` and unlock. `contrib/forge-fprint` tests this, both
+  broadcast and directed. A restarted fprintd (new unique name) ends fingerprint unlock for
+  that lock; PAM still works.
+- `$DESC` is the GECOS name up to the first comma. hyprlock shows the whole field, but the
+  rest is room and phone numbers.
+
+### Phase 2 exit check
+
+hyprlock's `assets/example.conf`, translated by hand to `examples/hyprlock-example.kdl`, parses
+(unit test) and renders on headless sway at 1280x800 over a swaybg wallpaper. The checks were
+done by pixel sampling: the screenshot background blurs (a striped image goes uniform grey with
+`passes 3`, and is pixel-exact without blur); the time and date labels sit top-right; the
+gradient outline draws; typing adds dots in the font colour; the `$LAYOUT[en,ru]` label draws.
+Left out of the translation: `onclick` (out of scope) and hyprlock's `inputFieldDots` animation.
+
+Phase 2 leftovers, moved to Phase 3: `rotate`, the input-field width/colour/dots animations,
+`fade-on-empty`, label and ring shadows, `vibrancy`/`vibrancy-darkness`, background and image
+reload/crossfade, fractional scale.
+
+### Phase 2 review (2026-10-19)
+
+A six-reviewer panel (correctness, security, simplicity, tests, docs, hyprlock parity) went over
+5569c54..a8ea570. Fixed in 3aaa6f4 (security) and 087ca8b (the rest): forged fprintd/logind
+signals could unlock (signals are now trusted by unique name); `fade-out { duration-ms 0 }` and a
+`cmd[]` child that closed stdout both left the session locked for good; `--ready-fd` leaked to
+`cmd[]` children; hide-input drew inside the field; `cmd[]` ran before `$VAR` substitution;
+fingerprint misses did not count as attempts; `$PAMPROMPT`, `<br/>`, text dots at natural size,
+dot rounding sentinels, `"none"` alignment and more screencopy formats now follow hyprlock. This
+section of the spec was brought back in line with the code: every `kdl` example validates.
 
 ## Phase 1 findings (2026-10-19)
 

@@ -17,7 +17,8 @@ jobs:
             git gcc clang rustup pam-devel wayland-devel libxkbcommon-devel \
             pango-devel cairo-devel cairo-gobject-devel glib2-devel \
             mesa-libEGL-devel mesa-dri-drivers mesa-libgbm-devel \
-            sway wtype grim python3 procps-ng libcap dejavu-sans-fonts
+            sway wtype grim python3 procps-ng libcap dejavu-sans-fonts swaybg \
+            dbus-daemon python3-dbus python3-gobject
           # Fedora ships sway with cap_sys_nice; the CI container may not grant it, so exec fails
           # with EPERM. The tests do not need realtime scheduling.
           setcap -r /usr/bin/sway

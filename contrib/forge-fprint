@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+"""Test helper: forge fprintd and logind signals, to check the locker ignores them.
+
+    forge-fprint broadcast|directed [verify|sleep]
+
+Sends `VerifyStatus("verify-match", true)` (or logind `PrepareForSleep(true)` with `sleep`) on
+DBUS_SYSTEM_BUS_ADDRESS from this process, which does not own net.reactivated.Fprint. `directed`
+addresses every other unique name on the bus (the locker among them), which is how a signal can
+bypass the bus's match-rule sender filtering.
+"""
+
+import os
+import sys
+
+import dbus
+
+bus = dbus.bus.BusConnection(os.environ["DBUS_SYSTEM_BUS_ADDRESS"])
+names = dbus.Interface(
+    bus.get_object("org.freedesktop.DBus", "/org/freedesktop/DBus"), "org.freedesktop.DBus"
+)
+mode = sys.argv[1]
+kind = sys.argv[2] if len(sys.argv) > 2 else "verify"
+try:
+    owner = names.GetNameOwner("net.reactivated.Fprint")
+except dbus.DBusException:
+    owner = None
+me = bus.get_unique_name()
+targets = [n for n in names.ListNames() if n.startswith(":") and n not in (owner, me)]
+
+
+def signal(dest=None):
+    if kind == "sleep":
+        m = dbus.lowlevel.SignalMessage(
+            "/org/freedesktop/login1", "org.freedesktop.login1.Manager", "PrepareForSleep"
+        )
+        m.append(True, signature="b")
+    else:
+        m = dbus.lowlevel.SignalMessage(
+            "/net/reactivated/Fprint/Device/0", "net.reactivated.Fprint.Device", "VerifyStatus"
+        )
+        m.append("verify-match", signature="s")
+        m.append(True, signature="b")
+    if dest:
+        m.set_destination(dest)
+    return m
+
+
+if mode == "directed":
+    for t in targets:
+        bus.send_message(signal(t))
+else:
+    bus.send_message(signal())
+bus.flush()
+print(f"forged {kind} {mode} to {targets if mode == 'directed' else 'everyone'}", flush=True)

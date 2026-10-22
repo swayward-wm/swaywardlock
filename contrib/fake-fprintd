@@ -1,0 +1,103 @@
+#!/usr/bin/env python3
+"""A fake fprintd for tests: net.reactivated.Fprint on whatever bus DBUS_SYSTEM_BUS_ADDRESS names.
+
+    fake-fprintd STATUS...
+
+After VerifyStart it replays the given VerifyStatus results, one every 0.4 s, e.g.
+`fake-fprintd verify-no-match verify-match`. It logs Claim/VerifyStart/VerifyStop/Release to
+stdout so tests can check the device was released. It also owns org.freedesktop.login1, so the
+locker's PrepareForSleep handling runs (and a forged one can be told apart from ours).
+
+A status with a `+sleep` suffix (`verify-no-match+sleep`) is followed 0.1 s later by logind's
+PrepareForSleep(true) and 2 s later by PrepareForSleep(false), logged as SLEEP and WAKE.
+"""
+
+import sys
+
+import dbus
+import dbus.service
+from dbus.mainloop.glib import DBusGMainLoop
+from gi.repository import GLib
+
+DEVICE_PATH = "/net/reactivated/Fprint/Device/0"
+DEV = "net.reactivated.Fprint.Device"
+
+
+class Manager(dbus.service.Object):
+    @dbus.service.method("net.reactivated.Fprint.Manager", out_signature="o")
+    def GetDefaultDevice(self):
+        return dbus.ObjectPath(DEVICE_PATH)
+
+
+class Logind(dbus.service.Object):
+    @dbus.service.signal("org.freedesktop.login1.Manager", signature="b")
+    def PrepareForSleep(self, starting):
+        pass
+
+
+class Device(dbus.service.Object):
+    def __init__(self, bus, statuses, logind):
+        super().__init__(bus, DEVICE_PATH)
+        self.statuses = list(statuses)
+        self.logind = logind
+
+    def log(self, what):
+        print(what, flush=True)
+
+    @dbus.service.method(DEV, in_signature="s")
+    def Claim(self, user):
+        self.log("Claim")
+
+    @dbus.service.method(DEV)
+    def Release(self):
+        self.log("Release")
+
+    @dbus.service.method(DEV, in_signature="s")
+    def VerifyStart(self, finger):
+        self.log("VerifyStart " + finger)
+        if self.statuses:
+            status = self.statuses.pop(0)
+            GLib.timeout_add(400, self.emit, status)
+
+    @dbus.service.method(DEV)
+    def VerifyStop(self):
+        self.log("VerifyStop")
+
+    def sleep(self, starting):
+        self.log("SLEEP" if starting else "WAKE")
+        self.logind.PrepareForSleep(starting)
+        return False
+
+    def emit(self, status):
+        status, _, then = status.partition("+")
+        if then == "sleep":
+            GLib.timeout_add(100, self.sleep, True)
+            GLib.timeout_add(2000, self.sleep, False)
+        self.log("status " + status)
+        done = status in ("verify-match", "verify-no-match")
+        self.VerifyStatus(status, done)
+        # Like fprintd, retry statuses keep the scan going: send the next one without waiting
+        # for another VerifyStart.
+        if not done and self.statuses:
+            GLib.timeout_add(400, self.emit, self.statuses.pop(0))
+        return False
+
+    @dbus.service.signal(DEV, signature="sb")
+    def VerifyStatus(self, result, done):
+        pass
+
+
+def main():
+    DBusGMainLoop(set_as_default=True)
+    bus = dbus.bus.BusConnection(__import__("os").environ["DBUS_SYSTEM_BUS_ADDRESS"])
+    name = dbus.service.BusName("net.reactivated.Fprint", bus)
+    logind = dbus.service.BusName("org.freedesktop.login1", bus)
+    Manager(bus, "/net/reactivated/Fprint/Manager")
+    Device(bus, sys.argv[1:], Logind(bus, "/org/freedesktop/login1"))
+    print("ready", flush=True)
+    GLib.MainLoop().run()
+    del name, logind
+
+
+if __name__ == "__main__":
+    main()

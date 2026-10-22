@@ -54,6 +54,10 @@ impl SecretBuf {
         }
     }
 
+    pub fn len_chars(&self) -> usize {
+        self.as_str().chars().count()
+    }
+
     pub fn clear(&mut self) {
         self.buf[..self.len].zeroize();
         self.len = 0;

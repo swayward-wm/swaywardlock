@@ -9,6 +9,8 @@ use smithay::backend::renderer::{ContextId, Renderer as _, Texture as _};
 use smithay::gpu_span_location;
 use smithay::utils::{Buffer, Size};
 
+use crate::render::shaders::Shaders;
+
 #[derive(Debug)]
 pub struct Blur {
     program: BlurProgram,
@@ -92,9 +94,8 @@ impl BlurProgram {
 }
 
 impl Blur {
-    /// swaywardlock: takes the compiled program directly; swayward fetches it from its `Shaders`
-    /// cache on the renderer.
-    pub fn new(renderer: &GlesRenderer, program: BlurProgram) -> Option<Self> {
+    pub fn new(renderer: &mut GlesRenderer) -> Option<Self> {
+        let program = Shaders::get(renderer).blur.clone()?;
         Some(Self {
             program,
             renderer_context_id: renderer.context_id(),

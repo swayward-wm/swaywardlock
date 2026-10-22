@@ -1,0 +1,73 @@
+// hyprlock's assets/example.conf, translated by hand to swaywardlock KDL.
+// Try it without locking: swaywardlock --preview -c examples/hyprlock-example.kdl
+
+general {
+    hide-cursor false
+}
+
+// Uncomment to enable fingerprint authentication.
+// auth {
+//     fingerprint {
+//         ready-message "Scan fingerprint to unlock"
+//         present-message "Scanning..."
+//         retry-delay-ms 250
+//     }
+// }
+
+animations {
+    fade-in { duration-ms 500; curve "linear"; }
+    fade-out { duration-ms 500; curve "linear"; }
+}
+
+// hyprlock applies these defaults with blur_passes > 0; spelled out here.
+background {
+    screenshot
+    color "#111111"
+    blur { passes 3; noise 0.0117; }
+    contrast 0.8917
+    brightness 0.8172
+}
+
+input-field {
+    size "20%" "5%"
+    // hyprlock angles + 90: CSS angles here (hyprlock 45deg = angle=135).
+    outline { width 3; gradient from="#33ccffee" to="#00ff99ee" angle=135; }
+    inner-color "#00000000"
+    check { gradient from="#00ff99ee" to="#ff6633ee" angle=210; }
+    fail { gradient from="#ff6633ee" to="#ff0066ee" angle=130; text "$PAMFAIL$FPRINTFAIL"; }
+    font-color "rgb(143, 143, 143)"
+    fade-on-empty false
+    corner-radius 15
+    font "Monospace"
+    placeholder-text "Input password..."
+    // check { text "Authenticating..."; }
+    // dots text="*" size=0.4
+    dots spacing=0.3
+    // hide-input
+    position 0 -20
+}
+
+// Time
+label {
+    text "$TIME"
+    font "Monospace 90"
+    position -30 0
+    halign "right"
+    valign "top"
+}
+
+// Date
+label {
+    text "cmd[update:60000] date +\"%A, %d %B %Y\""
+    font "Monospace 25"
+    position -30 -150
+    halign "right"
+    valign "top"
+}
+
+// Keyboard layout (hyprlock's onclick is not supported)
+label {
+    text "$LAYOUT[en,ru]"
+    font "Monospace 24"
+    position 250 -20
+}

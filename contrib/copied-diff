@@ -30,6 +30,23 @@ FILES=(
     src/render/shaders/blur.vert:src/render_helpers/shaders/blur.vert:verbatim
     src/render/shaders/blur_down.frag:src/render_helpers/shaders/blur_down.frag:verbatim
     src/render/shaders/blur_up.frag:src/render_helpers/shaders/blur_up.frag:verbatim
+    src/config/copied/shadow.rs:swayward-config/src/appearance/border.rs:trimmed
+    src/render/shader_element.rs:src/render_helpers/shader_element.rs:trimmed
+    src/render/border.rs:src/render_helpers/border.rs:trimmed
+    src/render/shadow.rs:src/render_helpers/shadow.rs:trimmed
+    src/render/resources.rs:src/render_helpers/resources.rs:trimmed
+    src/render/shadow_geometry.rs:src/layout/shadow.rs:trimmed
+    src/render/shaders/mod.rs:src/render_helpers/shaders/mod.rs:trimmed
+    src/render/shaders/border.frag:src/render_helpers/shaders/border.frag:verbatim
+    src/render/shaders/shadow.frag:src/render_helpers/shaders/shadow.frag:verbatim
+    src/render/shaders/rounding_alpha.frag:src/render_helpers/shaders/rounding_alpha.frag:verbatim
+    src/render/shaders/texture.vert:src/render_helpers/shaders/texture.vert:verbatim
+    src/animation/mod.rs:src/animation/mod.rs:trimmed
+    src/animation/bezier.rs:src/animation/bezier.rs:verbatim
+    src/animation/spring.rs:src/animation/spring.rs:verbatim
+    src/animation/clock.rs:src/animation/clock.rs:trimmed
+    src/config/copied/animations/decode.rs:swayward-config/src/animations/decode.rs:trimmed
+    src/config/copied/animations/types.rs:swayward-config/src/animations/types.rs:trimmed
 )
 
 status=0

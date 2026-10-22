@@ -5,8 +5,10 @@
 
 #[macro_use]
 pub mod macros;
+pub mod animations;
 pub mod color;
 pub mod effects;
 pub mod error;
 pub mod merge_with;
+pub mod shadow;
 pub mod utils;

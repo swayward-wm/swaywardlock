@@ -1,13 +1,22 @@
 //! swaywardlock: a screen locker for the swayward-wm family.
 
+#[allow(dead_code)] // copied from swayward wholesale; not every helper is used here
+mod animation;
 mod auth;
+mod commands;
 mod config;
 mod egl;
+mod fade;
+mod fprint;
+mod labels;
+mod preview;
 mod process;
 mod render;
+mod screencopy;
 mod secret;
 mod state;
 mod surface;
+mod textvars;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -40,9 +49,8 @@ use crate::auth::{AuthEvent, Authenticator};
 use crate::config::Config;
 use crate::egl::Gpu;
 use crate::process::Daemon;
-use crate::render::blur::BlurProgram;
 use crate::state::{KeyOutcome, LockState};
-use crate::surface::{Images, OutputInfo, Surface};
+use crate::surface::{Dynamic, Images, OutputInfo, Role, Surface};
 
 /// Exit codes from the spec.
 const EXIT_NEVER_LOCKED: u8 = 1;
@@ -66,9 +74,33 @@ struct Cli {
     #[arg(long, value_name = "FD")]
     ready_fd: Option<i32>,
 
+    /// Skip the fade-in animation.
+    #[arg(long)]
+    no_fade_in: bool,
+
+    /// Seconds after locking during which any key, pointer button or motion unlocks without a
+    /// password (hyprlock's --grace).
+    #[arg(short, long, value_name = "SECONDS", default_value_t = 0)]
+    grace: u64,
+
+    /// Lock without waiting for screenshots (hyprlock's --immediate-render).
+    #[arg(long)]
+    immediate_render: bool,
+
     /// Wayland display to connect to (default: $WAYLAND_DISPLAY).
     #[arg(long, value_name = "NAME")]
     display: Option<String>,
+
+    /// Draw the lock screen in an ordinary window instead of locking, and reload the config
+    /// whenever it changes. For iterating on a layout; nothing is locked and no password is
+    /// checked (typing still drives the indicator states). Close the window or press Ctrl+C
+    /// to quit.
+    #[arg(long, conflicts_with_all = ["daemonize", "ready_fd"])]
+    preview: bool,
+
+    /// With --preview, the output name the window pretends to be, for `output=` matching.
+    #[arg(long, value_name = "NAME", requires = "preview")]
+    preview_output: Option<String>,
 
     /// Verbose logging.
     #[arg(short, long, conflicts_with = "quiet", global = true)]
@@ -95,15 +127,24 @@ struct App {
     session_lock_state: SessionLockState,
     session_lock: Option<SessionLock>,
     surfaces: Vec<Surface>,
+    /// `--preview`: an xdg window instead of a lock; see `preview.rs`.
+    preview: Option<preview::Preview>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
     pointer: Option<wl_pointer::WlPointer>,
     modifiers: Modifiers,
     gpu: Gpu,
-    blur: Option<BlurProgram>,
     config: Config,
     images: Images,
     auth: Option<Authenticator>,
     state: LockState,
+    labels: labels::Labels,
+    fades: fade::Fades,
+    /// End of the grace period (`--grace`), if any.
+    grace_until: Option<Instant>,
+    no_fade_in: bool,
+    grace: u64,
+    shm: Option<smithay_client_toolkit::shm::Shm>,
+    screencopy: Option<screencopy::Screencopy>,
     timer: Option<RegistrationToken>,
     /// An unlock (auth success or SIGUSR1) that arrived before `locked`. The protocol forbids
     /// unlocking earlier, so it runs as soon as `locked` arrives.
@@ -115,17 +156,21 @@ struct App {
 }
 
 fn main() -> ExitCode {
-    // Block SIGUSR1 before any thread exists so every thread inherits the mask. Otherwise the
+    // Block SIGUSR1/2 before any thread exists so every thread inherits the mask. Otherwise the
     // kernel may deliver it to a Mesa or auth thread, whose default action kills the process; the
     // calloop signalfd below only sees signals blocked in every thread.
     block_unlock_signal();
 
     let cli = Cli::parse();
     init_logging(&cli);
+    // Before anything spawns (cmd[] labels): children must not inherit the ready fd.
+    if let Some(fd) = cli.ready_fd {
+        process::set_cloexec(fd);
+    }
 
     let path = config::resolve_path(cli.config.as_deref());
-    let config = match Config::load(path.as_deref()) {
-        Ok(config) => config,
+    let (config, config_files) = match Config::load_with_includes(path.as_deref()) {
+        Ok(loaded) => loaded,
         Err(err) => {
             eprintln!("{err:?}");
             return ExitCode::from(EXIT_NEVER_LOCKED);
@@ -152,7 +197,12 @@ fn main() -> ExitCode {
         Daemon::none()
     };
 
-    match run(cli, config, daemon) {
+    let preview = cli.preview.then(|| preview::Options {
+        path: path.clone(),
+        files: config_files,
+        output: cli.preview_output.clone(),
+    });
+    match run(cli, config, daemon, preview) {
         Ok(code) => ExitCode::from(code),
         Err(err) => {
             tracing::error!("{err:#}");
@@ -167,6 +217,8 @@ fn block_unlock_signal() {
         let mut set: libc::sigset_t = std::mem::zeroed();
         libc::sigemptyset(&mut set);
         libc::sigaddset(&mut set, libc::SIGUSR1);
+        // SIGUSR2 (refresh cmd[] labels) has the same kill-by-default problem.
+        libc::sigaddset(&mut set, libc::SIGUSR2);
         libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
     }
 }
@@ -188,7 +240,12 @@ fn init_logging(cli: &Cli) {
 }
 
 /// Everything up to the event loop. Errors here happen before `lock()` and map to exit 1.
-fn run(cli: Cli, config: Config, mut daemon: Daemon) -> anyhow::Result<u8> {
+fn run(
+    cli: Cli,
+    config: Config,
+    mut daemon: Daemon,
+    preview: Option<preview::Options>,
+) -> anyhow::Result<u8> {
     if let Some(display) = &cli.display {
         // SAFETY: still single-threaded except for a possible logging thread that does not read
         // the environment.
@@ -207,16 +264,12 @@ fn run(cli: Cli, config: Config, mut daemon: Daemon) -> anyhow::Result<u8> {
     // Renderer and shaders before lock: a GL failure must never leave a locked session showing
     // nothing.
     let mut gpu = Gpu::new(&conn)?;
-    let blur = match BlurProgram::compile(&mut gpu.renderer) {
-        Ok(program) => Some(program),
-        Err(err) => {
-            tracing::warn!("blur unavailable: {err:#}");
-            None
-        }
-    };
+    render::init(&mut gpu.renderer);
     let images = Images::load_all(&config);
 
     let auth = match &config.auth.pam_service {
+        // Preview never authenticates: no PAM, and no code path that could unlock anything.
+        _ if preview.is_some() => None,
         Some(service) => {
             let (auth_tx, auth_rx) = calloop::channel::channel();
             handle
@@ -234,6 +287,27 @@ fn run(cli: Cli, config: Config, mut daemon: Daemon) -> anyhow::Result<u8> {
         }
     };
 
+    // Fingerprint unlock (optional; never in preview).
+    if let (Some(fp), None) = (&config.auth.fingerprint, &preview) {
+        let (tx, rx) = calloop::channel::channel();
+        handle
+            .insert_source(rx, |event, _, app| {
+                if let calloop::channel::Event::Msg(event) = event {
+                    app.on_fprint(event);
+                }
+            })
+            .map_err(|e| e.error)?;
+        fprint::spawn(
+            fprint::Options {
+                ready_message: fp.ready_message.clone(),
+                present_message: fp.present_message.clone(),
+                retry_delay: std::time::Duration::from_millis(fp.retry_delay_ms.into()),
+            },
+            tx,
+        );
+    }
+
+    let state = LockState::new(&config.general);
     let mut app = App {
         conn: conn.clone(),
         handle: handle.clone(),
@@ -244,12 +318,19 @@ fn run(cli: Cli, config: Config, mut daemon: Daemon) -> anyhow::Result<u8> {
         session_lock_state,
         session_lock: None,
         surfaces: Vec::new(),
+        preview: None,
         keyboard: None,
         pointer: None,
         modifiers: Modifiers::default(),
         gpu,
-        blur,
-        state: LockState::new(&config.general),
+        labels: labels::Labels::new(&config, &state, &handle)?,
+        state,
+        fades: fade::Fades::new(config.animations),
+        grace_until: None,
+        no_fade_in: cli.no_fade_in,
+        grace: cli.grace,
+        shm: smithay_client_toolkit::shm::Shm::bind(&globals, &qh).ok(),
+        screencopy: None,
         config,
         images,
         auth,
@@ -268,6 +349,24 @@ fn run(cli: Cli, config: Config, mut daemon: Daemon) -> anyhow::Result<u8> {
     event_loop.dispatch(Some(std::time::Duration::ZERO), &mut app)?;
     conn.roundtrip()?;
     event_loop.dispatch(Some(std::time::Duration::ZERO), &mut app)?;
+
+    // Screenshots must be taken before locking: afterwards only lock surfaces are visible.
+    let wants_screenshot = app
+        .config
+        .widgets
+        .iter()
+        .any(|w| matches!(w, config::Widget::Background(b) if b.screenshot));
+    if wants_screenshot && !cli.immediate_render {
+        capture_screenshots(&mut app, &mut event_loop, &globals, &qh)?;
+    }
+
+    if let Some(options) = preview {
+        preview::start(&mut app, &globals, &qh, options)?;
+        while app.exit.is_none() {
+            event_loop.dispatch(None, &mut app)?;
+        }
+        return Ok(0);
+    }
 
     // Test builds can request an unlock before `locked` arrives, to exercise the deferral.
     #[cfg(feature = "test-auth")]
@@ -294,6 +393,10 @@ fn run(cli: Cli, config: Config, mut daemon: Daemon) -> anyhow::Result<u8> {
             app.request_unlock();
         })
         .map_err(|e| e.error)?;
+    let refresh = Signals::new(&[Signal::SIGUSR2])?;
+    handle
+        .insert_source(refresh, |_, _, app| app.labels.refresh(&app.state))
+        .map_err(|e| e.error)?;
 
     while app.exit.is_none() {
         event_loop.dispatch(None, &mut app)?;
@@ -303,6 +406,44 @@ fn run(cli: Cli, config: Config, mut daemon: Daemon) -> anyhow::Result<u8> {
     Ok(code)
 }
 
+/// How long to wait for screenshots before locking anyway (spec: at most 2 s).
+const SCREENSHOT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn capture_screenshots(
+    app: &mut App,
+    event_loop: &mut EventLoop<'static, App>,
+    globals: &wayland_client::globals::GlobalList,
+    qh: &QueueHandle<App>,
+) -> anyhow::Result<()> {
+    let outputs: Vec<(u32, wl_output::WlOutput)> = app
+        .outputs
+        .outputs()
+        .map(|o| (o.id().protocol_id(), o))
+        .collect();
+    if app.shm.is_none() {
+        tracing::warn!("screenshot background: no wl_shm; using the colour");
+        return Ok(());
+    }
+    let Some(sc) = screencopy::Screencopy::start(globals, qh, &outputs) else {
+        return Ok(());
+    };
+    app.screencopy = Some(sc);
+    let deadline = Instant::now() + SCREENSHOT_TIMEOUT;
+    while !app.screencopy.as_ref().is_some_and(|s| s.is_finished()) {
+        let now = Instant::now();
+        if now >= deadline {
+            tracing::warn!("screenshots did not finish in time; locking without them");
+            break;
+        }
+        event_loop.dispatch(Some(deadline - now), app)?;
+    }
+    tracing::debug!(
+        "captured {} screenshot(s)",
+        app.screencopy.as_ref().map_or(0, |s| s.done.len())
+    );
+    Ok(())
+}
+
 impl App {
     fn add_lock_surface(&mut self, qh: &QueueHandle<Self>, output: wl_output::WlOutput) {
         let Some(lock) = &self.session_lock else {
@@ -310,7 +451,21 @@ impl App {
         };
         let surface = self.compositor.create_surface(qh);
         let lock_surface = lock.create_lock_surface(surface, &output, qh);
-        self.surfaces.push(Surface::new(lock_surface, output));
+        let shot = self
+            .screencopy
+            .as_mut()
+            .and_then(|sc| sc.done.remove(&output.id().protocol_id()))
+            .and_then(|s| {
+                surface::Image::from_argb(s.width, s.height, &s.data)
+                    .map_err(|e| tracing::warn!("screenshot: {e:#}"))
+                    .ok()
+            });
+        let mut s = Surface::new(Role::Lock {
+            lock_surface,
+            output,
+        });
+        s.screenshot = shot;
+        self.surfaces.push(s);
     }
 
     fn output_info(&self, output: &wl_output::WlOutput) -> OutputInfo {
@@ -333,9 +488,44 @@ impl App {
             self.unlock_pending = true;
             return;
         }
+        self.session_lock = Some(lock);
+        if self.fades.unlock_when_done {
+            return; // already fading out
+        }
+        if self.fades.fade_out() {
+            self.fades.unlock_when_done = true;
+            fade::ensure_ticking(self);
+        } else {
+            self.finish_unlock();
+        }
+    }
+
+    /// Unlock now. Only called by `request_unlock`, directly or when its fade out ends.
+    fn finish_unlock(&mut self) {
+        let Some(lock) = self.session_lock.take() else {
+            return;
+        };
         lock.unlock();
         let _ = self.conn.roundtrip();
         self.exit = Some(0);
+    }
+
+    fn on_fprint(&mut self, event: fprint::FprintEvent) {
+        match event {
+            fprint::FprintEvent::Matched => {
+                tracing::info!("fingerprint matched");
+                self.request_unlock();
+            }
+            fprint::FprintEvent::Prompt(p) => {
+                self.state.fprint_prompt = p;
+                self.state_changed();
+            }
+            fprint::FprintEvent::Failed(why) => {
+                tracing::info!("fingerprint: {why}");
+                self.state.on_fprint_failed(Instant::now(), &why);
+                self.state_changed();
+            }
+        }
     }
 
     fn on_auth(&mut self, event: AuthEvent) {
@@ -344,15 +534,31 @@ impl App {
                 tracing::info!("authenticated");
                 self.request_unlock();
             }
+            AuthEvent::Prompt(prompt) => {
+                if self.state.pam_prompt != prompt {
+                    self.state.pam_prompt = prompt;
+                    self.draw_all();
+                }
+            }
             AuthEvent::Failure(msg) => {
                 tracing::info!("authentication failed: {msg}");
-                self.state.on_auth_failed(Instant::now());
+                self.state.on_auth_failed_with(Instant::now(), &msg);
                 self.state_changed();
             }
         }
     }
 
+    /// Within the grace period any input unlocks without a password (hyprlock's --grace).
+    fn in_grace(&self) -> bool {
+        self.grace_until.is_some_and(|t| Instant::now() < t)
+    }
+
     fn on_key(&mut self, event: KeyEvent) {
+        if self.in_grace() {
+            tracing::info!("input during the grace period; unlocking");
+            self.request_unlock();
+            return;
+        }
         let outcome = self.state.on_key(
             event.keysym,
             event.utf8.as_deref(),
@@ -366,6 +572,7 @@ impl App {
                 let secret = self.state.take_password();
                 match &self.auth {
                     Some(auth) => auth.submit(secret),
+                    None if self.preview.is_some() => preview::fake_check(self),
                     None => self.state.on_auth_failed(Instant::now()),
                 }
             }
@@ -405,12 +612,17 @@ impl App {
 
     fn draw_all(&mut self) {
         for surface in &mut self.surfaces {
+            let dynamic = Dynamic {
+                vars: self.labels.vars(&self.state),
+                cmd_output: &self.labels.output,
+                opacity: self.fades.opacity(),
+            };
             if let Err(err) = surface.draw(
                 &mut self.gpu.renderer,
-                self.blur.as_ref(),
                 &self.config,
                 &self.images,
                 &self.state,
+                &dynamic,
             ) {
                 tracing::warn!("error drawing: {err:#}");
             }
@@ -418,19 +630,27 @@ impl App {
     }
 
     fn reconfigure(&mut self, index: usize) {
-        let info = self.output_info(&self.surfaces[index].output);
+        let info = match &self.surfaces[index].role {
+            Role::Lock { output, .. } => self.output_info(output),
+            Role::Preview { info, .. } => info.clone(),
+        };
         let surface = &mut self.surfaces[index];
         surface.layout(&self.config, &info);
         if let Err(err) = surface.ensure_egl(&self.gpu) {
             tracing::error!("cannot create a surface for an output: {err:#}");
             return;
         }
+        let dynamic = Dynamic {
+            vars: self.labels.vars(&self.state),
+            cmd_output: &self.labels.output,
+            opacity: self.fades.opacity(),
+        };
         if let Err(err) = surface.draw(
             &mut self.gpu.renderer,
-            self.blur.as_ref(),
             &self.config,
             &self.images,
             &self.state,
+            &dynamic,
         ) {
             tracing::warn!("error drawing: {err:#}");
         }
@@ -444,8 +664,16 @@ impl SessionLockHandler for App {
             tracing::error!("failed to write the ready fd: {err}");
         }
         self.daemon.report(0);
+        if self.grace > 0 {
+            self.grace_until = Some(Instant::now() + std::time::Duration::from_secs(self.grace));
+        }
         if self.unlock_pending {
             self.request_unlock();
+            return;
+        }
+        if !self.no_fade_in {
+            self.fades.fade_in();
+            fade::ensure_ticking(self);
         }
     }
 
@@ -467,7 +695,7 @@ impl SessionLockHandler for App {
         let Some(index) = self
             .surfaces
             .iter()
-            .position(|s| s.lock_surface.wl_surface() == lock_surface.wl_surface())
+            .position(|s| s.wl_surface() == lock_surface.wl_surface())
         else {
             return;
         };
@@ -486,11 +714,7 @@ impl CompositorHandler for App {
         factor: i32,
     ) {
         // Integer scale for now; fractional scale arrives with Phase 2.
-        let Some(index) = self
-            .surfaces
-            .iter()
-            .position(|s| s.lock_surface.wl_surface() == surface)
-        else {
+        let Some(index) = self.surfaces.iter().position(|s| s.wl_surface() == surface) else {
             return;
         };
         if self.surfaces[index].scale != factor {
@@ -538,7 +762,8 @@ impl OutputHandler for App {
 
     fn new_output(&mut self, _: &Connection, qh: &QueueHandle<Self>, output: wl_output::WlOutput) {
         // Before `lock()` this is a no-op; outputs are picked up when locking starts.
-        if self.session_lock.is_some() && !self.surfaces.iter().any(|s| s.output == output) {
+        if self.session_lock.is_some() && !self.surfaces.iter().any(|s| s.output() == Some(&output))
+        {
             self.add_lock_surface(qh, output);
         }
     }
@@ -552,7 +777,7 @@ impl OutputHandler for App {
         output: wl_output::WlOutput,
     ) {
         // EGL surfaces must go before their wl_surface, which drops with the lock surface.
-        self.surfaces.retain(|s| s.output != output);
+        self.surfaces.retain(|s| s.output() != Some(&output));
     }
 }
 
@@ -688,8 +913,11 @@ impl KeyboardHandler for App {
         layout: u32,
     ) {
         self.modifiers = modifiers;
-        let changed = self.state.caps_lock != modifiers.caps_lock || self.state.layout != layout;
+        let changed = self.state.caps_lock != modifiers.caps_lock
+            || self.state.num_lock != modifiers.num_lock
+            || self.state.layout != layout;
         self.state.caps_lock = modifiers.caps_lock;
+        self.state.num_lock = modifiers.num_lock;
         self.state.layout = layout;
         if changed {
             self.state_changed();
@@ -734,6 +962,18 @@ impl PointerHandler for App {
         pointer: &wl_pointer::WlPointer,
         events: &[PointerEvent],
     ) {
+        if self.in_grace()
+            && events.iter().any(|e| {
+                matches!(
+                    e.kind,
+                    PointerEventKind::Motion { .. } | PointerEventKind::Press { .. }
+                )
+            })
+        {
+            tracing::info!("pointer input during the grace period; unlocking");
+            self.request_unlock();
+            return;
+        }
         if !self.config.general.hide_cursor {
             return;
         }
@@ -743,6 +983,14 @@ impl PointerHandler for App {
                 pointer.set_cursor(serial, None, 0, 0);
             }
         }
+    }
+}
+
+impl smithay_client_toolkit::shm::ShmHandler for App {
+    fn shm_state(&mut self) -> &mut smithay_client_toolkit::shm::Shm {
+        self.shm
+            .as_mut()
+            .expect("shm events only arrive once shm is bound")
     }
 }
 

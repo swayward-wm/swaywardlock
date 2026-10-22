@@ -46,7 +46,20 @@ pub struct LockState {
     /// Position of the typing highlight; 2048 = one full turn (swaylock's `highlight_start`).
     pub highlight_start: u32,
     pub failed_attempts: u32,
+    /// The latest auth failure message from any source, for `$FAIL`.
+    pub last_failure: Option<String>,
+    /// The latest PAM failure message, for `$PAMFAIL`.
+    pub pam_failure: Option<String>,
+    /// PAM's latest password prompt, for `$PAMPROMPT`.
+    pub pam_prompt: String,
+    /// fprintd's current prompt and last failure, for `$FPRINTPROMPT` / `$FPRINTFAIL`.
+    pub fprint_prompt: String,
+    pub fprint_fail: String,
     pub caps_lock: bool,
+    pub num_lock: bool,
+    /// Counts accepted key presses that changed the buffer, so widgets can react to "a key was
+    /// typed" (hide-input recolours on every key) without seeing the password.
+    pub keystrokes: u64,
     /// Active xkb layout index and the keymap's layout names.
     pub layout: u32,
     pub layout_names: Vec<String>,
@@ -67,7 +80,14 @@ impl LockState {
             input: InputState::Idle,
             highlight_start: 0,
             failed_attempts: 0,
+            last_failure: None,
+            pam_failure: None,
+            pam_prompt: String::new(),
+            fprint_prompt: String::new(),
+            fprint_fail: String::new(),
             caps_lock: false,
+            num_lock: false,
+            keystrokes: 0,
             layout: 0,
             layout_names: Vec::new(),
             password: SecretBuf::new(),
@@ -79,6 +99,11 @@ impl LockState {
             clear_at: None,
             rng: fastrand::Rng::new(),
         }
+    }
+
+    /// Number of characters typed, for dots. Never the content.
+    pub fn password_len(&self) -> usize {
+        self.password.len_chars()
     }
 
     pub fn layout_name(&self) -> Option<&str> {
@@ -109,6 +134,7 @@ impl LockState {
             Keysym::BackSpace | Keysym::Delete if ctrl => self.clear(),
             Keysym::BackSpace | Keysym::Delete => {
                 self.password.pop_char();
+                self.keystrokes += 1;
                 if self.password.is_empty() {
                     self.clear();
                 } else {
@@ -140,6 +166,7 @@ impl LockState {
                     return KeyOutcome::None;
                 };
                 if self.password.push_str(text) {
+                    self.keystrokes += 1;
                     self.input = InputState::Letter;
                     self.clear_at = Some(now + self.clear_after);
                     self.advance_highlight();
@@ -176,6 +203,28 @@ impl LockState {
     }
 
     pub fn on_auth_failed(&mut self, now: Instant) {
+        self.on_auth_failed_with(now, "Authentication failed");
+    }
+
+    pub fn on_auth_failed_with(&mut self, now: Instant, message: &str) {
+        self.pam_failure = Some(message.to_owned());
+        self.failed(now, message);
+    }
+
+    /// A fingerprint non-match is a failed attempt too (hyprlock's `enqueueFail`). It does not
+    /// interrupt a password check that is running.
+    pub fn on_fprint_failed(&mut self, now: Instant, message: &str) {
+        self.fprint_fail = message.to_owned();
+        if self.auth == AuthState::Validating {
+            self.last_failure = Some(message.to_owned());
+            self.failed_attempts = self.failed_attempts.saturating_add(1);
+        } else {
+            self.failed(now, message);
+        }
+    }
+
+    fn failed(&mut self, now: Instant, message: &str) {
+        self.last_failure = Some(message.to_owned());
         self.auth = AuthState::Invalid;
         self.failed_attempts = self.failed_attempts.saturating_add(1);
         self.auth_idle_at = Some(now + self.fail_timeout);
@@ -316,6 +365,35 @@ mod tests {
         // The old 3 s fail timer must not flip a running check back to idle.
         s.tick(t0 + Duration::from_secs(4));
         assert_eq!(s.auth, AuthState::Validating);
+        assert_eq!(s.next_deadline(), None);
+    }
+
+    /// A fingerprint miss is a failed attempt, as in hyprlock: it counts, shows the fail state
+    /// and sets `$FAIL`, but leaves `$PAMFAIL` alone.
+    #[test]
+    fn fingerprint_failure_counts_without_touching_pam_failure() {
+        let mut s = state();
+        let t0 = Instant::now();
+        s.on_auth_failed_with(t0, "Wrong password");
+        s.tick(t0 + Duration::from_secs(5));
+        s.on_fprint_failed(t0 + Duration::from_secs(5), "No match");
+        assert_eq!((s.auth, s.failed_attempts), (AuthState::Invalid, 2));
+        assert_eq!(s.last_failure.as_deref(), Some("No match"));
+        assert_eq!(s.pam_failure.as_deref(), Some("Wrong password"));
+        assert_eq!(s.fprint_fail, "No match");
+        assert!(s.tick(t0 + Duration::from_secs(10)));
+        assert_eq!(s.auth, AuthState::Idle);
+    }
+
+    /// A fingerprint miss while a password check runs must not end that check.
+    #[test]
+    fn fingerprint_failure_during_a_password_check_keeps_validating() {
+        let mut s = state();
+        let now = Instant::now();
+        typed(&mut s, "pw", now);
+        s.on_key(Keysym::Return, None, false, now);
+        s.on_fprint_failed(now, "No match");
+        assert_eq!((s.auth, s.failed_attempts), (AuthState::Validating, 1));
         assert_eq!(s.next_deadline(), None);
     }
 

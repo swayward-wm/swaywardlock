@@ -16,6 +16,8 @@ use crate::secret::SecretBuf;
 pub enum AuthEvent {
     Success,
     Failure(String),
+    /// The text of PAM's password prompt (e.g. "Password: "), for `$PAMPROMPT`.
+    Prompt(String),
 }
 
 /// Runs one PAM transaction per submitted secret, one at a time.
@@ -28,7 +30,7 @@ impl Authenticator {
         let (tx, rx) = mpsc::channel::<SecretBuf>();
         thread::Builder::new().name("auth".into()).spawn(move || {
             for secret in rx {
-                let event = check(&service, secret);
+                let event = check(&service, secret, &events);
                 if events.send(event).is_err() {
                     break;
                 }
@@ -48,7 +50,8 @@ impl Authenticator {
 pub const TEST_PASSWORD: &str = "swaywardlock-test";
 
 #[cfg(feature = "test-auth")]
-fn check(_service: &str, secret: SecretBuf) -> AuthEvent {
+fn check(_service: &str, secret: SecretBuf, events: &Sender<AuthEvent>) -> AuthEvent {
+    let _ = events.send(AuthEvent::Prompt("Password: ".into()));
     if secret.as_str() == TEST_PASSWORD {
         AuthEvent::Success
     } else {
@@ -57,8 +60,8 @@ fn check(_service: &str, secret: SecretBuf) -> AuthEvent {
 }
 
 #[cfg(not(feature = "test-auth"))]
-fn check(service: &str, secret: SecretBuf) -> AuthEvent {
-    match pam::authenticate(service, secret) {
+fn check(service: &str, secret: SecretBuf, events: &Sender<AuthEvent>) -> AuthEvent {
+    match pam::authenticate(service, secret, events) {
         Ok(()) => AuthEvent::Success,
         Err(msg) => AuthEvent::Failure(msg),
     }
@@ -74,17 +77,23 @@ mod pam {
     use super::*;
 
     /// Conversation state handed to libpam as `appdata_ptr`.
-    struct Conv {
+    struct Conv<'a> {
         secret: Option<SecretBuf>,
+        events: &'a Sender<AuthEvent>,
     }
 
-    pub fn authenticate(service: &str, secret: SecretBuf) -> Result<(), String> {
+    pub fn authenticate(
+        service: &str,
+        secret: SecretBuf,
+        events: &Sender<AuthEvent>,
+    ) -> Result<(), String> {
         let user = current_user().ok_or("cannot determine the current user")?;
         let service = CString::new(service).map_err(|_| "invalid PAM service name")?;
         let user = CString::new(user).map_err(|_| "invalid user name")?;
 
         let mut conv_state = Conv {
             secret: Some(secret),
+            events,
         };
         let conv = sys::pam_conv {
             conv: Some(converse),
@@ -135,7 +144,7 @@ mod pam {
         }
         // SAFETY: libpam passes back the pointer we gave pam_start; the transaction is
         // single-threaded.
-        let conv = unsafe { &mut *appdata.cast::<Conv>() };
+        let conv = unsafe { &mut *appdata.cast::<Conv<'_>>() };
         let n = num_msg as usize;
         // SAFETY: calloc returns zeroed memory or null.
         let replies = unsafe { libc::calloc(n, std::mem::size_of::<sys::pam_response>()) }
@@ -156,6 +165,10 @@ mod pam {
             };
             match m.msg_style {
                 sys::PAM_PROMPT_ECHO_OFF => {
+                    // The prompt text only; never anything derived from the secret.
+                    let _ = conv
+                        .events
+                        .send(AuthEvent::Prompt(text.clone().into_owned()));
                     let Some(secret) = conv.secret.take() else {
                         // A second password prompt (e.g. a changed-token flow): refuse.
                         unsafe { free_replies(replies, n) };

@@ -49,7 +49,7 @@ where
             let name = &**node.node_name;
 
             // Widgets and includes repeat; settings sections appear once per file.
-            if matches!(name, "general" | "auth") && !seen.insert(name) {
+            if matches!(name, "general" | "auth" | "animations") && !seen.insert(name) {
                 ctx.emit_error(DecodeError::unexpected(
                     &node.node_name,
                     "node",
@@ -61,6 +61,7 @@ where
             match name {
                 "general" => decode_general(node, ctx, &config)?,
                 "auth" => decode_auth(node, ctx, &config)?,
+                "animations" => decode_animations(node, ctx, &config)?,
                 "background" => {
                     let w = knuffel::Decode::decode_node(node, ctx)?;
                     config.borrow_mut().widgets.push(Widget::Background(w));
@@ -68,6 +69,22 @@ where
                 "ring-indicator" => {
                     let w = knuffel::Decode::decode_node(node, ctx)?;
                     config.borrow_mut().widgets.push(Widget::RingIndicator(w));
+                }
+                "shape" => {
+                    let w = knuffel::Decode::decode_node(node, ctx)?;
+                    config.borrow_mut().widgets.push(Widget::Shape(w));
+                }
+                "label" => {
+                    let w = knuffel::Decode::decode_node(node, ctx)?;
+                    config.borrow_mut().widgets.push(Widget::Label(w));
+                }
+                "image" => {
+                    let w = knuffel::Decode::decode_node(node, ctx)?;
+                    config.borrow_mut().widgets.push(Widget::Image(w));
+                }
+                "input-field" => {
+                    let w = knuffel::Decode::decode_node(node, ctx)?;
+                    config.borrow_mut().widgets.push(Widget::InputField(w));
                 }
                 "include" => decode_include(node, ctx)?,
                 name => ctx.emit_error(DecodeError::unexpected(
@@ -126,6 +143,42 @@ fn decode_general<S: knuffel::traits::ErrorSpan>(
     Ok(())
 }
 
+fn decode_animations<S: knuffel::traits::ErrorSpan>(
+    node: &knuffel::ast::SpannedNode<S>,
+    ctx: &mut knuffel::decode::Context<S>,
+    config: &RefCell<Config>,
+) -> Result<(), DecodeError<S>> {
+    use super::Animation;
+    expect_only_children(node, ctx);
+    let mut config = config.borrow_mut();
+    let anims = &mut config.animations;
+    for child in node.children() {
+        let slot = match &**child.node_name {
+            "off" => {
+                knuffel::decode::check_flag_node(child, ctx);
+                anims.off = true;
+                continue;
+            }
+            "fade-in" => &mut anims.fade_in,
+            "fade-out" => &mut anims.fade_out,
+            "input-field-fade" => &mut anims.input_field_fade,
+            other => {
+                ctx.emit_error(DecodeError::unexpected(
+                    child,
+                    "node",
+                    format!(
+                        "unexpected animation `{}`; expected fade-in, fade-out or input-field-fade",
+                        other.escape_default()
+                    ),
+                ));
+                continue;
+            }
+        };
+        *slot = Animation::decode_node(child, ctx, *slot, |_, _| Ok(false))?;
+    }
+    Ok(())
+}
+
 fn decode_auth<S: knuffel::traits::ErrorSpan>(
     node: &knuffel::ast::SpannedNode<S>,
     ctx: &mut knuffel::decode::Context<S>,
@@ -159,6 +212,28 @@ fn decode_auth<S: knuffel::traits::ErrorSpan>(
                     }
                 }
                 config.borrow_mut().auth.pam_service = service;
+            }
+            "fingerprint" => {
+                let mut fp = super::Fingerprint::default();
+                for c in child.children() {
+                    match &**c.node_name {
+                        "ready-message" => {
+                            fp.ready_message = parse_arg_node("ready-message", c, ctx)?
+                        }
+                        "present-message" => {
+                            fp.present_message = parse_arg_node("present-message", c, ctx)?
+                        }
+                        "retry-delay-ms" => {
+                            fp.retry_delay_ms = parse_arg_node("retry-delay-ms", c, ctx)?
+                        }
+                        other => ctx.emit_error(DecodeError::unexpected(
+                            c,
+                            "node",
+                            format!("unexpected node `{}`", other.escape_default()),
+                        )),
+                    }
+                }
+                config.borrow_mut().auth.fingerprint = Some(fp);
             }
             other => ctx.emit_error(DecodeError::unexpected(
                 child,

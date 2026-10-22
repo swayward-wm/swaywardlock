@@ -18,6 +18,9 @@ fail() { printf 'FAIL %s\n' "$1"; FAILED=1; }
 check() { if [ "$2" = "$3" ]; then pass "$1"; else fail "$1 (got '$2', want '$3')"; fi; }
 
 start_sway() {
+    # sway binds IPC to $SWAYSOCK when it names a missing path; a stale one from the caller (or an
+    # earlier test) points into a deleted directory and makes sway abort. Let it pick its own.
+    unset SWAYSOCK
     export XDG_RUNTIME_DIR
     XDG_RUNTIME_DIR=$(mktemp -d)
     local conf="$XDG_RUNTIME_DIR/sway.conf"
@@ -190,6 +193,496 @@ t_failing_widget() {
     wait_exit "$pid"
 }
 
+# Find the preview window's position and size on screen via sway IPC.
+window_rect() {
+    swaymsg_ -t get_tree | python3 -c '
+import json, sys
+def walk(n):
+    if n.get("app_id") == "swaywardlock-preview":
+        r = n["rect"]; print(r["x"], r["y"], r["width"], r["height"]); sys.exit()
+    for c in n.get("nodes", []) + n.get("floating_nodes", []):
+        walk(c)
+walk(json.load(sys.stdin))'
+}
+
+# swaymsg against this test's sway. Never export SWAYSOCK; see start_sway.
+swaymsg_() {
+    swaymsg --socket "$XDG_RUNTIME_DIR/sway-ipc.$(id -u).$SWAY_PID.sock" "$@"
+}
+
+t_preview() {
+    local c="$XDG_RUNTIME_DIR/lock.kdl"
+    cat >"$c" <<'EOF'
+background { color "#204060"; }
+shape {
+    size 160 80
+    color "#ff0000"
+    corner-radius 20
+    border { width 6; gradient from="#00ff00" to="#0000ff" angle=90; }
+}
+EOF
+    RUST_LOG=swaywardlock=info "$BIN" --preview -c "$c" >"$LOG" 2>&1 &
+    local pid=$!
+    sleep 1.5
+    if grep -q 'session locked' "$LOG"; then fail "preview: locked the session"; else pass "preview: did not lock"; fi
+    local x y w h
+    read -r x y w h < <(window_rect)
+    if [ -z "$w" ]; then fail "preview: no window"; kill "$pid"; return; fi
+    pass "preview: window mapped (${w}x${h})"
+    local cx=$((x + w / 2)) cy=$((y + h / 2))
+    check_colour "preview: shape fill at the window centre" "255 0 0" "$cx" "$cy"
+    # The 6 px border sits just inside the box's left and right edges, 80 px from the centre;
+    # the left-to-right gradient is green on the left and blue on the right.
+    local g gr
+    g=$(pixel $((cx - 78)) "$cy")
+    gr=$(pixel $((cx + 77)) "$cy")
+    if [ "$(echo "$g" | cut -d' ' -f1)" = 0 ] && [ "$(echo "$g" | cut -d' ' -f2)" -gt 200 ]; then
+        pass "preview: gradient border starts green on the left"
+    else
+        fail "preview: left border colour $g"
+    fi
+    if [ "$(echo "$gr" | cut -d' ' -f2)" -lt 60 ] && [ "$(echo "$gr" | cut -d' ' -f3)" -gt 200 ]; then
+        pass "preview: gradient border ends blue on the right"
+    else
+        fail "preview: right border colour $gr (want blue)"
+    fi
+    check_colour "preview: background" "32 64 96" $((x + 5)) $((y + 5))
+    # Live reload.
+    sed -i 's/#204060/#406020/' "$c"
+    check_colour "preview: reloads on change" "64 96 32" $((x + 5)) $((y + 5))
+    # A broken edit keeps the last good frame.
+    echo 'shape { size' >"$c"
+    sleep 1.2
+    if kill -0 "$pid" 2>/dev/null; then pass "preview: survives a broken edit"; else fail "preview: died on a broken edit"; fi
+    check_colour "preview: keeps the last good frame" "64 96 32" $((x + 5)) $((y + 5))
+    # Typing and Enter never unlock or exit.
+    $T wtype -s 300 whatever -k Return
+    sleep 1
+    if kill -0 "$pid" 2>/dev/null; then pass "preview: Enter does not exit"; else fail "preview: exited on Enter"; fi
+    swaymsg_ '[app_id=swaywardlock-preview] kill' >/dev/null
+    wait_exit "$pid"
+    check "preview: closing the window exits 0" "$?" 0
+}
+
+# Width in pixels of the region matching an "r g b" colour within a box, via a one-shot grim.
+# Usage: colour_width "R G B" X0 Y0 X1 Y1
+colour_width() {
+    $T grim -t ppm - | python3 -c '
+import sys
+want = tuple(int(v) for v in sys.argv[1].split())
+x0, y0, x1, y1 = map(int, sys.argv[2:6])
+data = sys.stdin.buffer.read()
+parts, i = [], 0
+while len(parts) < 4:
+    while data[i:i+1].isspace(): i += 1
+    j = i
+    while not data[j:j+1].isspace(): j += 1
+    parts.append(data[i:j]); i = j
+i += 1
+w = int(parts[1])
+xs = [x for y in range(y0, y1) for x in range(x0, x1)
+      if all(abs(a - b) < 60 for a, b in zip(data[i+(y*w+x)*3:i+(y*w+x)*3+3], want))]
+print(max(xs) - min(xs) + 1 if xs else 0)' "$@"
+}
+
+t_labels() {
+    local d="$XDG_RUNTIME_DIR"
+    echo one >"$d/counter"
+    python3 "$HERE/ppm-pixel" --write-test-png "$d/face.png"
+    cat >"$d/lock.kdl" <<EOF
+background { color "#000000"; }
+label { text "cmd[update:300:1] cat $d/counter"; font "Sans 20"; color "#ff0000"; halign "left"; valign "bottom"; position 10 10; }
+label { text "cmd[] cat $d/counter"; font "Sans 20"; color "#0000ff"; halign "left"; valign "top"; position 10 -10; }
+label { text "cmd[update:0:1] cat $d/counter"; font "Sans 20"; color "#ff00ff"; halign "right"; valign "top"; position -10 -10; }
+label { text "cmd[] sleep 300; echo never"; color "#ffffff"; }
+label { text "\$ATTEMPTS[none] tries"; font "Sans 20"; color "#00ff00"; halign "right"; valign "bottom"; position -10 10; }
+label { text "cmd[update:300] test -n \"\$ATTEMPTS\" && echo shown"; font "Sans 20"; color "#00ffff"; halign "left"; valign "center"; }
+label { text "[\$PAMPROMPT]"; font "Sans 20"; color "#ffff00"; halign "right"; valign "center"; }
+image { path "$d/face.png"; size 60; border { width 4; color "#ffff00"; }; }
+EOF
+    RUST_LOG=swaywardlock=debug "$BIN" -c "$d/lock.kdl" >"$LOG" 2>&1 &
+    local pid=$!
+    wait_locked "$LOG" || { fail "labels: never locked"; cat "$LOG"; kill "$pid"; return; }
+    sleep 0.5
+    local before after once green_before green_after
+    before=$(colour_width "255 0 0" 0 180 200 240)
+    once=$(colour_width "0 0 255" 0 0 200 60)
+    green_before=$(colour_width "0 255 0" 160 180 320 240)
+    [ "$before" -gt 0 ] && pass "labels: cmd[] output drawn" || fail "labels: cmd[] label missing"
+    # Variables are substituted into the command before it runs, as in hyprlock.
+    [ "$(colour_width "0 255 255" 0 100 100 140)" -gt 0 ] && pass "labels: \$VARS substituted before cmd[] runs" \
+        || fail "labels: cmd[] ran with \$ATTEMPTS unsubstituted"
+    # Image: picture centred, yellow border around it, circular by default.
+    check_colour "labels: image picture (red half)" "255 0 0" 160 110
+    check_colour "labels: image picture (blue half)" "0 0 255" 160 130
+    check_colour "labels: image border" "255 255 0" 160 88
+    check_colour "labels: image corner is round" "0 0 0" 129 89
+    # cmd[update:300] picks up the new output; cmd[] (no interval) does not.
+    echo twotwotwotwo >"$d/counter"
+    sleep 1
+    after=$(colour_width "255 0 0" 0 180 200 240)
+    [ "$after" -gt "$before" ] && pass "labels: interval command re-ran ($before -> $after px)" \
+        || fail "labels: interval command did not re-run ($before -> $after px)"
+    [ "$(colour_width "0 0 255" 0 0 200 60)" = "$once" ] && pass "labels: one-shot command ran once" \
+        || fail "labels: one-shot command re-ran"
+    # $ATTEMPTS[none] becomes the count after a failure; $PAMPROMPT shows the PAM prompt.
+    local prompt_before prompt_after
+    prompt_before=$(colour_width "255 255 0" 200 100 320 140)
+    $T wtype -s 300 nope -k Return
+    sleep 0.8
+    green_after=$(colour_width "0 255 0" 160 180 320 240)
+    prompt_after=$(colour_width "255 255 0" 200 100 320 140)
+    [ "$prompt_after" -gt "$prompt_before" ] && pass "labels: \$PAMPROMPT shows the PAM prompt ($prompt_before -> $prompt_after px)" \
+        || fail "labels: \$PAMPROMPT stayed empty ($prompt_before -> $prompt_after px)"
+    [ "$green_after" != "$green_before" ] && pass "labels: \$ATTEMPTS updates after a failure" \
+        || fail "labels: \$ATTEMPTS did not change ($green_before px)"
+    # SIGUSR2 re-runs cmd[...:1] labels (the magenta one has no interval of its own).
+    local magenta_before
+    magenta_before=$(colour_width "255 0 255" 160 0 320 60)
+    echo x >"$d/counter"
+    kill -USR2 "$pid"
+    sleep 0.8
+    kill -0 "$pid" 2>/dev/null && pass "labels: SIGUSR2 does not kill the locker" \
+        || fail "labels: SIGUSR2 killed the locker"
+    [ "$(colour_width "255 0 255" 160 0 320 60)" -lt "$magenta_before" ] \
+        && pass "labels: SIGUSR2 re-ran the refreshable command" \
+        || fail "labels: SIGUSR2 did not re-run cmd[update:0:1]"
+    pgrep -f "sleep 300; echo never" >/dev/null && pass "labels: long-running command is running" \
+        || fail "labels: long-running command not started"
+    kill -USR1 "$pid"
+    wait_exit "$pid"
+    sleep 0.2
+    if pgrep -f "sleep 300; echo never" >/dev/null; then
+        fail "labels: cmd[] child left running after unlock"
+        pkill -f "sleep 300; echo never"
+    else
+        pass "labels: cmd[] children killed on unlock"
+    fi
+}
+
+t_input_field() {
+    cat >"$XDG_RUNTIME_DIR/lock.kdl" <<'EOF'
+background { color "#000000"; }
+input-field {
+    size 200 50
+    inner-color "#ffffff"
+    outline { width 4; color "#0000ff"; }
+    font-color "#000000"
+    placeholder-text "zzzzzzzzzzzz"
+    dots size=0.4 spacing=0.5
+    check { color "#00ff00"; }
+    fail { color "#ff0000"; text "ffffffff"; }
+}
+EOF
+    "$BIN" -c "$XDG_RUNTIME_DIR/lock.kdl" >"$LOG" 2>&1 &
+    local pid=$!
+    wait_locked "$LOG" || { fail "input-field: never locked"; cat "$LOG"; kill "$pid"; return; }
+    # Field: 200x50 inner + 4 px outline, centred on 320x240 -> outer x 56..264, y 91..149.
+    check_colour "input-field: outline idle colour" "0 0 255" 160 92
+    check_colour "input-field: inner fill" "255 255 255" 70 120
+    local idle_text
+    # Sample rows through the middle: the pill's rounded ends show the background.
+    idle_text=$(colour_width "0 0 0" 62 112 258 128)
+    [ "$idle_text" -gt 40 ] && pass "input-field: placeholder drawn (${idle_text}px)" \
+        || fail "input-field: no placeholder (${idle_text}px)"
+    # Three characters: three dots, centred; placeholder gone.
+    $T wtype -s 300 abc
+    sleep 0.4
+    local dots
+    dots=$(colour_width "0 0 0" 62 112 258 128)
+    # dot = round(50*0.4*0.5)*2 = 20, spacing floor(20*0.5) = 10: 3 dots span 80 px.
+    check "input-field: three dots span 80 px" "$dots" 80
+    # Wrong password: fail outline and fail text (red), until the fail timeout.
+    $T wtype -s 300 -k Return
+    sleep 0.6
+    check_colour "input-field: fail outline" "255 0 0" 160 92
+    local fail_text
+    fail_text=$(colour_width "255 0 0" 62 112 258 128)
+    [ "$fail_text" -gt 30 ] && pass "input-field: fail text drawn in the fail colour (${fail_text}px)" \
+        || fail "input-field: no fail text (${fail_text}px)"
+    kill -USR1 "$pid"
+    wait_exit "$pid"
+
+    # Text dots follow the font colour: red while the fail state shows, black again after it.
+    printf '%s\n' 'background { color "#ffffff"; }' 'animations { off; }' 'general { fail-timeout-ms 1500; }' \
+        'input-field { size 200 50; inner-color "#ffffff"; font-color "#000000"; dots text="W";' \
+        '  outline { width 4; color "#0000ff"; };' \
+        '  fail { color "#ff0000"; text ""; }; }' >"$XDG_RUNTIME_DIR/lock.kdl"
+    "$BIN" -c "$XDG_RUNTIME_DIR/lock.kdl" >"$LOG" 2>&1 &
+    pid=$!
+    wait_locked "$LOG" || { fail "input-field: dot text never locked"; kill "$pid"; return; }
+    $T wtype -s 300 x -k Return
+    sleep 0.5
+    $T wtype -s 300 ab
+    sleep 0.2
+    local red_dots black_dots
+    red_dots=$(colour_width "255 0 0" 62 100 258 140)
+    sleep 1.5
+    black_dots=$(colour_width "0 0 0" 62 100 258 140)
+    [ "$red_dots" -gt 0 ] && pass "input-field: text dots in the fail colour (${red_dots}px)" \
+        || fail "input-field: text dots not red during the fail state"
+    [ "$black_dots" -gt 0 ] && pass "input-field: text dots back to the font colour (${black_dots}px)" \
+        || fail "input-field: text dots stuck in the fail colour"
+    kill -USR1 "$pid"
+    wait_exit "$pid"
+
+    # hide-input recolours one quadrant of the outline itself (hyprlock clips the full border
+    # to the quadrant), never a box inside the field.
+    printf '%s\n' 'background { color "#000000"; }' 'animations { off; }' \
+        'input-field { size 200 80; corner-radius 0; inner-color "#ffffff";' \
+        '  outline { width 6; color "#0000ff"; }; hide-input "#ff0000"; }' >"$XDG_RUNTIME_DIR/lock.kdl"
+    "$BIN" -c "$XDG_RUNTIME_DIR/lock.kdl" >"$LOG" 2>&1 &
+    pid=$!
+    wait_locked "$LOG" || { fail "input-field: hide-input never locked"; kill "$pid"; return; }
+    # One key: quadrant 1 (top right). Outer box x 54..266, y 74..166; centre (160, 120).
+    $T wtype -s 300 a
+    sleep 0.4
+    local edge other inside
+    edge=$(pixel 240 77); other=$(pixel 80 77); inside=$(pixel 200 117)
+    { [ "$edge" != "0 0 255" ] && [ "$edge" != "255 255 255" ]; } \
+        && pass "input-field: hide-input recolours the outline ($edge)" \
+        || fail "input-field: hide-input outline not recoloured ($edge)"
+    check "input-field: hide-input leaves other quadrants" "$other" "0 0 255"
+    check "input-field: hide-input draws nothing inside the field" "$inside" "255 255 255"
+    kill -USR1 "$pid"
+    wait_exit "$pid"
+}
+
+t_screenshot() {
+    # swaybg paints the desktop magenta; the lock's screenshot background must show it.
+    swaybg -c '#ff00ff' >/dev/null 2>&1 &
+    local bg=$!
+    for _ in $(seq 30); do
+        [ "$(pixel 5 5)" = "255 0 255" ] && break
+        sleep 0.1
+    done
+    check "screenshot: desktop is magenta before locking" "$(pixel 5 5)" "255 0 255"
+    printf '%s\n' 'background { color "#204060"; screenshot; }' >"$XDG_RUNTIME_DIR/lock.kdl"
+    "$BIN" -c "$XDG_RUNTIME_DIR/lock.kdl" >"$LOG" 2>&1 &
+    local pid=$!
+    wait_locked "$LOG" || { fail "screenshot: never locked"; cat "$LOG"; kill "$pid" "$bg"; return; }
+    check_colour "screenshot: lock shows the desktop" "255 0 255" 160 120
+    kill -USR1 "$pid"
+    wait_exit "$pid"
+
+    # --immediate-render skips the capture: the colour shows instead.
+    "$BIN" --immediate-render -c "$XDG_RUNTIME_DIR/lock.kdl" >"$LOG" 2>&1 &
+    pid=$!
+    wait_locked "$LOG" || { fail "screenshot: immediate never locked"; kill "$pid" "$bg"; return; }
+    check_colour "screenshot: --immediate-render falls back to the colour" "32 64 96" 160 120
+    kill -USR1 "$pid"
+    wait_exit "$pid"
+    kill "$bg"
+}
+
+t_fade() {
+    cat >"$XDG_RUNTIME_DIR/lock.kdl" <<'EOF'
+background { color "#ffffff"; }
+animations {
+    fade-in { duration-ms 1500; curve "linear"; }
+    fade-out { duration-ms 1500; curve "linear"; }
+}
+EOF
+    "$BIN" -c "$XDG_RUNTIME_DIR/lock.kdl" >"$LOG" 2>&1 &
+    local pid=$!
+    wait_locked "$LOG" || { fail "fade: never locked"; cat "$LOG"; kill "$pid"; return; }
+    sleep 0.4
+    local early late
+    early=$(pixel 5 5 | cut -d' ' -f1)
+    sleep 1.6
+    late=$(pixel 5 5 | cut -d' ' -f1)
+    { [ "$early" -gt 10 ] && [ "$early" -lt 240 ]; } && pass "fade: partway through fade-in ($early)" \
+        || fail "fade: not mid-fade at 0.4 s ($early)"
+    check "fade: fully faded in" "$late" 255
+    # Fade out: the unlock waits for the animation, and the screen darkens first.
+    local t0 t1 mid
+    t0=$(date +%s%N)
+    kill -USR1 "$pid"
+    sleep 0.6
+    mid=$(pixel 5 5 | cut -d' ' -f1)
+    wait_exit "$pid"
+    t1=$(date +%s%N)
+    { [ "$mid" -gt 10 ] && [ "$mid" -lt 240 ]; } && pass "fade: partway through fade-out ($mid)" \
+        || fail "fade: not mid-fade-out at 0.6 s ($mid)"
+    local ms=$(( (t1 - t0) / 1000000 ))
+    { [ "$ms" -ge 1300 ] && [ "$ms" -lt 3500 ]; } && pass "fade: unlock waited for the fade-out (${ms} ms)" \
+        || fail "fade: unlock took ${ms} ms"
+
+    # --no-fade-in skips a configured fade-in.
+    printf '%s\n' 'background { color "#ffffff"; }' 'animations { fade-in { duration-ms 3000; }; }' \
+        >"$XDG_RUNTIME_DIR/nofade.kdl"
+    "$BIN" --no-fade-in -c "$XDG_RUNTIME_DIR/nofade.kdl" >"$LOG" 2>&1 &
+    pid=$!
+    wait_locked "$LOG" || { fail "fade: --no-fade-in never locked"; kill "$pid"; return; }
+    sleep 0.5
+    check "fade: --no-fade-in shows full colour at once" "$(pixel 5 5)" "255 255 255"
+    kill -USR1 "$pid"
+    wait_exit "$pid"
+
+    # `animations { off }` draws at full opacity at once.
+    printf '%s\n' 'background { color "#ffffff"; }' 'animations { off; }' >"$XDG_RUNTIME_DIR/off.kdl"
+    "$BIN" -c "$XDG_RUNTIME_DIR/off.kdl" >"$LOG" 2>&1 &
+    pid=$!
+    wait_locked "$LOG" || { fail "fade: off never locked"; kill "$pid"; return; }
+    check_colour "fade: animations off shows full colour" "255 255 255" 5 5
+    t0=$(date +%s%N)
+    kill -USR1 "$pid"
+    wait_exit "$pid"
+    t1=$(date +%s%N)
+    ms=$(( (t1 - t0) / 1000000 ))
+    [ "$ms" -lt 1000 ] && pass "fade: animations off unlocks at once (${ms} ms)" \
+        || fail "fade: animations off took ${ms} ms to unlock"
+
+    # A zero-length fade-out must still unlock (it once left the session wedged locked).
+    printf '%s\n' 'animations { fade-out { duration-ms 0; }; }' >"$XDG_RUNTIME_DIR/zero.kdl"
+    "$BIN" -c "$XDG_RUNTIME_DIR/zero.kdl" >"$LOG" 2>&1 &
+    pid=$!
+    wait_locked "$LOG" || { fail "fade: zero never locked"; kill "$pid"; return; }
+    sleep 1 # let the default fade-in finish, so its ticker is not the one that unlocks
+    kill -USR1 "$pid"
+    wait_exit "$pid"
+    check "fade: duration-ms 0 fade-out unlocks" "$?" 0
+}
+
+t_grace() {
+    printf '%s\n' 'animations { off; }' >"$XDG_RUNTIME_DIR/off.kdl"
+    "$BIN" --grace 3 -c "$XDG_RUNTIME_DIR/off.kdl" >"$LOG" 2>&1 &
+    local pid=$!
+    wait_locked "$LOG" || { fail "grace: never locked"; kill "$pid"; return; }
+    $T wtype -s 300 x
+    wait_exit "$pid"
+    check "grace: a key within the grace period unlocks" "$?" 0
+    "$BIN" --grace 1 -c "$XDG_RUNTIME_DIR/off.kdl" >"$LOG" 2>&1 &
+    pid=$!
+    wait_locked "$LOG" || { fail "grace: second never locked"; kill "$pid"; return; }
+    sleep 1.5
+    $T wtype -s 300 x
+    sleep 0.5
+    kill -0 "$pid" 2>/dev/null && pass "grace: after the grace period a key does not unlock" \
+        || fail "grace: unlocked after the grace period"
+    kill -USR1 "$pid"
+    wait_exit "$pid"
+}
+
+t_fingerprint() {
+    # A private bus stands in for the system bus, with a fake fprintd on it.
+    local busdir="$XDG_RUNTIME_DIR/bus"
+    mkdir -p "$busdir"
+    dbus-daemon --session --nofork --address="unix:path=$busdir/sock" --print-address >/dev/null 2>&1 &
+    local busd=$!
+    for _ in $(seq 30); do [ -S "$busdir/sock" ] && break; sleep 0.1; done
+    export DBUS_SYSTEM_BUS_ADDRESS="unix:path=$busdir/sock"
+
+    "$HERE/fake-fprintd" verify-finger-not-centered verify-no-match verify-match >"$XDG_RUNTIME_DIR/fprintd.log" 2>&1 &
+    local fake=$!
+    for _ in $(seq 30); do grep -q ready "$XDG_RUNTIME_DIR/fprintd.log" 2>/dev/null && break; sleep 0.1; done
+
+    cat >"$XDG_RUNTIME_DIR/lock.kdl" <<'EOF'
+background { color "#000000"; }
+auth { fingerprint { retry-delay-ms 100; }; }
+label { text "$FPRINTPROMPT"; font "Sans 12"; color "#ffffff"; }
+animations { off; }
+EOF
+    "$BIN" -c "$XDG_RUNTIME_DIR/lock.kdl" >"$LOG" 2>&1 &
+    local pid=$!
+    wait_locked "$LOG" || { fail "fingerprint: never locked"; cat "$LOG"; kill "$pid" "$fake" "$busd"; return; }
+    wait_exit "$pid"
+    check "fingerprint: a match unlocks" "$?" 0
+    local log
+    log=$(tr '\n' ' ' <"$XDG_RUNTIME_DIR/fprintd.log")
+    case "$log" in
+        *"VerifyStart any"*"status verify-no-match"*"VerifyStart any"*"status verify-match"*)
+            pass "fingerprint: retried after a non-match" ;;
+        *) fail "fingerprint: unexpected fprintd log: $log" ;;
+    esac
+    case "$log" in
+        *Release*) pass "fingerprint: device released on exit" ;;
+        *) fail "fingerprint: device not released: $log" ;;
+    esac
+    kill "$fake" 2>/dev/null
+
+    # Forged signals from a process that does not own net.reactivated.Fprint must be ignored,
+    # broadcast or addressed to the locker directly. The fake never reports a status here.
+    "$HERE/fake-fprintd" >"$XDG_RUNTIME_DIR/fprintd.log" 2>&1 &
+    fake=$!
+    for _ in $(seq 30); do grep -q ready "$XDG_RUNTIME_DIR/fprintd.log" 2>/dev/null && break; sleep 0.1; done
+    "$BIN" -c "$XDG_RUNTIME_DIR/lock.kdl" >"$LOG" 2>&1 &
+    pid=$!
+    wait_locked "$LOG" || { fail "fingerprint: forgery run never locked"; kill "$pid" "$fake" "$busd"; return; }
+    for _ in $(seq 30); do grep -q VerifyStart "$XDG_RUNTIME_DIR/fprintd.log" && break; sleep 0.1; done
+    # The forger must actually run, or this check proves nothing.
+    "$HERE/forge-fprint" broadcast >/dev/null && "$HERE/forge-fprint" directed >/dev/null \
+        || fail "fingerprint: forge-fprint did not run"
+    sleep 1.5
+    kill -0 "$pid" 2>/dev/null && pass "fingerprint: forged VerifyStatus does not unlock" \
+        || fail "fingerprint: a forged VerifyStatus unlocked the session"
+    # A forged PrepareForSleep must not stop scanning either.
+    "$HERE/forge-fprint" directed sleep >/dev/null || fail "fingerprint: forge-fprint did not run"
+    sleep 0.5
+    if grep -q VerifyStop "$XDG_RUNTIME_DIR/fprintd.log"; then
+        fail "fingerprint: a forged PrepareForSleep stopped scanning"
+    else
+        pass "fingerprint: forged PrepareForSleep ignored"
+    fi
+    kill -USR1 "$pid" 2>/dev/null
+    wait_exit "$pid"
+    kill "$fake" 2>/dev/null; wait "$fake" 2>/dev/null
+
+    # Sleep during the retry delay: the retry must not restart the scan while asleep; waking
+    # restarts it.
+    "$HERE/fake-fprintd" verify-no-match+sleep >"$XDG_RUNTIME_DIR/fprintd.log" 2>&1 &
+    fake=$!
+    for _ in $(seq 30); do grep -q ready "$XDG_RUNTIME_DIR/fprintd.log" 2>/dev/null && break; sleep 0.1; done
+    printf '%s\n' 'auth { fingerprint { retry-delay-ms 1000; }; }' 'animations { off; }' >"$XDG_RUNTIME_DIR/sleep.kdl"
+    "$BIN" -c "$XDG_RUNTIME_DIR/sleep.kdl" >"$LOG" 2>&1 &
+    pid=$!
+    wait_locked "$LOG" || { fail "fingerprint: sleep run never locked"; kill "$pid" "$fake" "$busd"; return; }
+    for _ in $(seq 60); do grep -q WAKE "$XDG_RUNTIME_DIR/fprintd.log" && break; sleep 0.1; done
+    sleep 0.5
+    log=$(tr '\n' ' ' <"$XDG_RUNTIME_DIR/fprintd.log")
+    case "$log" in
+        *SLEEP*VerifyStart*WAKE*) fail "fingerprint: scanning restarted while asleep: $log" ;;
+        *SLEEP*WAKE*VerifyStart*) pass "fingerprint: no scan while asleep, rescans on wake" ;;
+        *) fail "fingerprint: unexpected sleep log: $log" ;;
+    esac
+    case "$log" in
+        *WAKE*VerifyStart*VerifyStart*) fail "fingerprint: scan started twice after wake: $log" ;;
+    esac
+    kill -USR1 "$pid"
+    wait_exit "$pid"
+    kill "$fake" 2>/dev/null; wait "$fake" 2>/dev/null
+
+    # Four non-matches give up (three restarts, as hyprlock); the lock stays and PAM still works.
+    printf '%s\n' 'auth { fingerprint { retry-delay-ms 100; }; }' 'animations { off; }' \
+        "label { text \"cmd[update:200] echo \$ATTEMPTS > $XDG_RUNTIME_DIR/attempts\"; }" \
+        >"$XDG_RUNTIME_DIR/lock.kdl"
+    "$HERE/fake-fprintd" verify-no-match verify-no-match verify-no-match verify-no-match verify-match >"$XDG_RUNTIME_DIR/fprintd.log" 2>&1 &
+    fake=$!
+    for _ in $(seq 30); do grep -q ready "$XDG_RUNTIME_DIR/fprintd.log" 2>/dev/null && break; sleep 0.1; done
+    "$BIN" -c "$XDG_RUNTIME_DIR/lock.kdl" >"$LOG" 2>&1 &
+    pid=$!
+    wait_locked "$LOG" || { fail "fingerprint: second never locked"; kill "$pid" "$fake" "$busd"; return; }
+    sleep 3.5
+    kill -0 "$pid" 2>/dev/null && pass "fingerprint: gives up after four non-matches" \
+        || fail "fingerprint: unlocked after four non-matches"
+    # Each miss is a failed attempt, as in hyprlock: the cmd[] label sees $ATTEMPTS = 4.
+    grep -qx 4 "$XDG_RUNTIME_DIR/attempts" && pass "fingerprint: misses count as failed attempts" \
+        || fail "fingerprint: \$ATTEMPTS after four misses is '$(cat "$XDG_RUNTIME_DIR/attempts" 2>/dev/null)'"
+    $T wtype -s 300 "$PASSWORD" -k Return
+    wait_exit "$pid"
+    check "fingerprint: password still unlocks" "$?" 0
+
+    # No fprintd on the bus: the locker runs normally.
+    kill "$fake" 2>/dev/null; wait "$fake" 2>/dev/null
+    "$BIN" -c "$XDG_RUNTIME_DIR/lock.kdl" >"$LOG" 2>&1 &
+    pid=$!
+    wait_locked "$LOG" && pass "fingerprint: locks without fprintd" || fail "fingerprint: no lock without fprintd"
+    kill -USR1 "$pid"
+    wait_exit "$pid"
+    unset DBUS_SYSTEM_BUS_ADDRESS
+    kill "$busd"
+}
+
 t_validate() {
     echo 'ring-indicator { radius 0; }' >"$XDG_RUNTIME_DIR/bad.kdl"
     $T "$BIN" validate -c "$XDG_RUNTIME_DIR/bad.kdl" >"$LOG" 2>&1
@@ -204,6 +697,23 @@ t_validate() {
     check "validate: locker refuses a bad config" "$?" 1
     grep -q 'session locked' "$LOG" && fail "validate: locked despite a bad config" \
         || pass "validate: never locked with a bad config"
+    # Every kdl example in the spec, and the shipped example, must validate.
+    local spec="$HERE/../docs/specs/2026-10-19-swaywardlock.md" n=0 bad=0 f
+    while IFS= read -r f; do
+        n=$((n + 1))
+        "$BIN" validate -c "$f" >"$LOG" 2>&1 || { bad=$((bad + 1)); cat "$LOG"; }
+    done < <(python3 - "$spec" "$XDG_RUNTIME_DIR" <<'PY'
+import re, sys
+s = open(sys.argv[1]).read()
+for i, block in enumerate(re.findall(r"```kdl\n(.*?)```", s, re.S)):
+    path = f"{sys.argv[2]}/spec{i}.kdl"
+    open(path, "w").write(block)
+    print(path)
+PY
+    )
+    "$BIN" validate -c "$HERE/../examples/hyprlock-example.kdl" >"$LOG" 2>&1 || { bad=$((bad + 1)); cat "$LOG"; }
+    { [ "$n" -ge 7 ] && [ "$bad" = 0 ]; } && pass "validate: the spec's $n examples and the example config" \
+        || fail "validate: $bad of $n spec examples (+ example config) failed"
 }
 
 t_sigusr1() {
@@ -231,6 +741,20 @@ t_ready_fd() {
     local pid=$!
     wait_locked "$LOG" || fail "ready-fd: never locked"
     check "ready-fd: newline written" "$(od -An -c "$ready" | tr -d ' ')" '\n'
+    kill -USR1 "$pid"
+    wait_exit "$pid"
+
+    # cmd[] children must not inherit the ready fd: one could signal "locked" early.
+    local fds="$XDG_RUNTIME_DIR/child-fds"
+    printf '%s\n' "label { text \"cmd[] ls /proc/\$\$/fd > $fds; echo x\"; }" 'animations { off; }' \
+        >"$XDG_RUNTIME_DIR/fd.kdl"
+    "$BIN" -c "$XDG_RUNTIME_DIR/fd.kdl" --ready-fd 9 9>"$ready" >"$LOG" 2>&1 &
+    pid=$!
+    wait_locked "$LOG" || fail "ready-fd: cmd run never locked"
+    for _ in $(seq 30); do [ -s "$fds" ] && break; sleep 0.1; done
+    [ -s "$fds" ] || fail "ready-fd: the cmd[] child never ran"
+    grep -qx 9 "$fds" && fail "ready-fd: a cmd[] child inherited fd 9" \
+        || pass "ready-fd: not inherited by cmd[] children"
     kill -USR1 "$pid"
     wait_exit "$pid"
 }
@@ -265,7 +789,7 @@ t_no_display() {
     check "no display: exit code" "$?" 1
 }
 
-TESTS=${TESTS:-password defaults image converted broken-image failing-widget validate sigusr1 early-unlock ready-fd daemonize second-locker no-display}
+TESTS=${TESTS:-password defaults image converted broken-image failing-widget preview labels input-field screenshot fade grace fingerprint validate sigusr1 early-unlock ready-fd daemonize second-locker no-display}
 for t in $TESTS; do
     run_test "$t" "t_${t//-/_}"
 done
