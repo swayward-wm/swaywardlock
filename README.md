@@ -4,8 +4,7 @@
 
 > The ring got a glow-up.
 
-<!-- SCREENSHOT: the animated ring style mid-typing over a blurred screenshot (examples/swayward-ring.kdl) -->
-![PLACEHOLDER: swaywardlock's animated ring over a blurred screenshot](docs/screenshots/PLACEHOLDER-ring.png)
+![A large glowing ring and clock over a blurred wallpaper, rendered by swaywardlock](docs/screenshots/ring.png)
 
 swaywardlock draws a modern lock screen: blurred screenshots with vibrancy, labels and clocks,
 an input field, images, shapes, gradients, shadows, rotation, animations, a ring that glows and
@@ -100,6 +99,9 @@ and slow workers. A crash can still leave a locked session requiring recovery.
 
 ## Quickstart
 
+Without a config file you get the classic swaylock look. To customize it, convert your existing
+config or start from an example:
+
 ```
 mkdir -p ~/.config/swaywardlock
 swaywardlock-hyprlock-to-kdl ~/.config/hypr/hyprlock.conf > ~/.config/swaywardlock/config.kdl
@@ -115,10 +117,9 @@ In your idle setup, replace `swaylock` with `swaywardlock`:
 swayidle -w timeout 300 'swaywardlock -f' before-sleep 'swaywardlock -f'
 ```
 
-Without a config file you get the classic swaylock look.
+A custom hyprlock-style layout, with oversized widgets and an unblurred wallpaper:
 
-<!-- SCREENSHOT: hyprlock's sample config converted (examples/hyprlock-example.kdl) -->
-![PLACEHOLDER: hyprlock's sample config, converted and drawn by swaywardlock](docs/screenshots/PLACEHOLDER-hyprlock-example.png)
+![A large clock, date and gradient-outlined password field over a sharp wallpaper, rendered by swaywardlock](docs/screenshots/widgets.png)
 
 ## More
 

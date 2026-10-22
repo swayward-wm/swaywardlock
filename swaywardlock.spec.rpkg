@@ -148,6 +148,7 @@ install -Dm644 -t %{buildroot}%{zsh_completions_dir} ./_swaywardlock
 
 install -Dm644 docs/USING.md %{buildroot}%{_docdir}/%{name}/docs/USING.md
 install -Dm644 docs/screenshots/README.md %{buildroot}%{_docdir}/%{name}/docs/screenshots/README.md
+install -Dm644 -t %{buildroot}%{_docdir}/%{name}/docs/screenshots docs/screenshots/*.png
 # Keep repository links as well as the man page's existing specs path.
 ln -s ../specs %{buildroot}%{_docdir}/%{name}/docs/specs
 

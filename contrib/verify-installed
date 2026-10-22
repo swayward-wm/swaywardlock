@@ -44,7 +44,10 @@ done
 cmp README.md "$doc/README.md" || fail "README.md is not shipped as is"
 cmp docs/USING.md "$doc/docs/USING.md" || fail "docs/USING.md is not shipped as is"
 cmp docs/screenshots/README.md "$doc/docs/screenshots/README.md" \
-    || fail "screenshot placeholder note is missing or changed"
+    || fail "screenshot documentation is missing or changed"
+for shot in docs/screenshots/*.png; do
+    cmp "$shot" "$doc/$shot" || fail "$shot is not shipped as is"
+done
 for spec in docs/specs/*.md; do
     cmp "$spec" "$doc/$spec" || fail "$spec link is missing or changed"
 done

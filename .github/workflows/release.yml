@@ -134,6 +134,7 @@ jobs:
           install -Dm644 README.md "$stage/README.md"
           install -Dm644 docs/USING.md "$stage/docs/USING.md"
           install -Dm644 docs/screenshots/README.md "$stage/docs/screenshots/README.md"
+          install -Dm644 -t "$stage/docs/screenshots" docs/screenshots/*.png
           # The tarball still omits design documents; point those links at the exact tag.
           python3 - "$stage" "$version" <<'PY'
           import pathlib
@@ -196,6 +197,9 @@ jobs:
           cmp "$stage/share/pam.d/swaywardlock" pam/swaywardlock
           test -s "$stage/docs/USING.md"
           cmp "$stage/docs/screenshots/README.md" docs/screenshots/README.md
+          for shot in docs/screenshots/*.png; do
+            cmp "$stage/$shot" "$shot"
+          done
           grep -F ']('"https://github.com/swayward-wm/swaywardlock/blob/swaywardlock-v${{ github.event.inputs.version }}/docs/specs/" "$stage/README.md" "$stage/docs/USING.md"
           "$stage/bin/swaywardlock-swaylock-to-kdl" --help > /dev/null
           "$stage/bin/swaywardlock-hyprlock-to-kdl" --help > /dev/null
