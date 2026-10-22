@@ -405,6 +405,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           draft: true
+          prerelease: ${{ contains(github.event.inputs.version, '-') }}
           generate_release_notes: true
           tag_name: swaywardlock-v${{ github.event.inputs.version }}
           files: release-files/*
