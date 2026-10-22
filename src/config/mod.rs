@@ -72,6 +72,9 @@ impl Default for General {
 pub struct Auth {
     /// PAM service name; `None` disables PAM.
     pub pam_service: Option<String>,
+    /// `pam { reuse-password; }`: a question asked again with the same text in one transaction
+    /// is answered with the previous answer (stacks with two password modules).
+    pub pam_reuse_password: bool,
     /// fprintd fingerprint unlock; `None` (the default) disables it.
     pub fingerprint: Option<Fingerprint>,
 }
@@ -80,6 +83,7 @@ impl Default for Auth {
     fn default() -> Self {
         Self {
             pam_service: Some("swaywardlock".into()),
+            pam_reuse_password: false,
             fingerprint: None,
         }
     }
@@ -112,6 +116,17 @@ pub struct Animations {
     pub fade_in: Animation,
     pub fade_out: Animation,
     pub input_field_fade: Animation,
+    pub input_field_width: Animation,
+    pub input_field_colors: Animation,
+    pub input_field_dots: Animation,
+    /// The swayward ring style: state colour crossfade.
+    pub ring_colors: Animation,
+    /// The swayward ring style: typing highlight sweep and its trail.
+    pub ring_highlight: Animation,
+    /// The swayward ring style: fade and scale in, fade out.
+    pub ring_appear: Animation,
+    /// The swayward ring style: shake and flash on a wrong password.
+    pub ring_wrong: Animation,
 }
 
 fn easing(ms: u32, curve: AnimationCurve) -> Animation {
@@ -132,6 +147,13 @@ impl Default for Animations {
             fade_in: easing(200, AnimationCurve::EaseOutCubic),
             fade_out: easing(200, AnimationCurve::EaseOutCubic),
             input_field_fade: easing(300, AnimationCurve::EaseOutCubic),
+            input_field_width: easing(300, AnimationCurve::EaseOutCubic),
+            input_field_colors: easing(300, AnimationCurve::Linear),
+            input_field_dots: easing(200, AnimationCurve::Linear),
+            ring_colors: easing(250, AnimationCurve::EaseOutCubic),
+            ring_highlight: easing(180, AnimationCurve::EaseOutCubic),
+            ring_appear: easing(250, AnimationCurve::EaseOutCubic),
+            ring_wrong: easing(450, AnimationCurve::Linear),
         }
     }
 }

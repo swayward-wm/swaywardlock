@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+"""A Wayland proxy for e2e tests: hides wl_keyboard key releases and leaves from the client.
+
+    WAYLAND_DISPLAY=<upstream> wl-drop-key-release
+
+Listens on $XDG_RUNTIME_DIR/wayland-droprel-0, forwards every connection to $WAYLAND_DISPLAY,
+and drops every wl_keyboard `key` event with state released and every `leave` event. The
+protocol does not require either before a seat's keyboard capability goes away, so a client
+must stop a held key's repeat when it releases the keyboard, without a release or leave.
+Creates $XDG_RUNTIME_DIR/droprel-ready once it listens.
+"""
+
+import array
+import os
+import select
+import socket
+import struct
+import threading
+
+RUNTIME = os.environ["XDG_RUNTIME_DIR"]
+UPSTREAM = os.path.join(RUNTIME, os.environ["WAYLAND_DISPLAY"])
+WL_REGISTRY_BIND, WL_SEAT_GET_KEYBOARD = 0, 1
+WL_KEYBOARD_LEAVE, WL_KEYBOARD_KEY = 2, 3
+RELEASED = 0
+
+
+def recv(sock):
+    fds = array.array("i")
+    data, anc, _, _ = sock.recvmsg(65536, socket.CMSG_LEN(64 * 4))
+    for level, kind, payload in anc:
+        if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+            fds.frombytes(payload[: len(payload) - len(payload) % 4])
+    return data, list(fds)
+
+
+def send(sock, data, fds):
+    if fds:
+        sock.sendmsg([data], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", fds))])
+        for fd in fds:
+            os.close(fd)
+    elif data:
+        sock.sendall(data)
+
+
+def messages(buf):
+    """Split whole messages off buf: ([(object id, opcode, bytes)], rest)."""
+    out = []
+    while len(buf) >= 8:
+        oid, word = struct.unpack("<II", buf[:8])
+        size = word >> 16
+        if size < 8 or len(buf) < size:
+            break
+        out.append((oid, word & 0xFFFF, buf[:size]))
+        buf = buf[size:]
+    return out, buf
+
+
+def serve(client):
+    server = socket.socket(socket.AF_UNIX)
+    server.connect(UPSTREAM)
+    registry, seats, keyboards = set(), set(), set()
+    cbuf = sbuf = b""
+    cfds, sfds = [], []
+    try:
+        while True:
+            ready, _, _ = select.select([client, server], [], [])
+            for sock in ready:
+                data, fds = recv(sock)
+                if not data and not fds:
+                    return
+                out = b""
+                if sock is client:
+                    msgs, cbuf = messages(cbuf + data)
+                    cfds += fds
+                    for oid, op, msg in msgs:
+                        if oid == 1 and op == 1:  # wl_display.get_registry
+                            registry.add(struct.unpack("<I", msg[8:12])[0])
+                        elif oid in registry and op == WL_REGISTRY_BIND:
+                            n = struct.unpack("<I", msg[12:16])[0]
+                            if msg[16 : 16 + n - 1] == b"wl_seat":
+                                seats.add(struct.unpack("<I", msg[-4:])[0])
+                        elif oid in seats and op == WL_SEAT_GET_KEYBOARD:
+                            keyboards.add(struct.unpack("<I", msg[8:12])[0])
+                        out += msg
+                    send(server, out, cfds)
+                    cfds = []
+                else:
+                    msgs, sbuf = messages(sbuf + data)
+                    sfds += fds
+                    for oid, op, msg in msgs:
+                        if oid in keyboards and (
+                            op == WL_KEYBOARD_LEAVE
+                            or (op == WL_KEYBOARD_KEY and struct.unpack("<I", msg[-4:])[0] == RELEASED)
+                        ):
+                            continue
+                        out += msg
+                    send(client, out, sfds)
+                    sfds = []
+    except OSError:
+        pass
+
+
+listener = socket.socket(socket.AF_UNIX)
+listener.bind(os.path.join(RUNTIME, "wayland-droprel-0"))
+listener.listen(8)
+open(os.path.join(RUNTIME, "droprel-ready"), "w").close()
+while True:
+    conn, _ = listener.accept()
+    threading.Thread(target=serve, args=(conn,), daemon=True).start()

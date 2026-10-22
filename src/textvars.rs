@@ -52,6 +52,12 @@ impl Template {
         Template::Cmd(cmd)
     }
 
+    /// Whether `text` is a `cmd[...]` label: the prefix and a closing `]`, as in hyprlock.
+    /// Anything else is plain text, even if it starts with `cmd[`.
+    pub fn is_cmd(text: &str) -> bool {
+        matches!(Self::parse(text), Template::Cmd(_))
+    }
+
     /// Whether the text shows the clock, so it must redraw when the minute changes.
     pub fn uses_time(&self) -> bool {
         let s = match self {
@@ -169,15 +175,6 @@ pub fn local_time() -> (u32, u32) {
     }
 }
 
-/// Time until the next minute starts, for clock labels.
-pub fn until_next_minute() -> Duration {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    Duration::from_secs(60 - now.as_secs() % 60) - Duration::from_nanos(now.subsec_nanos().into())
-        + Duration::from_millis(5)
-}
-
 /// The login name and GECOS name of the current user.
 pub fn user_names() -> (String, String) {
     // SAFETY: getpwuid_r with a local buffer.
@@ -226,6 +223,15 @@ mod tests {
             pam_prompt: "Password: ",
             ..Vars::default()
         }
+    }
+
+    /// hyprlock needs the closing `]`; without it the text is shown as is.
+    #[test]
+    fn cmd_needs_a_closing_bracket() {
+        assert!(Template::is_cmd("cmd[] date"));
+        assert!(Template::is_cmd("cmd[update:1000] date"));
+        assert!(!Template::is_cmd("cmd[ HELLO"));
+        assert!(!Template::is_cmd("cmd HELLO"));
     }
 
     #[test]
@@ -313,9 +319,14 @@ mod tests {
         assert!(!Template::parse("cmd[update:1000] date").uses_time());
     }
 
+    /// `$USER` is the login name of the user running the locker.
     #[test]
-    fn next_minute_is_within_a_minute() {
-        let d = until_next_minute();
-        assert!(d > Duration::ZERO && d <= Duration::from_secs(61), "{d:?}");
+    fn user_is_the_login_name() {
+        let out = std::process::Command::new("id")
+            .arg("-un")
+            .output()
+            .expect("id");
+        let want = String::from_utf8(out.stdout).unwrap();
+        assert_eq!(user_names().0, want.trim());
     }
 }

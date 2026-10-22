@@ -47,7 +47,17 @@ impl RoundedBox {
         }
     }
 
-    fn update(&mut self, p: Params) {
+    fn update(&mut self, mut p: Params) {
+        // A zero-width border is no border (hyprlock's border_size 0): the border shader cuts
+        // its interior out only for a positive width, so it would paint the whole box.
+        p.border = p.border.filter(|b| b.width > 0.);
+        // Whole physical pixels, as the shadow geometry expects: on a tiny output a sub-pixel box
+        // with its radius ceiled to a pixel made a negative Size (a debug-build abort).
+        p.size = p
+            .size
+            .to_physical_precise_round::<f64, i32>(p.scale)
+            .to_f64()
+            .to_logical(p.scale);
         if self.params == Some(p) {
             return;
         }
@@ -102,7 +112,7 @@ impl RoundedBox {
         if params.fill.is_some() {
             push(Element::Border(self.fill.clone().with_location(location)));
         }
-        if params.border.is_some() {
+        if self.params.is_some_and(|p| p.border.is_some()) {
             push(Element::Border(self.border.clone().with_location(location)));
         }
     }

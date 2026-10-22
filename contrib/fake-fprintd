@@ -10,9 +10,22 @@ locker's PrepareForSleep handling runs (and a forged one can be told apart from 
 
 A status with a `+sleep` suffix (`verify-no-match+sleep`) is followed 0.1 s later by logind's
 PrepareForSleep(true) and 2 s later by PrepareForSleep(false), logged as SLEEP and WAKE.
+`+quicksleep` wakes after 0.4 s instead, inside a 1 s retry delay.
+
+Like fprintd (device.c can_start_action), a VerifyStart while a verify session is open, that is
+until VerifyStop, fails with net.reactivated.Fprint.Error.AlreadyInUse (logged as REFUSED), and
+one before Claim fails with net.reactivated.Fprint.Error.ClaimDevice (logged as REFUSED too).
+
+The status `finger-present` is not a VerifyStatus: it sets the device's finger-present property
+(PropertiesChanged), as fprintd does when a finger touches the reader, and the next status
+follows 0.4 s later. `pause` sends nothing and waits 2 s before the next status.
+
+Log lines after "ready" start with the milliseconds since the fake started, e.g.
+"1234 VerifyStart any", so a test can check the delays between steps.
 """
 
 import sys
+import time
 
 import dbus
 import dbus.service
@@ -21,6 +34,7 @@ from gi.repository import GLib
 
 DEVICE_PATH = "/net/reactivated/Fprint/Device/0"
 DEV = "net.reactivated.Fprint.Device"
+T0 = time.monotonic()
 
 
 class Manager(dbus.service.Object):
@@ -40,20 +54,35 @@ class Device(dbus.service.Object):
         super().__init__(bus, DEVICE_PATH)
         self.statuses = list(statuses)
         self.logind = logind
+        self.verifying = False
+        self.claimed = False
 
     def log(self, what):
-        print(what, flush=True)
+        print(int((time.monotonic() - T0) * 1000), what, flush=True)
 
     @dbus.service.method(DEV, in_signature="s")
     def Claim(self, user):
+        self.claimed = True
         self.log("Claim")
 
     @dbus.service.method(DEV)
     def Release(self):
+        self.claimed = False
         self.log("Release")
 
     @dbus.service.method(DEV, in_signature="s")
     def VerifyStart(self, finger):
+        if not self.claimed:
+            self.log("VerifyStart REFUSED ClaimDevice")
+            raise dbus.exceptions.DBusException(
+                "Device was not claimed before use", name="net.reactivated.Fprint.Error.ClaimDevice"
+            )
+        if self.verifying:
+            self.log("VerifyStart REFUSED AlreadyInUse")
+            raise dbus.exceptions.DBusException(
+                "Verification already in progress", name="net.reactivated.Fprint.Error.AlreadyInUse"
+            )
+        self.verifying = True
         self.log("VerifyStart " + finger)
         if self.statuses:
             status = self.statuses.pop(0)
@@ -61,6 +90,7 @@ class Device(dbus.service.Object):
 
     @dbus.service.method(DEV)
     def VerifyStop(self):
+        self.verifying = False
         self.log("VerifyStop")
 
     def sleep(self, starting):
@@ -69,12 +99,23 @@ class Device(dbus.service.Object):
         return False
 
     def emit(self, status):
+        if status == "pause":
+            if self.statuses:
+                GLib.timeout_add(2000, self.emit, self.statuses.pop(0))
+            return False
+        if status == "finger-present":
+            self.log("finger-present")
+            self.PropertiesChanged(DEV, {"finger-present": dbus.Boolean(True)}, dbus.Array([], signature="s"))
+            if self.statuses:
+                GLib.timeout_add(400, self.emit, self.statuses.pop(0))
+            return False
         status, _, then = status.partition("+")
-        if then == "sleep":
+        if then in ("sleep", "quicksleep"):
             GLib.timeout_add(100, self.sleep, True)
-            GLib.timeout_add(2000, self.sleep, False)
+            GLib.timeout_add(2000 if then == "sleep" else 400, self.sleep, False)
         self.log("status " + status)
         done = status in ("verify-match", "verify-no-match")
+        # The verify session stays open after a final status, until VerifyStop.
         self.VerifyStatus(status, done)
         # Like fprintd, retry statuses keep the scan going: send the next one without waiting
         # for another VerifyStart.
@@ -84,6 +125,10 @@ class Device(dbus.service.Object):
 
     @dbus.service.signal(DEV, signature="sb")
     def VerifyStatus(self, result, done):
+        pass
+
+    @dbus.service.signal("org.freedesktop.DBus.Properties", signature="sa{sv}as")
+    def PropertiesChanged(self, iface, changed, invalidated):
         pass
 
 

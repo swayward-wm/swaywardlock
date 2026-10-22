@@ -23,6 +23,7 @@ Source: `swayward-wm/swayward` at `339f99e8d70c099f75aaad86dcc8b23c9cd32bd2`.
 | `src/render/border.rs` | `src/render_helpers/border.rs` | trimmed: `TtyRenderer` impl removed, `NiriRenderer` → `GlesRenderer`, tracy spans removed |
 | `src/render/shadow.rs` | `src/render_helpers/shadow.rs` | trimmed: as `border.rs` |
 | `src/render/resources.rs` | `src/render_helpers/resources.rs` | trimmed: tracy span removed, log macros qualified |
+| `src/render/offscreen.rs` (`encompassing_geo`, `create_texture`, `render_to_encompassing_texture`, `render_to_texture`, `render_elements`) | `src/render_helpers/mod.rs` | trimmed: only these functions; tracy span and sync point removed, `Transform::Normal` fixed, `Abgr8888` fixed, transparent padding and a texture size check added, elements drawn in the order given |
 | `src/render/shadow_geometry.rs` | `src/layout/shadow.rs` | trimmed: `NiriRenderer` → `GlesRenderer`, config paths adjusted |
 | `src/animation/mod.rs` | `src/animation/mod.rs` | trimmed: config paths adjusted, tracy span removed |
 | `src/animation/bezier.rs`, `spring.rs` | `src/animation/` | verbatim |
@@ -30,11 +31,22 @@ Source: `swayward-wm/swayward` at `339f99e8d70c099f75aaad86dcc8b23c9cd32bd2`.
 | `src/config/copied/animations/decode.rs` | `swayward-config/src/animations/decode.rs` | trimmed: imports, `decode_node` made public, product name in an error message |
 | `src/config/copied/animations/types.rs` | `swayward-config/src/animations/types.rs` | trimmed: only `Animation`, `Kind`, `EasingParams`, `Curve`, `SpringParams` |
 | `src/render/shaders/mod.rs` | `src/render_helpers/shaders/mod.rs` | rewritten from the original: only border, shadow and blur programs |
+| `src/render/shaders/postprocess.frag` (`hash12`, `saturate`) | `src/render_helpers/shaders/postprocess.frag` | ported: the two functions and the noise/saturation lines of `postprocess()`, in a new shader with hyprlock's vibrancy (see Other copied files); not checked by `contrib/copied-diff`. `hash12` is David Hoskins' (MIT) |
 | `src/render/shaders/blur.vert`, `blur_down.frag`, `blur_up.frag`, `border.frag`, `shadow.frag`, `rounding_alpha.frag`, `texture.vert` | `src/render_helpers/shaders/` | verbatim |
 
 Not copied, written for swaywardlock: the widget nodes (`src/config/widgets.rs`), the ring
 (`src/render/ring.rs`, a port of swaylock's `render.c`), background fitting
-(`src/render/background.rs`, after swaylock's `background-image.c`) and everything else.
+(`src/render/background.rs`, after swaylock's `background-image.c`), the rotated texture element
+(`src/render/rotated.rs`) and everything else.
+
+## Other copied files
+
+Not swayward code, so outside the table above and not checked by `contrib/copied-diff`.
+
+| Destination | Source | Licence |
+|---|---|---|
+| `src/render/shaders/postprocess.frag` (`doubleCircleSigmoid`, `rgb2hsl`, `hsl2rgb`, `vibrancyBoost`) | hyprlock `src/renderer/Shaders.hpp` `FRAGBLUR1` at `0332e40`, ported: the vibrancy branch of its `main` became `vibrancyBoost`, out of the blur pass | BSD-3-Clause, Copyright (c) 2024, Hypr Development (hyprlock `LICENSE`) |
+| `contrib/fixtures/hyprlock-example.conf` | hyprlock `assets/example.conf` at `0332e40`, verbatim apart from a two-line header comment naming the source | BSD-3-Clause, Copyright (c) 2024, Hypr Development (hyprlock `LICENSE`) |
 
 ## Keeping up
 

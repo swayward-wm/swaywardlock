@@ -2,3 +2,6 @@
 __pycache__/
 *.snap.new
 /target
+/contrib/src/
+/contrib/pkg/
+/contrib/*.pkg.tar.*

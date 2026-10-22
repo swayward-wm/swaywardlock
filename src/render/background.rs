@@ -12,13 +12,43 @@ use crate::config::{Color, Fit};
 /// A decoded image as a premultiplied cairo surface.
 pub struct Image(cairo::ImageSurface);
 
+/// Formats `Image::load` decodes, by extension, for messages (content is sniffed regardless).
+pub const FORMATS: &str = "png, jpeg, webp, gif, bmp, tiff, ico, jxl";
+
 impl Image {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
-        let img = image::ImageReader::open(path)
+        // Idempotent: returns false once registered.
+        jxl_oxide::integration::register_image_decoding_hook();
+        let reader = image::ImageReader::open(path)
             .with_context(|| format!("error opening {path:?}"))?
-            .with_guessed_format()?
-            .decode()
-            .with_context(|| format!("error decoding {path:?}"))?
+            .with_guessed_format()?;
+        // AVIF decoding needs the system dav1d library (image's avif-native); not built in.
+        if reader.format() == Some(image::ImageFormat::Avif) {
+            anyhow::bail!("error decoding {path:?}: AVIF is not supported (supported: {FORMATS})");
+        }
+        // jxl-oxide (a hook format, so no built-in format here) already applies the codestream
+        // orientation, which JPEG XL says wins over any Exif tag.
+        let builtin = reader.format().is_some();
+        let decoded = (|| {
+            use image::ImageDecoder as _;
+            let mut decoder = reader.into_decoder()?;
+            // decode() checks the buffer against the default allocation limit; so do we.
+            image::Limits::default().reserve(decoder.total_bytes())?;
+            // Like swaylock's gdk_pixbuf_apply_embedded_orientation: a phone photo tagged
+            // "rotate 90" is shown upright. An unreadable tag is no rotation.
+            let orientation = if builtin {
+                decoder
+                    .orientation()
+                    .unwrap_or(image::metadata::Orientation::NoTransforms)
+            } else {
+                image::metadata::Orientation::NoTransforms
+            };
+            let mut img = image::DynamicImage::from_decoder(decoder)?;
+            img.apply_orientation(orientation);
+            Ok::<_, image::ImageError>(img)
+        })();
+        let img = decoded
+            .with_context(|| format!("error decoding {path:?} (supported: {FORMATS})"))?
             .into_rgba8();
         let (w, h) = img.dimensions();
         let mut surface = cairo::ImageSurface::create(cairo::Format::ARgb32, w as i32, h as i32)?;
@@ -300,5 +330,92 @@ mod tests {
         let mut s = render(black, Some(&img), Fit::Center, 40, 30).unwrap();
         assert_eq!(pixel(&mut s, 12, 15), RED);
         assert_eq!(pixel(&mut s, 5, 5), BLACK);
+    }
+
+    /// Fixtures: 4x4 solid red, written by ImageMagick.
+    fn testdata(name: &str) -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/render/testdata")
+            .join(name)
+    }
+
+    /// swaylock loads through gdk-pixbuf, which reads these too; Fedora's stock wallpaper is jxl.
+    #[test]
+    fn decodes_tiff_ico_and_jxl() {
+        for name in ["red.tif", "red.ico", "red.jxl"] {
+            let img = Image::load(&testdata(name)).unwrap_or_else(|e| panic!("{name}: {e:#}"));
+            assert_eq!(img.size(), (4, 4), "{name}");
+            let mut s = img.0;
+            assert_eq!(pixel(&mut s, 0, 0), [255, 0, 0, 255], "{name}");
+        }
+    }
+
+    /// swaylock applies the Exif orientation (gdk_pixbuf_apply_embedded_orientation); a phone
+    /// photo tagged "rotate 90" was shown sideways. The fixtures are one 16x8 image (left half
+    /// red, right half blue, its top-left 4x4 corner green) with only the Orientation tag set
+    /// (exiv2), in JPEG, PNG, WebP and 8-bit RGB TIFF.
+    #[test]
+    fn exif_orientation_is_applied() {
+        const GREEN: [u8; 4] = [0, 255, 0, 255];
+        /// A pixel and the colour expected there.
+        type Sample = ((usize, usize), [u8; 4]);
+        // (fixture, displayed size, samples)
+        let cases: [(&str, (i32, i32), [Sample; 3]); 6] = [
+            // 180: blue left, red right, green bottom-right.
+            (
+                "exif3.jpg",
+                (16, 8),
+                [((2, 4), BLUE), ((10, 2), RED), ((14, 6), GREEN)],
+            ),
+            // 90 clockwise: 8x16, red on top, blue below, green top-right.
+            (
+                "exif6.jpg",
+                (8, 16),
+                [((2, 6), RED), ((4, 12), BLUE), ((6, 2), GREEN)],
+            ),
+            (
+                "exif6.png",
+                (8, 16),
+                [((2, 6), RED), ((4, 12), BLUE), ((6, 2), GREEN)],
+            ),
+            (
+                "exif6.webp",
+                (8, 16),
+                [((2, 6), RED), ((4, 12), BLUE), ((6, 2), GREEN)],
+            ),
+            (
+                "exif6.tif",
+                (8, 16),
+                [((2, 6), RED), ((4, 12), BLUE), ((6, 2), GREEN)],
+            ),
+            // 90 counter-clockwise: 8x16, blue on top, red below, green bottom-left.
+            (
+                "exif8.jpg",
+                (8, 16),
+                [((4, 2), BLUE), ((6, 10), RED), ((2, 14), GREEN)],
+            ),
+        ];
+        for (name, size, samples) in cases {
+            let img = Image::load(&testdata(name)).unwrap_or_else(|e| panic!("{name}: {e:#}"));
+            assert_eq!(img.size(), size, "{name}");
+            let mut s = img.0;
+            for ((x, y), want) in samples {
+                let got = pixel(&mut s, x, y);
+                let near = got
+                    .iter()
+                    .zip(want)
+                    .all(|(&a, b)| (i32::from(a) - i32::from(b)).abs() <= 8);
+                assert!(near, "{name} ({x}, {y}): {got:?}, want {want:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn avif_fails_with_a_clear_message() {
+        let err = Image::load(&testdata("red.avif")).err().unwrap();
+        assert!(
+            format!("{err:#}").contains("AVIF is not supported"),
+            "{err:#}"
+        );
     }
 }

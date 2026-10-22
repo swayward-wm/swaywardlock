@@ -73,27 +73,43 @@ impl Fades {
     pub fn tick_clock(&mut self) {
         self.clock.clear();
     }
+
+    /// The shared animation clock; the input fields' animations run on it too.
+    pub fn clock(&self) -> &Clock {
+        &self.clock
+    }
 }
 
-/// Make sure a redraw timer runs while an animation is in progress. It stops itself when the
-/// animations finish, and performs the pending unlock after a fade out.
+/// Make sure a redraw timer runs while an animation is in progress: a whole-screen fade or, until
+/// an unlock is pending, an input-field animation. It stops itself when they finish, and performs
+/// the pending unlock as soon as the fade out ends, whatever the fields are doing.
 pub fn ensure_ticking(app: &mut App) {
-    if app.fades.ticking || !app.fades.is_animating() {
+    if app.fades.ticking || !app.needs_frames() {
         return;
     }
     app.fades.ticking = true;
     let handle: LoopHandle<'static, App> = app.handle.clone();
     let _ = handle.insert_source(Timer::from_duration(FRAME), |_, _, app| {
+        if app.exit.is_some() {
+            // Unlocked (or finished) while animating: the surfaces are gone.
+            app.fades.ticking = false;
+            return TimeoutAction::Drop;
+        }
         app.fades.tick_clock();
         app.draw_all();
         if app.fades.is_animating() {
             return TimeoutAction::ToDuration(FRAME);
         }
-        app.fades.ticking = false;
         if app.fades.unlock_when_done {
+            app.fades.ticking = false;
             app.fades.unlock_when_done = false;
             app.finish_unlock();
+            return TimeoutAction::Drop;
         }
+        if app.needs_frames() {
+            return TimeoutAction::ToDuration(FRAME);
+        }
+        app.fades.ticking = false;
         TimeoutAction::Drop
     });
 }

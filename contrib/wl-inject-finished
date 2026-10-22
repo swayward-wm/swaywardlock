@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+"""A Wayland proxy for e2e tests: sends ext_session_lock_v1.finished right after locked.
+
+    WAYLAND_DISPLAY=<upstream> wl-inject-finished [--error [--keep-open]] LOG
+
+Listens on $XDG_RUNTIME_DIR/wayland-inject-0 and forwards every connection to $WAYLAND_DISPLAY.
+Right after the compositor's `locked` event it injects `finished` on the same lock object,
+which the protocol allows ("may still be sent at some later time"). It logs the client's
+requests on the lock object and any wl_display.error from the compositor to LOG, so a test can
+check the client answers with unlock_and_destroy, not destroy (a protocol error after locked).
+
+With --error it sends a wl_display.error on the lock object one second after `locked` instead,
+then closes the connection as a compositor does; --keep-open leaves the socket open, so only the
+error itself can make the client stop.
+
+With --hold-locked FILE it injects nothing: it holds `locked` (and every event after it) until FILE
+exists, logging "held locked", so a test can make an unlock request reach the client before
+`locked` does, however fast the compositor is.
+"""
+
+import array
+import os
+import select
+import socket
+import struct
+import sys
+import threading
+import time
+
+RUNTIME = os.environ["XDG_RUNTIME_DIR"]
+UPSTREAM = os.path.join(RUNTIME, os.environ["WAYLAND_DISPLAY"])
+ARGS = sys.argv[1:]
+ERROR = "--error" in ARGS
+KEEP_OPEN = "--keep-open" in ARGS
+HOLD = None
+if "--hold-locked" in ARGS:
+    i = ARGS.index("--hold-locked")
+    HOLD = ARGS.pop(i + 1)
+    ARGS.pop(i)
+LOG = open([a for a in ARGS if not a.startswith("--")][0], "w", buffering=1)
+LOCK_REQUESTS = {0: "destroy", 1: "get_lock_surface", 2: "unlock_and_destroy"}
+
+
+def log(*parts):
+    print(*parts, file=LOG)
+
+
+def recv(sock):
+    fds = array.array("i")
+    data, anc, _, _ = sock.recvmsg(65536, socket.CMSG_LEN(64 * 4))
+    for level, kind, payload in anc:
+        if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+            fds.frombytes(payload[: len(payload) - len(payload) % 4])
+    return data, list(fds)
+
+
+def send(sock, data, fds):
+    if fds:
+        sock.sendmsg([data], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", fds))])
+    else:
+        sock.sendall(data)
+
+
+class Messages:
+    """Splits a byte stream into whole Wayland messages (object id, opcode, bytes)."""
+
+    def __init__(self):
+        self.buf = b""
+
+    def feed(self, data):
+        self.buf += data
+        out = []
+        while len(self.buf) >= 8:
+            oid, word = struct.unpack("<II", self.buf[:8])
+            size = word >> 16
+            if size < 8 or len(self.buf) < size:
+                break
+            out.append((oid, word & 0xFFFF, self.buf[:size]))
+            self.buf = self.buf[size:]
+        return out
+
+
+def display_error(object_id, text):
+    """wl_display.error(object_id, code 0, text)."""
+    raw = text.encode() + b"\0"
+    body = struct.pack("<III", object_id, 0, len(raw)) + raw + b"\0" * (-len(raw) % 4)
+    return struct.pack("<II", 1, ((8 + len(body)) << 16) | 0) + body
+
+
+def string_at(msg, off):
+    n = struct.unpack("<I", msg[off : off + 4])[0]
+    return msg[off + 4 : off + 3 + n].decode(), off + 4 + ((n + 3) & ~3)
+
+
+def serve(client):
+    server = socket.socket(socket.AF_UNIX)
+    server.connect(UPSTREAM)
+    requests, events = Messages(), Messages()
+    registry = manager = lock = None
+    injected = False
+    pending_fds = []
+    try:
+        while True:
+            ready, _, _ = select.select([client, server], [], [])
+            for sock in ready:
+                data, fds = recv(sock)
+                if not data:
+                    return
+                if sock is client:
+                    for oid, op, msg in requests.feed(data):
+                        if oid == 1 and op == 1:
+                            registry = struct.unpack("<I", msg[8:12])[0]
+                        elif oid == registry and op == 0:
+                            iface, off = string_at(msg, 12)
+                            if iface == "ext_session_lock_manager_v1":
+                                manager = struct.unpack("<I", msg[off + 4 : off + 8])[0]
+                        elif oid == manager and op == 1:
+                            lock = struct.unpack("<I", msg[8:12])[0]
+                        elif lock is not None and oid == lock:
+                            log("request", LOCK_REQUESTS.get(op, op))
+                    send(server, data, fds)
+                    continue
+                # Compositor to client: forward whole messages only, so `finished` can go
+                # straight after `locked`. Descriptors ride along with the next send.
+                pending_fds += fds
+                out = b""
+                for oid, op, msg in events.feed(data):
+                    out += msg
+                    if oid == 1 and op == 0:
+                        log("error", msg[20:].split(b"\0")[0].decode(errors="replace"))
+                    if lock is not None and oid == lock and op == 0 and not injected:
+                        log("event locked")
+                        injected = True
+                        if HOLD:
+                            # Everything before `locked` goes now; `locked` and the rest wait.
+                            send(client, out[: -len(msg)], pending_fds)
+                            pending_fds, out = [], msg
+                            log("held locked")
+                            while not os.path.exists(HOLD):
+                                time.sleep(0.02)
+                            log("released locked")
+                            continue
+                        if not ERROR:
+                            out += struct.pack("<II", lock, (8 << 16) | 1)
+                            log("injected finished")
+                            continue
+                        send(client, out, pending_fds)
+                        pending_fds, out = [], b""
+                        time.sleep(1)
+                        send(client, display_error(lock, "injected protocol error"), [])
+                        log("injected error")
+                        if not KEEP_OPEN:
+                            return
+                        # Keep the socket open but stop forwarding, like a compositor that has
+                        # not got round to closing it.
+                        while recv(client)[0]:
+                            pass
+                        return
+                if out:
+                    send(client, out, pending_fds)
+                    pending_fds = []
+    except OSError:
+        pass
+    finally:
+        client.close()
+        server.close()
+
+
+def main():
+    path = os.path.join(RUNTIME, "wayland-inject-0")
+    listener = socket.socket(socket.AF_UNIX)
+    listener.bind(path)
+    listener.listen(4)
+    log("ready")
+    while True:
+        conn, _ = listener.accept()
+        threading.Thread(target=serve, args=(conn,), daemon=True).start()
+
+
+if __name__ == "__main__":
+    main()

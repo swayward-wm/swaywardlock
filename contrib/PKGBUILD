@@ -1,0 +1,116 @@
+# Maintainer: Martin Trojer <martin.trojer@gmail.com>
+#
+# Reference PKGBUILD, in the style of swayward's. There is no release tag yet, so for now it
+# builds the checkout it sits in (contrib/..), not a downloaded tarball: run makepkg in this
+# directory of a git checkout. Build and lint it with an Arch container:
+#
+#   distrobox create --name arch-pkg --image docker.io/library/archlinux:latest
+#   distrobox enter arch-pkg -- bash -lc 'sudo pacman -S --needed base-devel namcap scdoc'
+#   cd contrib && BUILDDIR=/tmp/swl-build PKGDEST=/tmp/swl-build makepkg -sf && namcap PKGBUILD /tmp/swl-build/*.pkg.tar.zst
+#
+# makepkg's src/ and pkg/ (with the cargo target dir, ~2.5 GB) and the packages land in contrib/
+# unless BUILDDIR and PKGDEST say otherwise; .gitignore covers them, but a /tmp BUILDDIR keeps
+# the checkout clean.
+#
+# To publish a release: tag it, replace source=() and the _root lines with the tag tarball
+# ("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz", and cd "$pkgname-$pkgver"
+# in each function), and set a real sha256sum. Publishing needs an AUR account with an SSH key; see
+# https://wiki.archlinux.org/title/AUR_submission_guidelines
+
+pkgname=swaywardlock
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Screen locker for the swayward-wm family (ext-session-lock-v1, hyprlock-style widgets)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/swayward-wm/swaywardlock"
+license=('GPL-3.0-or-later')
+
+depends=(
+  'cairo'
+  'glib2'
+  'libxkbcommon'
+  'mesa'          # libEGL, loaded at run time through dlopen
+  'pam'
+  'pango'
+  # Owns /etc/pam.d/login, which the shipped /etc/pam.d/swaywardlock includes.
+  # Without it every password fails and only SIGUSR1 unlocks.
+  'util-linux'
+  'python'        # swaywardlock-swaylock-to-kdl, swaywardlock-hyprlock-to-kdl
+  # Not linked at build time (wayland-backend and wayland-egl dlopen
+  # libwayland-client.so.0 and libwayland-egl.so.1), so namcap may call it
+  # unneeded. It is required at runtime.
+  'wayland'
+)
+
+makedepends=(
+  'cargo'
+  'scdoc'
+)
+
+# The checkout this file is in. Nothing is downloaded; cargo builds in $srcdir/target, which is
+# contrib/src/target unless BUILDDIR is set (ignored by git either way).
+source=()
+sha256sums=()
+_root=$(realpath "$(dirname "${BASH_SOURCE[0]}")/..")
+backup=('etc/pam.d/swaywardlock')
+
+prepare() {
+  [ -f "$_root/Cargo.toml" ] || { echo "run makepkg from contrib/ in a swaywardlock checkout" >&2; return 1; }
+  cd "$_root"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR="$srcdir/target"
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$_root"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR="$srcdir/target"
+  # No --features test-auth: that feature replaces PAM with a fixed password.
+  cargo build --frozen --release
+
+  scdoc < docs/swaywardlock.1.scd > "$srcdir/swaywardlock.1"
+
+  "$srcdir/target/release/swaywardlock" completions bash > "$srcdir/swaywardlock.bash"
+  "$srcdir/target/release/swaywardlock" completions fish > "$srcdir/swaywardlock.fish"
+  "$srcdir/target/release/swaywardlock" completions zsh > "$srcdir/_swaywardlock"
+}
+
+check() {
+  cd "$_root"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR="$srcdir/target"
+  # The headless-sway end-to-end suite (contrib/e2e-sway) needs a compositor,
+  # so run the Rust tests only.
+  cargo test --frozen --release
+}
+
+package() {
+  cd "$_root"
+
+  install -Dm755 "$srcdir/target/release/swaywardlock" "$pkgdir/usr/bin/swaywardlock"
+  # The config translators are useless from a source checkout nobody has after
+  # installing a package, so ship them on PATH under namespaced names.
+  install -Dm755 contrib/swaylock-to-kdl "$pkgdir/usr/bin/swaywardlock-swaylock-to-kdl"
+  install -Dm755 contrib/hyprlock-to-kdl "$pkgdir/usr/bin/swaywardlock-hyprlock-to-kdl"
+
+  # swaywardlock refuses to lock without this file. It is the user's to edit
+  # (see backup=), and never weaker than the shipped one: auth only.
+  install -Dm644 pam/swaywardlock "$pkgdir/etc/pam.d/swaywardlock"
+
+  install -Dm644 "$srcdir/swaywardlock.1" "$pkgdir/usr/share/man/man1/swaywardlock.1"
+  gzip -9n "$pkgdir/usr/share/man/man1/swaywardlock.1"
+
+  install -Dm644 "$srcdir/swaywardlock.bash" \
+    "$pkgdir/usr/share/bash-completion/completions/swaywardlock"
+  install -Dm644 "$srcdir/swaywardlock.fish" \
+    "$pkgdir/usr/share/fish/vendor_completions.d/swaywardlock.fish"
+  install -Dm644 "$srcdir/_swaywardlock" \
+    "$pkgdir/usr/share/zsh/site-functions/_swaywardlock"
+
+  # The man page points here: the examples and the design document (the config reference).
+  install -Dm644 -t "$pkgdir/usr/share/doc/$pkgname/examples" examples/*.kdl
+  install -Dm644 -t "$pkgdir/usr/share/doc/$pkgname/specs" docs/specs/*.md
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

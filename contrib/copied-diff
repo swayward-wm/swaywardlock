@@ -35,6 +35,7 @@ FILES=(
     src/render/border.rs:src/render_helpers/border.rs:trimmed
     src/render/shadow.rs:src/render_helpers/shadow.rs:trimmed
     src/render/resources.rs:src/render_helpers/resources.rs:trimmed
+    src/render/offscreen.rs:src/render_helpers/mod.rs:trimmed
     src/render/shadow_geometry.rs:src/layout/shadow.rs:trimmed
     src/render/shaders/mod.rs:src/render_helpers/shaders/mod.rs:trimmed
     src/render/shaders/border.frag:src/render_helpers/shaders/border.frag:verbatim

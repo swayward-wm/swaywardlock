@@ -10,22 +10,36 @@ import sys
 import zlib
 
 
+def fail(msg):
+    print(f"ppm-pixel: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
 def pixel(args):
     data = sys.stdin.buffer.read()
+    # Header: "P6", width, height, maxval, each separated by whitespace, then one whitespace byte.
     parts, i = [], 0
     while len(parts) < 4:
-        while data[i : i + 1].isspace():
+        while i < len(data) and data[i : i + 1].isspace():
             i += 1
         j = i
-        while not data[j : j + 1].isspace():
+        while j < len(data) and not data[j : j + 1].isspace():
             j += 1
+        if j == i:
+            fail("empty or truncated PPM header")
         parts.append(data[i:j])
         i = j
     i += 1
+    if parts[0] != b"P6" or not (parts[1].isdigit() and parts[2].isdigit()):
+        fail("not a binary PPM (P6)")
     w, h = int(parts[1]), int(parts[2])
     x = int(args[0]) if args else w // 2
     y = int(args[1]) if len(args) > 1 else h // 2
+    if not (0 <= x < w and 0 <= y < h):
+        fail(f"pixel ({x}, {y}) is outside the {w}x{h} image")
     o = i + (y * w + x) * 3
+    if o + 3 > len(data):
+        fail("truncated PPM pixel data")
     print(*data[o : o + 3])
 
 

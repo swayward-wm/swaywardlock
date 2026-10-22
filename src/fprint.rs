@@ -14,7 +14,8 @@
 //! `org.freedesktop.login1`) when we start, compared by unique name. The system bus lets any
 //! client send a signal addressed to us, and zbus cannot match a well-known sender name locally,
 //! so filtering by the well-known name would accept a forged `verify-match` from any local
-//! process. If fprintd restarts (a new unique name), fingerprint unlock stops for this lock.
+//! process. If fprintd restarts (a new unique name), fingerprint unlock stops for this lock: the
+//! bus's `NameOwnerChanged` for the old unique name clears the prompt and sets `$FPRINTFAIL`.
 
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -39,8 +40,13 @@ pub enum FprintEvent {
     Prompt(String),
     /// Text for `$FPRINTFAIL`; scanning may continue.
     Failed(String),
+    /// Fingerprints are no longer read (fprintd went away, or scanning could not restart): the
+    /// prompt clears and the text goes to `$FPRINTFAIL`. Not a failed attempt.
+    Unavailable(String),
     Matched,
 }
+
+const UNAVAILABLE: &str = "Fingerprint unavailable";
 
 #[derive(Debug, Clone)]
 pub struct Options {
@@ -52,8 +58,13 @@ pub struct Options {
 /// Start the worker. Returns immediately; problems are reported as log warnings.
 pub fn spawn(options: Options, events: Sender<FprintEvent>) {
     let _ = thread::Builder::new().name("fprint".into()).spawn(move || {
-        if let Err(err) = run(&options, &events) {
+        let mut prompted = false;
+        if let Err(err) = run(&options, &events, &mut prompted) {
             tracing::warn!("fingerprint unlock unavailable: {err:#}");
+            // A prompt already on screen must not keep asking for a finger nobody reads.
+            if prompted {
+                let _ = events.send(FprintEvent::Unavailable(UNAVAILABLE.into()));
+            }
         }
     });
 }
@@ -105,7 +116,21 @@ fn sent_by(msg: &zbus::Message, trusted: &OwnedUniqueName) -> bool {
         .is_some_and(|s| *s == trusted.as_ref())
 }
 
-fn run(o: &Options, events: &Sender<FprintEvent>) -> anyhow::Result<()> {
+/// Whether `msg` is the bus saying the connection `name` has gone (`NameOwnerChanged(name, name,
+/// "")`). Only the bus itself can send it; anything else is a forgery.
+fn is_gone(msg: &zbus::Message, name: &OwnedUniqueName) -> bool {
+    let from_bus = msg
+        .header()
+        .sender()
+        .is_some_and(|s| s.as_str() == "org.freedesktop.DBus");
+    from_bus
+        && msg
+            .body()
+            .deserialize::<(String, String, String)>()
+            .is_ok_and(|(n, _, new)| n == name.as_str() && new.is_empty())
+}
+
+fn run(o: &Options, events: &Sender<FprintEvent>, prompted: &mut bool) -> anyhow::Result<()> {
     let conn = Connection::system()?;
     let fprintd = owner(&conn, FPRINT)?;
     let manager = Proxy::new(&conn, fprintd.clone(), MANAGER_PATH, MANAGER)?;
@@ -138,6 +163,16 @@ fn run(o: &Options, events: &Sender<FprintEvent>) -> anyhow::Result<()> {
             .build();
         MessageIterator::for_match_rule(rule, &conn, None).ok()
     });
+    // fprintd's connection going away (crash, restart). Subscribed before claiming, so a
+    // vanish after the owner lookup above is either seen here or fails the Claim.
+    let vanish_rule = MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .sender("org.freedesktop.DBus")?
+        .interface("org.freedesktop.DBus")?
+        .member("NameOwnerChanged")?
+        .arg(0, fprintd.as_str())?
+        .build();
+    let vanish_signals = MessageIterator::for_match_rule(vanish_rule, &conn, None)?;
 
     // Empty user name means "the caller".
     let () = device.call("Claim", &("",))?;
@@ -150,8 +185,10 @@ fn run(o: &Options, events: &Sender<FprintEvent>) -> anyhow::Result<()> {
     // machine sleeps and nothing touches the device after the loop has released it.
     let scan = Arc::new(Mutex::new(Scan::default()));
     let start = |scan: &mut Scan, prompt: &str| -> anyhow::Result<()> {
-        if scan.asleep || scan.done {
-            return Ok(()); // waking restarts it
+        // Asleep: waking restarts it. Scanning: a wake inside the retry delay already restarted
+        // it, and fprintd refuses a second VerifyStart (AlreadyInUse).
+        if scan.asleep || scan.done || scan.scanning {
+            return Ok(());
         }
         let () = device.call("VerifyStart", &("any",))?;
         scan.scanning = true;
@@ -159,6 +196,36 @@ fn run(o: &Options, events: &Sender<FprintEvent>) -> anyhow::Result<()> {
         Ok(())
     };
     start(&mut scan.lock().unwrap(), &o.ready_message)?;
+    *prompted = true;
+
+    // fprintd vanishing: the device loop below would wait for its signals forever, so tell the
+    // user from here. Nothing is released: the claim died with fprintd's connection.
+    {
+        let scan = scan.clone();
+        let events = events.clone();
+        let fprintd = fprintd.clone();
+        // A failed thread::spawn panics, and panic=abort would take the locker down after lock.
+        let spawned = thread::Builder::new()
+            .name("fprint-vanish".into())
+            .spawn(move || {
+                for msg in vanish_signals.flatten() {
+                    if !is_gone(&msg, &fprintd) {
+                        continue;
+                    }
+                    let mut s = scan.lock().unwrap();
+                    if !s.done {
+                        tracing::warn!("fprint: fprintd went away; fingerprint unlock stops");
+                        s.done = true;
+                        s.scanning = false;
+                        let _ = events.send(FprintEvent::Unavailable(UNAVAILABLE.into()));
+                    }
+                    return;
+                }
+            });
+        if let Err(err) = spawned {
+            tracing::warn!("fprint: cannot watch for fprintd going away: {err}");
+        }
+    }
 
     // Sleep handling on its own thread: stop before sleep, restart after.
     if let Some(sleep_signals) = sleep_signals {
@@ -166,33 +233,38 @@ fn run(o: &Options, events: &Sender<FprintEvent>) -> anyhow::Result<()> {
         let device = device.clone();
         let ready = o.ready_message.clone();
         let events = events.clone();
-        thread::spawn(move || {
-            let Some(logind) = logind else { return };
-            for msg in sleep_signals.flatten() {
-                if !sent_by(&msg, &logind) {
-                    tracing::warn!("fprint: ignoring PrepareForSleep not from logind");
-                    continue;
-                }
-                let Ok(starting) = msg.body().deserialize::<bool>() else {
-                    continue;
-                };
-                let mut s = scan.lock().unwrap();
-                if s.done {
-                    return;
-                }
-                tracing::info!("fprint: PrepareForSleep({starting})");
-                s.asleep = starting;
-                if starting {
-                    if s.scanning {
-                        let _ = device.call_method("VerifyStop", &());
-                        s.scanning = false;
+        let spawned = thread::Builder::new()
+            .name("fprint-sleep".into())
+            .spawn(move || {
+                let Some(logind) = logind else { return };
+                for msg in sleep_signals.flatten() {
+                    if !sent_by(&msg, &logind) {
+                        tracing::warn!("fprint: ignoring PrepareForSleep not from logind");
+                        continue;
                     }
-                } else if !s.scanning && device.call_method("VerifyStart", &("any",)).is_ok() {
-                    s.scanning = true;
-                    let _ = events.send(FprintEvent::Prompt(ready.clone()));
+                    let Ok(starting) = msg.body().deserialize::<bool>() else {
+                        continue;
+                    };
+                    let mut s = scan.lock().unwrap();
+                    if s.done {
+                        return;
+                    }
+                    tracing::info!("fprint: PrepareForSleep({starting})");
+                    s.asleep = starting;
+                    if starting {
+                        if s.scanning {
+                            let _ = device.call_method("VerifyStop", &());
+                            s.scanning = false;
+                        }
+                    } else if !s.scanning && device.call_method("VerifyStart", &("any",)).is_ok() {
+                        s.scanning = true;
+                        let _ = events.send(FprintEvent::Prompt(ready.clone()));
+                    }
                 }
-            }
-        });
+            });
+        if let Err(err) = spawned {
+            tracing::warn!("fprint: cannot follow suspend and resume: {err}");
+        }
     }
 
     let mut retries = 0;
@@ -232,10 +304,12 @@ fn run(o: &Options, events: &Sender<FprintEvent>) -> anyhow::Result<()> {
                             }
                         }
                         thread::sleep(o.retry_delay);
-                        start(
-                            &mut scan.lock().unwrap(),
-                            "Could not match fingerprint. Try again.",
-                        )?;
+                        let mut s = scan.lock().unwrap();
+                        if let Err(err) = start(&mut s, "Could not match fingerprint. Try again.") {
+                            // Keep the claim and the loop: a wake from sleep tries again.
+                            tracing::warn!("fprint: could not restart scanning: {err:#}");
+                            let _ = events.send(FprintEvent::Unavailable(UNAVAILABLE.into()));
+                        }
                     }
                     Next::Stop(why) => {
                         let _ = events.send(FprintEvent::Failed(why.into()));
@@ -319,5 +393,41 @@ mod tests {
         ));
         assert!(matches!(classify("verify-disconnected", 0), Next::Stop(_)));
         assert_eq!(classify("verify-something-new", 0), Next::Ignore);
+    }
+
+    fn name_owner_changed(sender: &str, args: (&str, &str, &str)) -> zbus::Message {
+        zbus::Message::signal(
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            "NameOwnerChanged",
+        )
+        .unwrap()
+        .sender(sender)
+        .unwrap()
+        .build(&args)
+        .unwrap()
+    }
+
+    #[test]
+    fn only_the_bus_can_say_fprintd_is_gone() {
+        let fprintd = OwnedUniqueName::try_from(":1.7").unwrap();
+        let bus = "org.freedesktop.DBus";
+        assert!(is_gone(
+            &name_owner_changed(bus, (":1.7", ":1.7", "")),
+            &fprintd
+        ));
+        // Another connection, another name, or a new owner (not a vanish).
+        assert!(!is_gone(
+            &name_owner_changed(":1.9", (":1.7", ":1.7", "")),
+            &fprintd
+        ));
+        assert!(!is_gone(
+            &name_owner_changed(bus, (":1.8", ":1.8", "")),
+            &fprintd
+        ));
+        assert!(!is_gone(
+            &name_owner_changed(bus, (":1.7", "", ":1.7")),
+            &fprintd
+        ));
     }
 }

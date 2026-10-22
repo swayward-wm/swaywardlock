@@ -65,6 +65,10 @@ pub fn start(
         description: None,
     };
     let mut surface = Surface::new(Role::Preview { window, info });
+    surface.fractional = app
+        .scales
+        .as_ref()
+        .map(|m| m.attach(surface.wl_surface(), qh));
     surface.size = (DEFAULT_SIZE.0 as i32, DEFAULT_SIZE.1 as i32).into();
     app.surfaces.push(surface);
 
@@ -124,7 +128,11 @@ fn poll(app: &mut App) {
                 app.reconfigure(i);
             }
         }
-        Err(err) => eprintln!("{err:?}"),
+        // Not eprintln!: it panics when stderr is gone (a closed terminal).
+        Err(err) => {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "{err:?}");
+        }
     }
 }
 
@@ -163,6 +171,7 @@ impl WindowHandler for App {
         let w = configure.new_size.0.map_or(current.w, |w| w.get() as i32);
         let h = configure.new_size.1.map_or(current.h, |h| h.get() as i32);
         self.surfaces[index].size = (w, h).into();
+        self.surfaces[index].configured = true;
         self.reconfigure(index);
     }
 }

@@ -1,0 +1,1244 @@
+#!/usr/bin/env python3
+"""Translate a hyprlock.conf (hyprlang syntax) to swaywardlock KDL.
+
+    hyprlock-to-kdl [CONFIG]      read a hyprlock config (default: hyprlock's search path)
+
+Prints KDL on stdout. On stderr it prints the swaywardlock command line to use (`--immediate-render`
+comes from general:immediate_render) and a warning for every key it could not carry over. It never
+drops a key silently: a key with no KDL counterpart yet also becomes a `// hyprlock: key = value`
+comment inside the node it belongs to, so the KDL itself shows what was left behind.
+
+It understands hyprlang's syntax: sections, `$var = value`, `{{ a + b }}` expressions, `source =`,
+`# hyprlang if/endif`, `\\` continuation lines, and comments with `##` for a literal `#`.
+
+hyprlock defaults that differ from swaywardlock's are written out, so a translated config looks the
+same: hide-cursor, fail-timeout-ms, the background colour, label alignment, the image border, the
+fade durations, the blur offset and noise, vibrancy and vibrancy-darkness, and blur saturation 1
+(hyprlock has none; ours defaults to swayward's 1.5). Two are left as ours: clear-input-after-ms (hyprlock
+never clears a typed password; ours clears it after 10 s) and the input-field-* animations, which
+are written only when an `animation` line sets them.
+
+hyprlock text never reaches the output raw: control characters (CR, VT, FF, NEL, ...), U+2028,
+U+2029 and bidi controls become \\u{hex} escapes in comments, strings and warnings, so a value
+cannot end a `//` comment and inject KDL. Gradient angles are hyprlock degrees + 90, the closest CSS equivalent (swaywardlock
+uses CSS angles; hyprlock's shader angle is not geometric, so only multiples of 90 are exact).
+Relative widget paths become absolute against the conf file's directory: a deliberate divergence
+(hyprlock uses the working directory when it locks; swaywardlock may chdir to /).
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import math
+import os
+import re
+import sys
+import unicodedata
+from pathlib import Path
+
+WIDGETS = ("background", "shape", "image", "input-field", "label")  # hyprlock's draw order
+SHADOW = {"shadow_size", "shadow_passes", "shadow_color", "shadow_boost"}
+CLICK = {"onclick"}
+COMMON = {"monitor", "zindex"}
+# Every key hyprlock registers (ConfigManager.cpp init), per section. A key outside its set is
+# reported as unknown; a key inside it must be translated or listed in UNSUPPORTED.
+KEYS = {
+    "general": {"text_trim", "hide_cursor", "ignore_empty_input", "immediate_render",
+                "fractional_scaling", "screencopy_mode", "fail_timeout"},
+    "auth": {"pam:enabled", "pam:module", "fingerprint:enabled", "fingerprint:ready_message",
+             "fingerprint:present_message", "fingerprint:retry_delay"},
+    "animations": {"enabled"},
+    "background": COMMON | {"path", "color", "blur_size", "blur_passes", "noise", "contrast",
+                            "brightness", "vibrancy", "vibrancy_darkness", "reload_time",
+                            "reload_cmd", "crossfade_time"},
+    "shape": COMMON | SHADOW | CLICK | {"size", "rounding", "border_size", "border_color", "color",
+                                        "position", "halign", "valign", "rotate", "xray"},
+    "image": COMMON | SHADOW | CLICK | {"path", "size", "rounding", "border_size", "border_color",
+                                        "position", "halign", "valign", "rotate", "reload_time",
+                                        "reload_cmd"},
+    "input-field": COMMON | SHADOW | {
+        "size", "inner_color", "outer_color", "outline_thickness", "dots_size", "dots_center",
+        "dots_spacing", "dots_rounding", "dots_text_format", "fade_on_empty", "fade_timeout",
+        "font_color", "font_family", "halign", "valign", "position", "placeholder_text",
+        "hide_input", "hide_input_base_color", "rounding", "check_color", "fail_color",
+        "fail_text", "check_text", "capslock_color", "numlock_color", "bothlock_color",
+        "invert_numlock", "swap_font_color"},
+    "label": COMMON | SHADOW | CLICK | {"position", "color", "font_size", "text", "font_family",
+                                        "halign", "valign", "rotate", "text_align"},
+}
+
+# Keys older hyprlock versions read that swaywardlock covers another way: the warning says how.
+# grace is not added to the command line: current hyprlock ignores the key, so the user decides.
+OLD_OPTIONS = {
+    "general:grace": "swaywardlock has -g/--grace SECONDS on the command line; add it to the command if you want it",
+    "general:disable_loading_bar": "swaywardlock has no loading bar, so there is nothing to disable",
+}
+
+# Ranges swaywardlock's config decoder accepts (src/config/widgets.rs, copied/effects.rs); a value
+# outside them makes the whole config fail to load, so the converter clamps and warns instead.
+POSITION = (-100000, 100000)
+SIZE_PX = (0, 100000)
+SIZE_PCT = (0, 1000)
+BLUR_PASSES = (1, 255)
+BLUR_OFFSET = (0, 100)
+BLUR_NOISE = (0, 1000)
+CONTRAST = (0, 10)
+VIBRANCY = (0, 10)
+VIBRANCY_DARKNESS = (0, 1)
+OUTLINE_WIDTH = (0, 1000)
+SHADOW_SOFTNESS = (0, 1024)
+TEXT_SHADOW_PASSES = (1, 4)  # decoder caps: the blur reach doubles per pass
+TEXT_SHADOW_SIZE = (0, 20)
+TEXT_SHADOW_BOOST = (0, 10)
+DOT_SIZE = (0.001, 0.8)  # hyprlock clamps the same way
+DOT_SPACING = (-1, 1)
+MAX_ANIM_MS = 3000  # decoder cap for every animation: a longer fade-out holds the session locked
+BEZIER_Y = (-2.0, 3.0)  # decoder range for cubic-bezier control y values
+MAX_CORNER = 32767
+
+# Text tokens swaywardlock substitutes at runtime (src/textvars.rs); any other $NAME in a text
+# value was a hyprlang variable or environment variable, which hyprlock replaced at parse time.
+RUNTIME_TOKENS = ("$TIME12", "$TIME", "$LAYOUT", "$ATTEMPTS", "$FAIL", "$PAMFAIL", "$PAMPROMPT",
+                  "$FPRINTFAIL", "$FPRINTPROMPT", "$USER", "$DESC")
+
+# hyprlock's animation tree (ConfigManager.cpp init): leaf -> parent.
+ANIM_PARENT = {
+    "fade": "global", "inputField": "global",
+    "fadeIn": "fade", "fadeOut": "fade",
+    "inputFieldColors": "inputField", "inputFieldFade": "inputField",
+    "inputFieldWidth": "inputField", "inputFieldDots": "inputField",
+}
+ANIM_KDL = {  # KDL animation name -> hyprlock node
+    "fade-in": "fadeIn", "fade-out": "fadeOut", "input-field-fade": "inputFieldFade",
+    "input-field-width": "inputFieldWidth", "input-field-colors": "inputFieldColors",
+    "input-field-dots": "inputFieldDots",
+}
+DEFAULT_BEZIER = (0.0, 0.75, 0.15, 1.0)  # hyprutils' "default"
+
+
+class ConfError(ValueError):
+    """A value hyprlock would reject; the key keeps hyprlock's default."""
+
+
+# ---- hyprlang value types (hyprlock MiscFunctions.cpp configStringToInt, ConfigManager.cpp) ----
+
+
+def c_stof(s: str) -> float:
+    """C++ std::stof: a numeric prefix is enough; past float range it throws."""
+    m = re.match(r"\s*[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?", s)
+    if not m:
+        raise ConfError(f"cannot parse {s!r} as a number")
+    v = float(m.group(0))
+    if abs(v) > 3.4028234663852886e38:  # FLT_MAX
+        raise ConfError(f"{m.group(0).strip()} is out of range for a float")
+    return v
+
+
+def c_stoi(s: str) -> int:
+    m = re.match(r"\s*[+-]?\d+", s)
+    if not m:
+        raise ConfError(f"cannot parse {s!r} as an integer")
+    return int(m.group(0))
+
+
+def parse_hex(s: str) -> int:
+    try:
+        return int(s, 16)
+    except ValueError:
+        raise ConfError(f"invalid hex {s!r}") from None
+
+
+def int_of(s: str) -> int:
+    """hyprlock's configStringToInt for plain INT options (booleans, numbers, 0xAARRGGBB)."""
+    s = s.strip()
+    if s.startswith("0x"):
+        return parse_hex(s[2:])
+    if s.startswith(("true", "on", "yes")):
+        return 1
+    if s.startswith(("false", "off", "no")):
+        return 0
+    if re.fullmatch(r"[+-]?\d+", s):
+        return int(s)
+    raise ConfError(f"cannot parse {s!r} as an integer")
+
+
+def parse_color(s: str) -> tuple[int, int, int, int]:
+    """(r, g, b, a), unclamped: hyprlock lets out-of-range components spill into their neighbours."""
+    s = s.strip()
+    if s.startswith("rgba(") and s.endswith(")"):
+        inner = s[5:-1].strip()
+        if inner.count(",") == 3:
+            parts = [p.strip() for p in inner.split(",")]
+            r, g, b = (int_of(p) for p in parts[:3])
+            return r, g, b, math.floor(c_stof(parts[3]) * 255 + 0.5)
+        if len(inner) == 8:
+            v = parse_hex(inner)
+            return v >> 24 & 255, v >> 16 & 255, v >> 8 & 255, v & 255
+        raise ConfError("rgba() expects 8 hex digits or 4 comma separated values")
+    if s.startswith("rgb(") and s.endswith(")"):
+        inner = s[4:-1].strip()
+        if inner.count(",") == 2:
+            r, g, b = (int_of(p.strip()) for p in inner.split(","))
+            return r, g, b, 255
+        if len(inner) == 6:
+            v = parse_hex(inner)
+            return v >> 16 & 255, v >> 8 & 255, v & 255, 255
+        raise ConfError("rgb() expects 6 hex digits or 3 comma separated values")
+    v = int_of(s) & 0xFFFFFFFF  # 0xAARRGGBB
+    return v >> 16 & 255, v >> 8 & 255, v & 255, v >> 24 & 255
+
+
+def parse_gradient(s: str) -> tuple[list[tuple[int, int, int, int]], int | None]:
+    """Colours and the angle in degrees (None if absent). An empty value has no colours."""
+    colors, angle = [], None
+    for tok in re.findall(r"rgba?\([^)]*\)|\S+", s):
+        if "deg" in tok and not tok.startswith("rgb"):
+            angle = c_stoi(tok[: tok.index("deg")])
+            break
+        if len(colors) >= 10:
+            raise ConfError("a gradient takes at most 10 colours")
+        colors.append(parse_color(tok))
+    return colors, angle
+
+
+Length = tuple[str, float]  # ("px" | "pct", value)
+
+
+def parse_layout(s: str) -> tuple[Length, Length]:
+    """hyprlock's `x, y` layout value: exactly one comma, each part optionally ending in %."""
+    lhs, sep, rhs = s.partition(",")
+    if not sep:
+        raise ConfError(f"expected two comma separated values, got {s!r}")
+    if "," in rhs:
+        raise ConfError(f"too many arguments in {s!r}")
+    out = []
+    for part in (lhs, rhs):
+        part = part.strip()
+        rel = part.endswith("%")
+        out.append(("pct" if rel else "px", c_stof(part[:-1] if rel else part)))
+    return out[0], out[1]
+
+
+# ---- KDL helpers ----
+
+# Bidirectional controls: harmless to the parser, but they reorder how the text around them looks.
+BIDI = set("\u061c\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069")
+
+
+def unsafe(c: str) -> bool:
+    """A character that must not appear raw in the output: control characters (C0, DEL, C1;
+    this covers LF, CR, VT, FF and NEL), U+2028/U+2029, which KDL ends a line on (so in a
+    // comment they would start a new node), lone surrogates from undecodable file names, and
+    bidi controls."""
+    return unicodedata.category(c) in ("Cc", "Zl", "Zp", "Cs") or c in BIDI
+
+
+def is_surrogate(c: str) -> bool:
+    return 0xD800 <= ord(c) <= 0xDFFF
+
+
+def has_surrogate(s: str) -> bool:
+    return any(is_surrogate(c) for c in s)
+
+
+def escape_unsafe(s: str) -> str:
+    """S with every unsafe character as a visible KDL-style \\u{hex} escape. A lone surrogate
+    (an undecodable byte of a file name or environment variable, kept by surrogateescape) is
+    not a KDL character at all, so it is spelled as plain ASCII text instead: \\xFF for the byte
+    0xFF. That is for comments and warnings only; kdl_str never lets one through."""
+    out = []
+    for c in s:
+        o = ord(c)
+        if is_surrogate(c):
+            out.append(f"\\x{o - 0xDC00:02X}" if 0xDC80 <= o <= 0xDCFF else f"\\u{o:04X}")
+        elif unsafe(c):
+            out.append(f"\\u{{{o:x}}}")
+        else:
+            out.append(c)
+    return "".join(out)
+
+
+def comment(text: str) -> str:
+    """A single-line KDL comment holding TEXT. Every comment the converter writes goes through
+    here: hyprlock text in it must not end the comment and inject KDL."""
+    return "// " + escape_unsafe(text)
+
+
+def kdl_str(s: str) -> str:
+    """A KDL string decoding to S. Unsafe characters are \\u{} escapes (same value, but no raw
+    line break or control character in the file). KDL cannot hold a lone surrogate, so callers
+    refuse such a value before it gets here (path_value does); one that still arrives is
+    written as U+FFFD rather than as an escape that makes swaywardlock reject the whole file."""
+    s = "".join("\ufffd" if is_surrogate(c) else c for c in s)
+    return '"' + escape_unsafe(s.replace("\\", "\\\\").replace('"', '\\"')) + '"'
+
+
+def fmt(v: float) -> str:
+    return str(int(v)) if float(v).is_integer() else repr(round(float(v), 6))
+
+
+def hexcolor(c: tuple[int, int, int, int]) -> str:
+    return kdl_str("#" + "".join(f"{x:02x}" for x in c))
+
+
+def fmt_len(length: Length) -> str:
+    kind, v = length
+    return kdl_str(fmt(v) + "%") if kind == "pct" else fmt(v)
+
+
+# ---- the converter ----
+
+
+class Scope:
+    """The keys of one hyprlock section or widget block, and the KDL lines made from them."""
+
+    def __init__(self, kind: str, prefix: str = "") -> None:
+        self.kind = kind
+        self.prefix = prefix  # "general:" so a comment names the full hyprlock key
+        self.vals: dict[str, tuple[str, str]] = {}  # key -> (value, "file:line")
+        self.used: set[str] = set()
+        self.lines: list[str] = []  # KDL, from the translators
+        self.extra: list[str] = []  # KDL, from UNSUPPORTED handlers that now emit real nodes
+        self.comments: list[str] = []
+        self.output = ""  # monitor
+        self.loc = ""
+
+    def label(self, key: str) -> str:
+        return self.prefix + key
+
+    def body(self) -> list[str]:
+        return self.lines + self.extra + self.comments
+
+
+def same_value(value: str, default) -> bool:
+    """Is VALUE hyprlock's default (a string, or a number that may be spelled as a bool)?"""
+    if isinstance(default, str):
+        return value == default
+    try:
+        return float(int_of(value)) == default
+    except ConfError:
+        pass
+    try:
+        return c_stof(value) == default
+    except ConfError:
+        return False
+
+
+def unsupported(default=None, why="not supported yet"):
+    """A handler for a key with no KDL counterpart: warn and leave a comment, unless VALUE is
+    hyprlock's default (which means "off"). A unit that adds the KDL replaces its entry."""
+
+    def handler(conv: "Converter", scope: Scope, key: str, value: str, loc: str) -> None:
+        if default is not None and same_value(value, default):
+            return
+        conv.unsupported(scope, key, value, loc, why)
+
+    return handler
+
+
+# One entry per hyprlock key that has no KDL yet. Keys the translators consume never get here
+# (shadow_size/passes/color on shapes, images and input fields become a `shadow` node, and the
+# four shadow keys on a label a `text-shadow` node).
+UNSUPPORTED = {
+    "text_trim": unsupported(1, "swaywardlock trims only the end of a cmd[] output"),
+    "fractional_scaling": unsupported(2, "not configurable (swaywardlock follows the compositor)"),
+    "screencopy_mode": unsupported(0, "not configurable (swaywardlock uses wlr-screencopy, then ext-image-copy-capture)"),
+    "reload_time": unsupported(-1),
+    "reload_cmd": unsupported(""),
+    "crossfade_time": unsupported(-1),
+    "onclick": unsupported(""),
+    "shadow_boost": unsupported(1.2, "the shadow's colour boost has no KDL counterpart"),
+}
+
+
+class Cfg:
+    def __init__(self, enabled: bool, speed: int, points: tuple[float, ...], loc: str | None, bezier: str = "") -> None:
+        self.enabled, self.speed, self.points, self.loc, self.bezier = enabled, speed, points, loc, bezier
+
+
+class Converter:
+    def __init__(self) -> None:
+        self.messages: list[str] = []  # "warning: ..." and "note: ..." lines, in order
+        self.vars: dict[str, str] = {}
+        self.stack: list[str] = []  # open sections
+        self.ifs: list[bool] = []  # hyprlang if blocks: True = failed
+        self.files: list[Path] = []  # include stack
+        self.top = Scope("top")
+        self.general = Scope("general", "general:")
+        self.auth = Scope("auth", "auth:")
+        self.anim_enabled = Scope("animations", "animations:")
+        self.blocks: list[Scope] = []
+        self.current: Scope | None = None
+        self.immediate_render = False
+        self.beziers = {"linear": (0.0, 0.0, 1.0, 1.0), "default": DEFAULT_BEZIER}
+        self.anims = {"global": Cfg(True, 8, DEFAULT_BEZIER, None),
+                      "inputFieldColors": Cfg(True, 8, (0.0, 0.0, 1.0, 1.0), None)}
+
+    # -- messages --
+
+    def warn(self, loc: str | None, key: str | None, msg: str) -> None:
+        where = f"{loc}: " if loc else ""
+        self.messages.append(escape_unsafe(f"warning: {where}{key + ': ' if key else ''}{msg}"))
+
+    def note(self, loc: str | None, key: str, msg: str) -> None:
+        self.messages.append(escape_unsafe(f"note: {loc + ': ' if loc else ''}{key}: {msg}"))
+
+    def unsupported(self, scope: Scope, key: str, value: str, loc: str, why: str = "not supported yet") -> None:
+        self.warn(loc, scope.label(key), f"{why}; left as a comment")
+        scope.comments.append(comment(f"hyprlock: {scope.label(key)} = {value} ({why})"))
+
+    # -- reading --
+
+    def read_file(self, path: Path) -> None:
+        # Split on LF only, as hyprlang's std::getline does: read_text() would also split on a
+        # lone CR, turning the rest of a hyprlock value into a line of its own (e.g. an
+        # auth:pam:enabled = false that hyprlock never sees).
+        text = path.read_bytes().decode("utf-8", errors="replace")
+        self.files.append(path)
+        lines = text.split("\n")
+        i = 0
+        while i < len(lines):
+            lineno = i + 1
+            line = lines[i].rstrip("\r")
+            i += 1
+            while line.endswith("\\"):
+                line = line[:-1].rstrip(" \t")
+                if i >= len(lines):
+                    self.warn(f"{path}:{lineno}", None, "a line ends with a backslash at the end of the file")
+                    break
+                line += lines[i].rstrip("\r")
+                i += 1
+            self.parse_line(line, f"{path}:{lineno}", path)
+        self.files.pop()
+
+    def truthy(self, name: str) -> bool:
+        if name in os.environ:
+            return bool(os.environ[name])
+        return bool(self.vars.get(name))
+
+    def directive(self, comment: str, loc: str) -> None:
+        toks = comment.split()
+        if not toks or toks[0] != "hyprlang":
+            return
+        i = 1
+        while i < len(toks):
+            if toks[i] == "noerror":
+                return
+            if toks[i] == "endif":
+                if self.ifs:
+                    self.ifs.pop()
+                else:
+                    self.warn(loc, None, "stray `# hyprlang endif`")
+                return
+            if toks[i] == "if" and i + 1 < len(toks):
+                name, negated = toks[i + 1], False
+                if name.startswith("!"):
+                    name, negated = name[1:], True
+                defined = name in os.environ or name in self.vars
+                if defined:
+                    self.ifs.append(self.truthy(name) if negated else not self.truthy(name))
+                else:
+                    self.ifs.append(not negated)
+                return
+            i += 1
+
+    def parse_line(self, line: str, loc: str, path: Path) -> None:
+        line = line.strip()
+        if line.startswith("#"):
+            self.directive(line[1:].strip(), loc)
+            return
+        if self.ifs and self.ifs[-1]:
+            return
+        pos, last = line.find("#"), 0
+        while pos != -1:
+            if pos < len(line) - 1 and line[pos + 1] == "#":  # ## is a literal #
+                last = pos + 2
+                line = line[: pos + 1] + line[pos + 2 :]
+                pos = line.find("#", last)
+            else:
+                line = line[:pos]
+                break
+        line = line.strip()
+        if not line:
+            return
+        eq = line.find("=")
+        if eq == -1:
+            if line.endswith("{"):
+                self.open_section(line[:-1].strip(), loc)
+            elif line == "}":
+                if self.stack:
+                    self.stack.pop()
+                    if not self.stack:
+                        self.current = None
+                else:
+                    self.warn(loc, None, "stray `}`")
+            else:
+                self.warn(loc, None, f"invalid config line {line!r}; skipped")
+            return
+        lhs, rhs = line[:eq].strip(), line[eq + 1 :].strip()
+        if not lhs:
+            self.warn(loc, None, "empty key; skipped")
+            return
+        is_var = lhs.startswith("$")
+        try:
+            lhs, rhs = self.expand(lhs, rhs, is_var)
+        except ConfError as err:
+            self.warn(loc, lhs, f"{err}; line skipped")
+            return
+        if is_var:
+            self.vars[lhs[1:]] = rhs
+            return
+        self.set_key(lhs, rhs, loc, path)
+
+    def expand(self, lhs: str, rhs: str, is_var: bool) -> tuple[str, str]:
+        """Variables (longest name first, plain substring), then {{ }} expressions, then escapes."""
+        for n in range(100):
+            any_match = False
+            for name in sorted(self.vars, key=len, reverse=True):
+                tok = "$" + name
+                if not is_var and tok in lhs:
+                    lhs = lhs.replace(tok, self.vars[name])
+                    any_match = True
+                if tok in rhs:
+                    rhs = rhs.replace(tok, self.vars[name])
+                    any_match = True
+            while "{{" in rhs:
+                first = rhs.find("{{")
+                while first > 0:
+                    slashes = len(rhs[:first]) - len(rhs[:first].rstrip("\\"))
+                    if slashes % 2 == 0:
+                        break
+                    first = rhs.find("{{", first + 1)
+                    if first == -1:
+                        break
+                if first == -1:
+                    break
+                end = rhs.find("}}", first + 2)
+                if end == -1:
+                    break
+                rhs = rhs[:first] + self.expression(rhs[first + 2 : end]) + rhs[end + 2 :]
+            if not any_match:
+                break
+            if n == 99:
+                raise ConfError("expanding variables exceeded 100 rounds")
+        if is_var:
+            return lhs, rhs
+        out, i = list(rhs), 0
+        while i < len(out) - 1:
+            if out[i] == "\\":
+                if out[i + 1] == "\\":
+                    del out[i]
+                elif out[i + 1] in "{}":
+                    del out[i]
+                    i -= 1
+            i += 1
+        return lhs, "".join(out)
+
+    def expression(self, expr: str) -> str:
+        args = expr.split()
+        if len(args) != 3 or args[1] not in "+-*/" or len(args[1]) != 1:
+            raise ConfError(f"invalid expression {{{{{expr}}}}}: supported are `a + b`, -, *, /")
+        vals = []
+        for a in (args[0], args[2]):
+            try:
+                vals.append(c_stof(self.vars.get(a, a)))
+            except ConfError:
+                raise ConfError(f"expression operand {a!r} is not a number or a variable holding one") from None
+        a, b = vals
+        try:
+            r = {"+": a + b, "-": a - b, "*": a * b, "/": a / b}[args[1]]
+        except ZeroDivisionError:
+            raise ConfError("division by zero in an expression") from None
+        return fmt(r)
+
+    def open_section(self, name: str, loc: str) -> None:
+        if not self.stack:
+            if name in WIDGETS:
+                self.current = Scope(name)
+                self.current.loc = loc
+                self.blocks.append(self.current)
+            elif name not in ("general", "auth", "animations"):
+                self.warn(loc, name, "not a hyprlock section; its keys are left as comments")
+        self.stack.append(name)
+
+    def set_key(self, key: str, value: str, loc: str, path: Path) -> None:
+        # Handlers work at any nesting.
+        if key == "source":
+            return self.source(value, loc, path)
+        if key == "bezier":
+            return self.bezier(value, loc)
+        if key == "animation":
+            return self.animation(value, loc)
+        parts = self.stack + key.split(":")
+        head = parts[0]
+        if head in WIDGETS and self.current is not None and self.stack:
+            if len(parts) == 2:
+                self.current.vals[parts[1]] = (value, loc)
+            else:
+                self.top_unknown(":".join(parts), value, loc)
+            return
+        rest = ":".join(parts[1:])
+        scope = {"general": self.general, "auth": self.auth, "animations": self.anim_enabled}.get(head)
+        if scope is not None and rest in KEYS[head]:
+            scope.vals[rest] = (value, loc)
+        else:
+            self.top_unknown(":".join(parts), value, loc)
+
+    def top_unknown(self, name: str, value: str, loc: str) -> None:
+        hint = OLD_OPTIONS.get(name)
+        if hint:
+            # Older hyprlock versions (and many dotfiles) still set these.
+            self.warn(loc, name, f"not an option of current hyprlock (it reports an error); {hint}; left as a comment")
+        else:
+            self.warn(loc, name, "not a hyprlock option (hyprlock reports an error); left as a comment")
+        self.top.comments.append(comment(f"hyprlock: {name} = {value} (not a hyprlock option)"))
+
+    def source(self, value: str, loc: str, path: Path) -> None:
+        pattern = os.path.expandvars(os.path.expanduser(value))
+        if not os.path.isabs(pattern):
+            pattern = os.path.join(os.path.dirname(os.path.abspath(path)), pattern)
+        matches = sorted(glob.glob(pattern))
+        if not matches:
+            self.warn(loc, "source", f"{value}: no such file (hyprlock reports an error); skipped")
+            return
+        for m in matches:
+            p = Path(os.path.abspath(m))
+            if not p.is_file():
+                continue
+            if any(p == f for f in self.files):
+                if p != self.files[-1]:
+                    self.warn(loc, "source", f"{value}: include loop through {p}; skipped")
+                continue
+            if len(self.files) >= 10:
+                self.warn(loc, "source", f"{value}: includes nested more than 10 deep; skipped")
+                continue
+            try:
+                self.read_file(p)
+            except OSError as err:
+                self.warn(loc, "source", f"cannot read {p}: {err.strerror}")
+
+    def bezier(self, value: str, loc: str) -> None:
+        args = [a.strip() for a in value.split(",")]
+        try:
+            if len(args) < 5 or not all(args[1:5]):
+                raise ConfError("too few arguments (name, x1, y1, x2, y2)")
+            if len(args) > 5:
+                raise ConfError("too many arguments")
+            self.beziers[args[0]] = tuple(c_stof(a) for a in args[1:5])
+        except ConfError as err:
+            self.warn(loc, "bezier", f"{err}; skipped")
+
+    def animation(self, value: str, loc: str) -> None:
+        args = [a.strip() for a in value.split(",")] + [""] * 5
+        name = args[0]
+        if name != "global" and name not in ANIM_PARENT:
+            self.warn(loc, "animation", f"no such animation {name!r}; skipped")
+            return
+        try:
+            enabled = int_of(args[1])
+        except ConfError:
+            enabled = -1
+        if enabled not in (0, 1):
+            self.warn(loc, name, "invalid animation on/off state; skipped")
+            return
+        if not enabled:
+            self.anims[name] = Cfg(False, 1, DEFAULT_BEZIER, loc)
+            return
+        try:
+            speed = int(c_stof(args[2]))  # hyprlock stores the speed in an int64
+        except ConfError:
+            speed = 0
+        if speed <= 0:
+            self.warn(loc, name, f"invalid speed {args[2]!r} (hyprlock wants a number of 1 or more); skipped")
+            return
+        bez = args[3]
+        if bez not in self.beziers:
+            self.warn(loc, name, f"no such bezier {bez!r}; hyprlock uses its default curve")
+            bez = "default"
+        self.anims[name] = Cfg(True, speed, self.beziers[bez], loc, bez)
+
+    # -- typed access --
+
+    def take(self, s: Scope, key: str):
+        s.used.add(key)
+        return s.vals.get(key)
+
+    def get(self, s: Scope, key: str, kind: str):
+        """The parsed value of KEY, or None if unset or one hyprlock would reject."""
+        got = self.take(s, key)
+        if got is None:
+            return None
+        value, loc = got
+        try:
+            if kind == "str":
+                return value
+            if kind == "int":
+                return int_of(value)
+            if kind == "bool":
+                return int_of(value) != 0
+            if kind == "float":
+                return c_stof(value)
+            if kind == "color":
+                return self.checked_color(parse_color(value), loc, key)
+            if kind == "gradient":
+                colors, angle = parse_gradient(value)
+                return [self.checked_color(c, loc, key) for c in colors], angle
+            if kind == "layout":
+                return parse_layout(value)
+        except ConfError as err:
+            self.warn(loc, key, f"{err}; hyprlock ignores the value and keeps its default")
+        return None
+
+    def checked_color(self, c, loc, key):
+        out = tuple(min(max(x, 0), 255) for x in c)
+        if out != tuple(c):
+            self.warn(loc, key, f"colour component outside 0..255 in {tuple(c)}; using {out}")
+        return out
+
+    def loc(self, s: Scope, key: str) -> str:
+        return s.vals[key][1] if key in s.vals else s.loc
+
+    def clamp(self, s: Scope, key: str, v: float, bounds: tuple[float, float], what: str | None = None) -> float:
+        lo, hi = bounds
+        out = min(max(v, lo), hi)
+        if out != v:
+            self.warn(self.loc(s, key), key, f"{what or 'value'} {fmt(v)} is outside {fmt(lo)}..{fmt(hi)}, which swaywardlock rejects; using {fmt(out)}")
+        return out
+
+    def text_value(self, s: Scope, key: str) -> str | None:
+        got = self.take(s, key)
+        if got is None:
+            return None
+        value, loc = got
+        if "cmd[" not in value:  # a shell expands its own $VARIABLES
+            for m in re.finditer(r"\$[A-Za-z_]\w*", value):
+                if not m.group(0).startswith(RUNTIME_TOKENS):
+                    self.warn(loc, key, f"{m.group(0)} is not a swaywardlock text variable; hyprlock replaced "
+                                        "hyprlang and environment variables when it read the config")
+        return value
+
+    def path_value(self, s: Scope, key: str) -> str | None:
+        got = self.take(s, key)
+        if got is None or not got[0]:
+            return None
+        value, loc = got
+        path = os.path.expandvars(os.path.expanduser(value))
+        # DELIBERATE DIVERGENCE: hyprlock resolves a widget path against the working directory
+        # when it locks. swaywardlock may chdir to / and resolves a relative path in a KDL file
+        # against that file's directory, so the converter makes the path absolute against the
+        # directory of the conf file it is written in (as `source =` does in hyprlock).
+        if "$" in path:
+            self.warn(loc, key, f"{path!r} still has a $variable; check the path")
+        if not os.path.isabs(path):
+            base = os.path.dirname(os.path.abspath(loc.rsplit(":", 1)[0]))
+            path = os.path.normpath(os.path.join(base, path))
+        if has_surrogate(path):
+            # A file or directory name that is not UTF-8 (or an environment variable that is not):
+            # KDL strings cannot hold the bytes, so the path cannot be written.
+            self.warn(loc, key, f"path {path} is not valid UTF-8, so it cannot be expressed in KDL; "
+                                "rename it (the widget's path is left out)")
+            return None
+        return path
+
+    def gradient_kdl(self, s: Scope, key: str, names: tuple[str, str]) -> str | None:
+        """`color "..."` / `gradient from= to= angle=` for a hyprlock gradient, or None if unset."""
+        g = self.get(s, key, "gradient")
+        if g is None:
+            return None
+        colors, angle = g
+        if not colors:
+            return None
+        if len(colors) == 1:
+            return f"{names[0]} {hexcolor(colors[0])}"
+        loc, raw = self.loc(s, key), s.vals[key][0]
+        if len(colors) > 2:
+            self.warn(loc, key, f"{len(colors)}-stop gradient reduced to the first and last colour (swaywardlock has two stops)")
+            s.comments.append(comment(f"hyprlock: {s.label(key)} = {raw} ({len(colors)} stops, first and last kept)"))
+        # hyprlock 0deg runs left to right and its shader is not a geometric angle; swaywardlock
+        # uses CSS angles (0 = up). +90 is the closest CSS equivalent (exact at multiples of 90).
+        # The angle is an i16 in the decoder, so it is normalised mod 360.
+        css = ((angle or 0) + 90) % 360
+        return f"{names[1]} from={hexcolor(colors[0])} to={hexcolor(colors[-1])} angle={css}"
+
+    # -- translating --
+
+    def common(self, s: Scope, default_z: int) -> None:
+        """monitor, position, halign, valign, zindex."""
+        mon = self.get(s, "monitor", "str")
+        if mon:
+            # A bare name with whitespace can only be a description prefix; ours needs `desc:`.
+            if not mon.startswith("desc:") and re.search(r"\s", mon):
+                mon = "desc:" + mon
+            s.output = mon
+        pos = self.get(s, "position", "layout")
+        if pos is not None:
+            vals = []
+            for axis in pos:
+                kind, v = axis
+                if kind == "px":
+                    v = self.clamp(s, "position", v, POSITION, "position")
+                vals.append((kind, v))
+            if vals != [("px", 0.0), ("px", 0.0)]:
+                s.lines.append(f"position {fmt_len(vals[0])} {fmt_len(vals[1])}")
+        for key, allowed in (("halign", ("left", "center", "right", "none")), ("valign", ("top", "center", "bottom", "none"))):
+            v = self.get(s, key, "str")
+            if v is None:
+                continue
+            if v not in allowed:
+                self.warn(self.loc(s, key), key, f"{v!r} is not one of {'/'.join(allowed)}; ignored")
+            elif v != "center":
+                s.lines.append(f'{key} "{v}"')
+        z = self.get(s, "zindex", "int")
+        if z is not None and z != default_z:
+            z = int(self.clamp(s, "zindex", z, (-(2**31), 2**31 - 1), "z-index"))
+            s.lines.append(f"z-index {z}")
+
+    def size(self, s: Scope, key: str = "size") -> None:
+        v = self.get(s, key, "layout")
+        if v is None:
+            return
+        out = []
+        for kind, n in v:
+            n = self.clamp(s, key, n, SIZE_PX if kind == "px" else SIZE_PCT, "size")
+            out.append((kind, n))
+        s.lines.append(f"size {fmt_len(out[0])} {fmt_len(out[1])}")
+
+    def rounding(self, s: Scope, default_zero: bool) -> None:
+        r = self.get(s, "rounding", "int")
+        if r is None:
+            return
+        if r == -1:
+            if default_zero:
+                s.lines.append('corner-radius "full"')
+            return
+        if r < -1:
+            self.warn(self.loc(s, "rounding"), "rounding", f"{r} is below -1; hyprlock clamps it to 0")
+            r = 0
+        r = min(r, MAX_CORNER)
+        if r == 0 and default_zero:
+            return
+        s.lines.append(f"corner-radius {r}")
+
+    def border(self, s: Scope, node: str, size_key: str, color_key: str, size_default: int, color_default: str,
+               always: bool) -> None:
+        """border / outline { width; color|gradient }."""
+        width = self.get(s, size_key, "int")
+        has_color = color_key in s.vals
+        if width is None and not has_color and not always:
+            return
+        if width is None:
+            width = size_default
+        grad = self.gradient_kdl(s, color_key, ("color", "gradient"))
+        if grad is None:
+            grad = f"color {color_default}"
+        if node == "border" and width <= 0:
+            if has_color:
+                self.warn(self.loc(s, color_key), color_key, f"no effect: {size_key} is {width}")
+            return
+        width = self.clamp(s, size_key, width, OUTLINE_WIDTH, "width")
+        s.lines.append(f"{node} {{ width {fmt(width)}; {grad}; }}")
+
+    def shadow(self, s: Scope) -> None:
+        passes = self.get(s, "shadow_passes", "int")
+        size = self.get(s, "shadow_size", "int")
+        color = self.get(s, "shadow_color", "color")
+        if passes is not None and passes > 0:
+            soft = self.clamp(s, "shadow_size", (3 if size is None else size) * passes, SHADOW_SOFTNESS, "softness")
+            c = hexcolor(color if color is not None else (0, 0, 0, 255))
+            s.lines.append(f"shadow {{ offset x=0 y=0; spread 0; softness {fmt(soft)}; color {c}; }}")
+            self.warn(self.loc(s, "shadow_passes"), "shadow_passes",
+                      "shadow approximated: hyprlock blurs a copy of the widget; the softness is shadow_size x shadow_passes")
+        else:
+            for key, v in (("shadow_size", size), ("shadow_color", color)):
+                if v is not None:
+                    self.warn(self.loc(s, key), key, "ignored: hyprlock draws no shadow without shadow_passes")
+
+    def text_shadow(self, s: Scope) -> None:
+        """A label's shadow_*: hyprlock blurs the text's alpha `shadow_passes` times (size is the
+        blur radius), boosts its alpha by `shadow_boost` and tints it. No passes, no shadow."""
+        passes = self.get(s, "shadow_passes", "int")
+        size = self.get(s, "shadow_size", "int")
+        color = self.get(s, "shadow_color", "color")
+        boost = self.get(s, "shadow_boost", "float")
+        if passes is None or passes <= 0:
+            for key, v, default in (("shadow_size", size, 3), ("shadow_color", color, (0, 0, 0, 255)),
+                                    ("shadow_boost", boost, 1.2)):
+                if v is not None and v != default:
+                    self.warn(self.loc(s, key), key, "ignored: hyprlock draws no shadow without shadow_passes")
+            return
+        passes = int(self.clamp(s, "shadow_passes", passes, TEXT_SHADOW_PASSES, "passes"))
+        parts = [f"passes {passes}"]
+        if size is not None and size != 3:
+            parts.append(f"size {fmt(self.clamp(s, 'shadow_size', size, TEXT_SHADOW_SIZE, 'size'))}")
+        # hyprlock uses only the colour's rgb; swaywardlock multiplies the shadow by the alpha.
+        if color is not None and color[:3] != (0, 0, 0):
+            parts.append(f"color {hexcolor(color[:3] + (255,))}")
+        if boost is not None and boost != 1.2:
+            parts.append(f"boost {fmt(self.clamp(s, 'shadow_boost', boost, TEXT_SHADOW_BOOST, 'boost'))}")
+        s.lines.append("text-shadow { " + "; ".join(parts) + "; }")
+
+    def rotate(self, s: Scope, xray: bool = False) -> None:
+        """rotate: degrees counter-clockwise, as in hyprlock; swaywardlock normalises to 0..360.
+        hyprlock ignores it on an xray shape, so there it stays a comment."""
+        v = self.get(s, "rotate", "float")
+        if v is None or v % 360 == 0:
+            return
+        if xray:
+            self.unsupported(s, "rotate", s.vals["rotate"][0], self.loc(s, "rotate"),
+                             "ignored: hyprlock does not rotate an xray shape")
+            return
+        s.lines.append(f"rotate {fmt(v % 360)}")
+
+    def tr_background(self, s: Scope) -> None:
+        path = self.path_value(s, "path") if s.vals.get("path", ("",))[0] != "screenshot" else None
+        if s.vals.get("path", ("",))[0] == "screenshot":
+            s.used.add("path")
+            s.lines.append("screenshot")
+        elif path:
+            s.lines.append(f"path {kdl_str(path)}")
+        color = self.get(s, "color", "color")
+        s.lines.append(f"color {hexcolor(color if color is not None else (17, 17, 17, 255))}")
+        passes = self.get(s, "blur_passes", "int")
+        size = self.get(s, "blur_size", "int")
+        noise = self.get(s, "noise", "float")
+        contrast = self.get(s, "contrast", "float")
+        brightness = self.get(s, "brightness", "float")
+        vibrancy = self.get(s, "vibrancy", "float")
+        darkness = self.get(s, "vibrancy_darkness", "float")
+        if passes is not None and passes > 0:
+            passes = int(self.clamp(s, "blur_passes", passes, BLUR_PASSES, "passes"))
+            blur = [f"passes {passes}"]
+            size = 8 if size is None else size  # hyprlock's blur_size default; our offset's is 3
+            blur.append(f"offset {fmt(self.clamp(s, 'blur_size', size, BLUR_OFFSET, 'blur size'))}")
+            noise = 0.0117 if noise is None else noise
+            blur.append(f"noise {fmt(self.clamp(s, 'noise', noise, BLUR_NOISE, 'noise'))}")
+            # hyprlock has no blur saturation; ours defaults to swayward's 1.5.
+            blur.append("saturation 1")
+            s.lines.append("blur { " + "; ".join(blur) + "; }")
+            contrast = 0.8917 if contrast is None else contrast
+            brightness = 0.8172 if brightness is None else brightness
+            s.lines.append(f"contrast {fmt(self.clamp(s, 'contrast', contrast, CONTRAST, 'contrast'))}")
+            s.lines.append(f"brightness {fmt(self.clamp(s, 'brightness', brightness, CONTRAST, 'brightness'))}")
+            # hyprlock's defaults; ours are 0 (off).
+            vibrancy = 0.1686 if vibrancy is None else vibrancy
+            darkness = 0.05 if darkness is None else darkness
+            s.lines.append(f"vibrancy {fmt(self.clamp(s, 'vibrancy', vibrancy, VIBRANCY, 'vibrancy'))}")
+            s.lines.append(f"vibrancy-darkness {fmt(self.clamp(s, 'vibrancy_darkness', darkness, VIBRANCY_DARKNESS, 'vibrancy darkness'))}")
+        else:
+            for key, v in (("blur_size", size), ("noise", noise), ("contrast", contrast), ("brightness", brightness),
+                           ("vibrancy", vibrancy), ("vibrancy_darkness", darkness)):
+                if v is not None:
+                    self.warn(self.loc(s, key), key, "ignored: hyprlock applies it only with blur_passes > 0")
+        self.common(s, -1)
+
+    def tr_shape(self, s: Scope) -> None:
+        self.size(s)
+        self.rounding(s, default_zero=True)
+        color = self.get(s, "color", "color")
+        if color is not None:
+            s.lines.append(f"color {hexcolor(color)}")
+        self.border(s, "border", "border_size", "border_color", 0, hexcolor((0, 207, 230, 255)), always=False)
+        xray = self.get(s, "xray", "bool")
+        if xray:
+            s.lines.append("xray")
+        self.rotate(s, bool(xray))
+        self.shadow(s)
+        self.common(s, 0)
+
+    def tr_image(self, s: Scope) -> None:
+        path = self.path_value(s, "path")
+        if not path:
+            why = "has no path" if not s.vals.get("path", ("",))[0] else "has a path that cannot be written"
+            self.warn(s.loc, "image", f"{why}; the widget is skipped (swaywardlock needs one)")
+            s.lines = None
+            return
+        s.lines.append(f"path {kdl_str(path)}")
+        size = self.get(s, "size", "int")
+        if size is not None and size != 150:
+            s.lines.append(f"size {fmt(self.clamp(s, 'size', size, (1, 10000), 'size'))}")
+        self.rounding(s, default_zero=False)
+        self.border(s, "border", "border_size", "border_color", 4, hexcolor((221, 221, 221, 255)), always=True)
+        self.rotate(s)
+        self.shadow(s)
+        self.common(s, 0)
+
+    def tr_label(self, s: Scope) -> None:
+        text = self.text_value(s, "text")
+        s.lines.append(f"text {kdl_str('Sample Text' if text is None else text)}")
+        family = self.get(s, "font_family", "str")
+        size = self.get(s, "font_size", "int")
+        if family is not None or size is not None:
+            family = "Sans" if family is None else family
+            # hyprlock sets the size in points over whatever the family string says.
+            family = re.sub(r"\s+\d+(\.\d+)?$", "", family)
+            if size is not None and size <= 0:
+                self.warn(self.loc(s, "font_size"), "font_size", f"{size} is not a size; using 16")
+                size = 16
+            s.lines.append(f"font {kdl_str(f'{family} {16 if size is None else size}')}")
+        color = self.get(s, "color", "color")
+        if color is not None and color != (255, 255, 255, 255):
+            s.lines.append(f"color {hexcolor(color)}")
+        align = self.get(s, "text_align", "str")
+        if align not in (None, "", "left", "center", "right"):
+            self.warn(self.loc(s, "text_align"), "text_align", f"{align!r} is not left/center/right; hyprlock uses left")
+        # hyprlock aligns left unless told otherwise; swaywardlock centres.
+        s.lines.append(f'align "{align if align in ("center", "right") else "left"}"')
+        self.rotate(s)
+        self.text_shadow(s)
+        self.common(s, 0)
+
+    def tr_input_field(self, s: Scope) -> None:
+        self.size(s)
+        self.rounding(s, default_zero=False)
+        self.border(s, "outline", "outline_thickness", "outer_color", 4, hexcolor((17, 17, 17, 255)), always=False)
+        for kdl, key in (("inner-color", "inner_color"), ("font-color", "font_color")):
+            c = self.get(s, key, "color")
+            if c is not None:
+                s.lines.append(f"{kdl} {hexcolor(c)}")
+        family = self.get(s, "font_family", "str")
+        if family is not None:
+            s.lines.append(f"font {kdl_str(family)}")
+        ph = self.text_value(s, "placeholder_text")
+        if ph is not None:
+            s.lines.append(f"placeholder-text {kdl_str(ph)}")
+        self.dots(s)
+        self.fade_on_empty(s)
+        hide = self.get(s, "hide_input", "bool")
+        base = self.get(s, "hide_input_base_color", "color")
+        if hide:
+            s.lines.append(f"hide-input {hexcolor(base)}" if base is not None else "hide-input")
+        elif base is not None:
+            self.warn(self.loc(s, "hide_input_base_color"), "hide_input_base_color", "ignored: hide_input is off")
+        for node, ckey, tkey in (("check", "check_color", "check_text"), ("fail", "fail_color", "fail_text")):
+            grad = self.gradient_kdl(s, ckey, ("color", "gradient"))
+            text = self.text_value(s, tkey)
+            parts = ([grad] if grad else []) + ([f"text {kdl_str(text)}"] if text is not None else [])
+            if parts:
+                s.lines.append(f"{node} {{ " + "; ".join(parts) + "; }")
+        for name in ("capslock", "numlock", "bothlock"):
+            g = self.gradient_kdl(s, f"{name}_color", (f"{name}-color", f"{name}-gradient"))
+            if g:
+                s.lines.append(g)
+        for kdl in ("invert_numlock", "swap_font_color"):
+            if self.get(s, kdl, "bool"):
+                s.lines.append(kdl.replace("_", "-"))
+        self.shadow(s)
+        self.common(s, 0)
+
+    def dots(self, s: Scope) -> None:
+        props = []
+        size = self.get(s, "dots_size", "float")
+        if size is not None:
+            props.append(f"size={fmt(self.clamp(s, 'dots_size', size, DOT_SIZE, 'dot size'))}")
+        spacing = self.get(s, "dots_spacing", "float")
+        if spacing is not None:
+            props.append(f"spacing={fmt(self.clamp(s, 'dots_spacing', spacing, DOT_SPACING, 'dot spacing'))}")
+        center = self.get(s, "dots_center", "bool")
+        if center is not None:
+            props.append(f"center={'true' if center else 'false'}")
+        rounding = self.get(s, "dots_rounding", "int")
+        if rounding is not None:
+            if rounding < -2:
+                self.warn(self.loc(s, "dots_rounding"), "dots_rounding", f"{rounding} is below -2; using -1 (round)")
+                rounding = -1
+            rounding = int(self.clamp(s, "dots_rounding", rounding, (-2, 1000), "dot rounding"))
+            props.append(f"corner-radius={rounding}")
+        text = self.get(s, "dots_text_format", "str")
+        if text:
+            props.append(f"text={kdl_str(text)}")
+        if props:
+            s.lines.append("dots " + " ".join(props))
+
+    def fade_on_empty(self, s: Scope) -> None:
+        on = self.get(s, "fade_on_empty", "bool")
+        timeout = self.get(s, "fade_timeout", "int")
+        if on is False:
+            s.lines.append("fade-on-empty false")
+            if timeout is not None:
+                self.warn(self.loc(s, "fade_timeout"), "fade_timeout", "ignored: fade_on_empty is off")
+        elif timeout is not None and timeout != 2000:
+            timeout = int(self.clamp(s, "fade_timeout", timeout, (0, 2**32 - 1), "timeout"))
+            s.lines.append(f"fade-on-empty timeout-ms={timeout}")
+
+    def leftovers(self, s: Scope, kind: str) -> None:
+        """Every key no translator took: a table handler, or unknown."""
+        for key, (value, loc) in s.vals.items():
+            if key in s.used:
+                continue
+            if key in KEYS[kind] and key in UNSUPPORTED:
+                UNSUPPORTED[key](self, s, key, value, loc)
+            elif key in KEYS[kind]:  # a translator forgot it: never drop it silently
+                self.unsupported(s, key, value, loc, "not translated")
+            else:
+                self.warn(loc, s.label(key), "not a hyprlock option for this section; left as a comment")
+                s.comments.append(comment(f"hyprlock: {s.label(key)} = {value} (not a hyprlock option)"))
+
+    def tr_general(self) -> list[str]:
+        s = self.general
+        hide = self.get(s, "hide_cursor", "bool")
+        s.lines.append(f"hide-cursor {'true' if hide else 'false'}")  # ours defaults to true
+        if self.get(s, "ignore_empty_input", "bool"):
+            s.lines.append("ignore-empty-input")
+        t = self.get(s, "fail_timeout", "int")
+        t = 2000 if t is None else t  # hyprlock's default; ours is 3000
+        s.lines.append(f"fail-timeout-ms {int(self.clamp(s, 'fail_timeout', t, (0, 2**32 - 1), 'timeout'))}")
+        if self.get(s, "immediate_render", "bool"):
+            self.immediate_render = True
+            value, loc = s.vals["immediate_render"]
+            self.note(loc, "general:immediate_render", "becomes the command line flag --immediate-render")
+            s.comments.append(comment(f"hyprlock: general:immediate_render = {value} (use the --immediate-render flag)"))
+        self.leftovers(s, "general")
+        return s.body()
+
+    def tr_auth(self) -> list[str]:
+        s = self.auth
+        enabled = self.get(s, "pam:enabled", "bool")
+        module = self.get(s, "pam:module", "str")
+        if enabled is False:
+            s.lines.append('pam "off"')
+            if module is not None:
+                self.note(self.loc(s, "pam:module"), "auth:pam:module", "ignored: PAM is off")
+                s.comments.append(comment(f"hyprlock: auth:pam:module = {module} (ignored: PAM is off)"))
+            if self.get(s, "fingerprint:enabled", "bool") is not True and not s.vals.get("fingerprint:enabled"):
+                self.warn(self.loc(s, "pam:enabled"), "auth:pam:enabled",
+                          "PAM is off and fingerprint is not enabled: only SIGUSR1 can unlock the session")
+        elif module is not None:
+            if module == "hyprlock":
+                # swaywardlock ships its own /etc/pam.d/swaywardlock; /etc/pam.d/hyprlock may not exist.
+                self.note(self.loc(s, "pam:module"), "auth:pam:module",
+                          "hyprlock's own PAM service is not used; swaywardlock's shipped /etc/pam.d/swaywardlock applies")
+                s.comments.append(comment("hyprlock: auth:pam:module = hyprlock (the shipped swaywardlock PAM file is used instead)"))
+            else:
+                s.lines.append(f"pam service={kdl_str(module)}")
+        fp = self.get(s, "fingerprint:enabled", "bool")
+        sub = []
+        for kdl, key, kind in (("ready-message", "fingerprint:ready_message", "str"),
+                               ("present-message", "fingerprint:present_message", "str"),
+                               ("retry-delay-ms", "fingerprint:retry_delay", "int")):
+            v = self.get(s, key, kind)
+            if v is None:
+                continue
+            if not fp:
+                self.note(self.loc(s, key), "auth:" + key, "ignored: fingerprint is not enabled")
+                s.comments.append(comment(f"hyprlock: auth:{key} = {s.vals[key][0]} (ignored: fingerprint is not enabled)"))
+            elif kind == "int":
+                sub.append(f"{kdl} {int(self.clamp(s, key, v, (0, 2**32 - 1), 'delay'))}")
+            else:
+                sub.append(f"{kdl} {kdl_str(v)}")
+        if fp:
+            s.lines.append("fingerprint {" + ("\n" + "\n".join(f"    {x}" for x in sub) + "\n" if sub else "") + "}")
+        self.leftovers(s, "auth")
+        return s.body()
+
+    def tr_animations(self) -> list[str]:
+        s = self.anim_enabled
+        enabled = self.get(s, "enabled", "bool")
+        self.leftovers(s, "animations")
+        if enabled is False:
+            return ["off"]
+        out = []
+        for kdl, node in ANIM_KDL.items():
+            n = node
+            while n not in self.anims:
+                n = ANIM_PARENT[n]
+            cfg = self.anims[n]
+            if cfg.loc is None and kdl not in ("fade-in", "fade-out"):
+                continue  # not set by the config: swaywardlock's own default
+            if not cfg.enabled:
+                out.append(f"{kdl} {{ off; }}")
+                continue
+            ms = min(cfg.speed * 100, 2**32 - 1)  # duration-ms is a u32
+            if ms > MAX_ANIM_MS:
+                self.warn(cfg.loc, node, f"{ms} ms is more than the {MAX_ANIM_MS} ms swaywardlock allows for an animation; using {MAX_ANIM_MS}")
+                ms = MAX_ANIM_MS
+            out.append(f"{kdl} {{ duration-ms {ms}; curve {self.curve(cfg, node)}; }}")
+        return out
+
+    def curve(self, cfg: Cfg, node: str) -> str:
+        x1, y1, x2, y2 = cfg.points
+        if x1 == y1 and x2 == y2:
+            return '"linear"'
+        cx1, cx2 = min(max(x1, 0.0), 1.0), min(max(x2, 0.0), 1.0)
+        if (cx1, cx2) != (x1, x2):
+            self.warn(cfg.loc, node, f"bezier {cfg.bezier!r}: x coordinates outside 0..1 are rejected by swaywardlock; clamped")
+        cy1, cy2 = (min(max(y, BEZIER_Y[0]), BEZIER_Y[1]) for y in (y1, y2))
+        if (cy1, cy2) != (y1, y2):
+            self.warn(cfg.loc, node, f"bezier {cfg.bezier!r}: y coordinates outside {fmt(BEZIER_Y[0])}..{fmt(BEZIER_Y[1])} are rejected by swaywardlock; clamped")
+        return '"cubic-bezier" ' + " ".join(fmt(v) for v in (cx1, cy1, cx2, cy2))
+
+    def emit(self) -> str:
+        out = [comment("Translated from hyprlock by contrib/hyprlock-to-kdl."), ""]
+        for line in self.top.comments:
+            out.append(line)
+        if self.top.comments:
+            out.append("")
+        for name, lines in (("general", self.tr_general()), ("auth", self.tr_auth())):
+            if lines:
+                out += [f"{name} {{"] + indent(lines) + ["}", ""]
+        anims = self.tr_animations()
+        if anims:
+            out += ["animations {"] + indent(anims) + ["}", ""]
+        translators = {"background": self.tr_background, "shape": self.tr_shape, "image": self.tr_image,
+                       "input-field": self.tr_input_field, "label": self.tr_label}
+        count = 0
+        for kind in WIDGETS:
+            for s in (b for b in self.blocks if b.kind == kind):
+                translators[kind](s)
+                if s.lines is None:  # skipped
+                    s.lines = []
+                    self.leftovers(s, kind)
+                    out += [comment(f"hyprlock: image at {s.loc} skipped")] + s.comments + [""]
+                    continue
+                self.leftovers(s, kind)
+                head = kind + (f" output={kdl_str(s.output)}" if s.output else "") + " {"
+                out += [head] + indent(s.body()) + ["}", ""]
+                count += 1
+        if not self.blocks:
+            self.warn(None, None, "no widgets: swaywardlock draws its default look (background and ring indicator), "
+                                  "hyprlock draws nothing")
+        return "\n".join(out).rstrip() + "\n"
+
+
+def indent(lines: list[str]) -> list[str]:
+    return ["    " + sub for line in lines for sub in line.split("\n")]
+
+
+def default_config() -> Path | None:
+    home = Path.home()
+    candidates = []
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    if xdg and os.path.isabs(xdg):
+        candidates.append(Path(xdg) / "hypr/hyprlock.conf")
+    candidates.append(home / ".config/hypr/hyprlock.conf")
+    for d in os.environ.get("XDG_CONFIG_DIRS", "").split(":"):
+        if d:
+            candidates.append(Path(d) / "hypr/hyprlock.conf")
+    candidates.append(Path("/etc/xdg/hypr/hyprlock.conf"))
+    return next((p for p in candidates if p.is_file()), None)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("config", nargs="?", type=Path, help="hyprlock config file")
+    opts = ap.parse_args()
+    path = opts.config or default_config()
+    if path is None:
+        print("hyprlock-to-kdl: no hyprlock config found; pass a path", file=sys.stderr)
+        return 1
+    conv = Converter()
+    try:
+        conv.read_file(path)
+    except OSError as err:
+        print(f"hyprlock-to-kdl: cannot read {path}: {err.strerror}", file=sys.stderr)
+        return 1
+    kdl = conv.emit()
+    sys.stdout.write(kdl)
+    print("command: swaywardlock" + (" --immediate-render" if conv.immediate_render else ""), file=sys.stderr)
+    for m in conv.messages:
+        print(m, file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

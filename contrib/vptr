@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""A virtual pointer for tests (wlr-virtual-pointer-unstable-v1), on the default seat.
+
+    vptr COMMAND...
+
+The headless seat has no pointer of its own (WLR_LIBINPUT_NO_DEVICES=1); this one gives the
+locker a wl_pointer and sends it events. Commands run in order; the pointer exists until the
+last one has run:
+
+    move DX DY    relative motion, in pixels
+    click         press and release the left button
+    sleep MS      wait
+
+Prints "ready" once the pointer exists. Speaks the Wayland wire protocol directly (see vkbd).
+"""
+
+import os
+import socket
+import struct
+import sys
+import time
+
+BTN_LEFT = 0x110
+
+
+class Wayland:
+    def __init__(self):
+        path = os.path.join(os.environ["XDG_RUNTIME_DIR"], os.environ.get("WAYLAND_DISPLAY", "wayland-0"))
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.connect(path)
+        self.next_id = 2
+        self.buf = b""
+
+    def new_id(self):
+        self.next_id += 1
+        return self.next_id - 1
+
+    def send(self, obj, opcode, args=b""):
+        self.sock.sendall(struct.pack("<II", obj, (8 + len(args)) << 16 | opcode) + args)
+
+    def events(self):
+        """Read until a wl_display.sync callback fires; yield (object, opcode, payload)."""
+        cb = self.new_id()
+        self.send(1, 0, struct.pack("<I", cb))
+        while True:
+            while len(self.buf) >= 8:
+                obj, word = struct.unpack_from("<II", self.buf)
+                size = word >> 16
+                if len(self.buf) < size:
+                    break
+                payload, self.buf = self.buf[8:size], self.buf[size:]
+                if obj == 1 and word & 0xFFFF == 0:
+                    sys.exit(f"vptr: protocol error {struct.unpack_from('<II', payload)[1]}")
+                if obj == cb:
+                    return
+                yield obj, word & 0xFFFF, payload
+            data = self.sock.recv(65536)
+            if not data:
+                sys.exit("vptr: compositor closed the connection")
+            self.buf += data
+
+
+def string(payload, off):
+    n = struct.unpack_from("<I", payload, off)[0]
+    return payload[off + 4 : off + 4 + n - 1].decode()
+
+
+def wl_string(s):
+    b = s.encode() + b"\0"
+    return struct.pack("<I", len(b)) + b + b"\0" * (-len(b) % 4)
+
+
+def main():
+    wl = Wayland()
+    registry = wl.new_id()
+    wl.send(1, 1, struct.pack("<I", registry))
+    manager = None
+    for obj, op, p in list(wl.events()):
+        if obj == registry and op == 0:
+            name = struct.unpack_from("<I", p)[0]
+            iface = string(p, 4)
+            if iface == "zwlr_virtual_pointer_manager_v1":
+                manager = wl.new_id()
+                wl.send(registry, 0, struct.pack("<I", name) + wl_string(iface) + struct.pack("<II", 1, manager))
+    if manager is None:
+        sys.exit("vptr: no zwlr_virtual_pointer_manager_v1")
+    ptr = wl.new_id()
+    wl.send(manager, 0, struct.pack("<II", 0, ptr))  # create_virtual_pointer(seat: null)
+    list(wl.events())
+    print("ready", flush=True)
+
+    t0 = time.monotonic()
+
+    def ms():
+        return int((time.monotonic() - t0) * 1000)
+
+    def frame():
+        wl.send(ptr, 4)
+        list(wl.events())
+
+    args = sys.argv[1:]
+    while args:
+        verb = args.pop(0)
+        if verb == "move":
+            dx, dy = int(args.pop(0)), int(args.pop(0))
+            wl.send(ptr, 0, struct.pack("<Iii", ms(), dx * 256, dy * 256))
+            frame()
+        elif verb == "click":
+            for state in (1, 0):
+                wl.send(ptr, 2, struct.pack("<III", ms(), BTN_LEFT, state))
+                frame()
+        elif verb == "sleep":
+            time.sleep(int(args.pop(0)) / 1000)
+        else:
+            sys.exit(f"vptr: unknown command {verb!r}")
+    wl.send(ptr, 8)  # destroy
+    list(wl.events())
+
+
+if __name__ == "__main__":
+    main()

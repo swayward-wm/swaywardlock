@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+"""A virtual keyboard for tests, on a chosen seat and with a chosen xkb layout list.
+
+    vkbd [--seat NAME] [--layout us,de] COMMAND...
+
+wtype cannot do either: it always uses the default seat and uploads a one-layout keymap of its
+own. Commands run in order; the keyboard exists until the last one has run:
+
+    type TEXT     press and release each lower-case letter, digit or '-' of TEXT
+    key NAME      press and release a key: Return, BackSpace, Shift_L, Control_L, Caps_Lock, a
+                  letter, or a raw evdev code
+    hold NAME MS  press, wait MS milliseconds, release (the compositor's key repeat runs)
+    down NAME     press a key and keep it down; up NAME releases it
+    mods D L K    send modifier masks (depressed, latched, locked: 4 = Ctrl, 2 = Caps Lock).
+                  The compositor does not derive them from the keys, so a client sees Ctrl or
+                  Caps Lock only after this (wtype never sends any)
+    sleep MS      wait
+    stdin         read further commands from stdin, one per line, until EOF or "quit"
+
+Prints "ready" once the keyboard exists. Needs WAYLAND_DISPLAY and the compositor's
+zwp_virtual_keyboard_manager_v1; libxkbcommon builds the keymap. Speaks the Wayland wire
+protocol directly so it needs nothing beyond the standard library.
+"""
+
+import ctypes
+import ctypes.util
+import os
+import socket
+import struct
+import sys
+import time
+
+KEYS = {
+    "Return": 28,
+    "BackSpace": 14,
+    "Delete": 111,
+    "Shift_L": 42,
+    "Escape": 1,
+    "Control_L": 29,
+    "Caps_Lock": 58,
+}
+ROWS = {"qwertyuiop": 16, "asdfghjkl": 30, "zxcvbnm": 44, "1234567890": 2}
+
+
+def named(name):
+    """A key from KEYS, one letter, digit or '-', or a raw evdev code."""
+    return KEYS.get(name) or (keycode(name) if len(name) == 1 else int(name))
+
+
+def keycode(c):
+    if c == "-":
+        return 12
+    for row, base in ROWS.items():
+        if c in row:
+            return base + row.index(c)
+    sys.exit(f"vkbd: no key for {c!r}")
+
+
+def keymap_text(layout):
+    xkb = ctypes.CDLL(ctypes.util.find_library("xkbcommon") or "libxkbcommon.so.0")
+
+    class Names(ctypes.Structure):
+        _fields_ = [(f, ctypes.c_char_p) for f in ("rules", "model", "layout", "variant", "options")]
+
+    xkb.xkb_context_new.restype = ctypes.c_void_p
+    xkb.xkb_keymap_new_from_names.restype = ctypes.c_void_p
+    xkb.xkb_keymap_new_from_names.argtypes = [ctypes.c_void_p, ctypes.POINTER(Names), ctypes.c_int]
+    xkb.xkb_keymap_get_as_string.restype = ctypes.c_char_p
+    xkb.xkb_keymap_get_as_string.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    ctx = xkb.xkb_context_new(0)
+    names = Names(None, None, layout.encode(), None, None)
+    km = xkb.xkb_keymap_new_from_names(ctx, ctypes.byref(names), 0)
+    if not km:
+        sys.exit(f"vkbd: xkbcommon cannot compile layout {layout!r}")
+    return xkb.xkb_keymap_get_as_string(km, 1) + b"\0"  # leaks; the process is short-lived
+
+
+class Wayland:
+    def __init__(self):
+        path = os.path.join(os.environ["XDG_RUNTIME_DIR"], os.environ.get("WAYLAND_DISPLAY", "wayland-0"))
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.connect(path)
+        self.next_id = 2
+        self.buf = b""
+
+    def new_id(self):
+        self.next_id += 1
+        return self.next_id - 1
+
+    def send(self, obj, opcode, args=b"", fds=()):
+        msg = struct.pack("<II", obj, (8 + len(args)) << 16 | opcode) + args
+        if fds:
+            socket.send_fds(self.sock, [msg], list(fds))
+        else:
+            self.sock.sendall(msg)
+
+    def events(self):
+        """Read until a wl_display.sync callback fires; yield (object, opcode, payload)."""
+        cb = self.new_id()
+        self.send(1, 0, struct.pack("<I", cb))
+        while True:
+            while len(self.buf) >= 8:
+                obj, word = struct.unpack_from("<II", self.buf)
+                size = word >> 16
+                if len(self.buf) < size:
+                    break
+                payload, self.buf = self.buf[8:size], self.buf[size:]
+                if obj == 1 and word & 0xFFFF == 0:
+                    _, code = struct.unpack_from("<II", payload)
+                    sys.exit(f"vkbd: protocol error {code}: {string(payload, 8)[0]}")
+                if obj == cb:
+                    return
+                yield obj, word & 0xFFFF, payload
+            data = self.sock.recv(65536)
+            if not data:
+                sys.exit("vkbd: compositor closed the connection")
+            self.buf += data
+
+
+def string(payload, off):
+    n = struct.unpack_from("<I", payload, off)[0]
+    s = payload[off + 4 : off + 4 + n - 1].decode()
+    return s, off + 4 + (n + 3) // 4 * 4
+
+
+def wl_string(s):
+    b = s.encode() + b"\0"
+    return struct.pack("<I", len(b)) + b + b"\0" * (-len(b) % 4)
+
+
+def main():
+    args = sys.argv[1:]
+    seat_name, layout = None, "us"
+    while args and args[0].startswith("--"):
+        opt, val, args = args[0], args[1], args[2:]
+        if opt == "--seat":
+            seat_name = val
+        elif opt == "--layout":
+            layout = val
+        else:
+            sys.exit(f"vkbd: unknown option {opt}")
+
+    wl = Wayland()
+    registry = wl.new_id()
+    wl.send(1, 1, struct.pack("<I", registry))
+    seats, manager = {}, None
+    for obj, op, p in list(wl.events()):
+        if obj == registry and op == 0:
+            name = struct.unpack_from("<I", p)[0]
+            iface, off = string(p, 4)
+            if iface == "wl_seat":
+                sid = wl.new_id()
+                wl.send(registry, 0, struct.pack("<I", name) + wl_string(iface) + struct.pack("<II", 2, sid))
+                seats[sid] = None
+            elif iface == "zwp_virtual_keyboard_manager_v1":
+                manager = wl.new_id()
+                wl.send(registry, 0, struct.pack("<I", name) + wl_string(iface) + struct.pack("<II", 1, manager))
+    for obj, op, p in list(wl.events()):
+        if obj in seats and op == 1:
+            seats[obj] = string(p, 0)[0]
+    if manager is None:
+        sys.exit("vkbd: no zwp_virtual_keyboard_manager_v1")
+    seat = next((s for s, n in seats.items() if seat_name in (None, n)), None)
+    if seat is None:
+        sys.exit(f"vkbd: no seat {seat_name!r} (have {sorted(n for n in seats.values() if n)})")
+
+    kb = wl.new_id()
+    wl.send(manager, 0, struct.pack("<II", seat, kb))
+    text = keymap_text(layout)
+    fd = os.memfd_create("vkbd-keymap")
+    os.write(fd, text)
+    wl.send(kb, 0, struct.pack("<II", 1, len(text)), [fd])
+    os.close(fd)
+    list(wl.events())
+    print("ready", flush=True)
+
+    t0 = time.monotonic()
+
+    def key(code, state):
+        wl.send(kb, 1, struct.pack("<III", int((time.monotonic() - t0) * 1000), code, state))
+        list(wl.events())
+
+    def tap(code):
+        key(code, 1)
+        key(code, 0)
+        time.sleep(0.03)
+
+    def run(cmd):
+        verb, _, rest = cmd.partition(" ")
+        if verb == "type":
+            for c in rest:
+                tap(keycode(c))
+        elif verb == "key":
+            tap(named(rest))
+        elif verb == "hold":
+            name, ms = rest.split()
+            code = named(name)
+            key(code, 1)
+            time.sleep(int(ms) / 1000)
+            key(code, 0)
+        elif verb in ("down", "up"):
+            key(named(rest), int(verb == "down"))
+        elif verb == "mods":
+            depressed, latched, locked = (int(v) for v in rest.split())
+            wl.send(kb, 2, struct.pack("<IIII", depressed, latched, locked, 0))
+            list(wl.events())
+        elif verb == "sleep":
+            time.sleep(int(rest) / 1000)
+        elif verb == "stdin":
+            for line in sys.stdin:
+                if line.strip() == "quit":
+                    break
+                if line.strip():
+                    run(line.strip())
+                    print("done " + line.strip(), flush=True)
+        else:
+            sys.exit(f"vkbd: unknown command {cmd!r}")
+
+    for cmd in args:
+        run(cmd)
+    wl.send(kb, 3)  # destroy
+    list(wl.events())
+
+
+if __name__ == "__main__":
+    main()

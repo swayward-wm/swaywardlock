@@ -1,4 +1,4 @@
-//! Runtime for `label` widgets: `cmd[]` schedules, their latest output, and the minute tick for
+//! Runtime for `label` widgets: `cmd[]` schedules, their latest output, and the clock check for
 //! `$TIME`. Owns the timers so a config reload (preview) can replace them wholesale.
 
 use calloop::timer::{TimeoutAction, Timer};
@@ -10,6 +10,9 @@ use crate::state::LockState;
 use crate::textvars::{self, Template};
 use crate::App;
 
+/// How often `$TIME` labels look at the wall clock.
+const CLOCK_CHECK: std::time::Duration = std::time::Duration::from_secs(1);
+
 pub struct Labels {
     runner: Runner,
     /// Latest output per widget index; `None` for non-command widgets or before the first run.
@@ -17,12 +20,14 @@ pub struct Labels {
     /// Commands that re-run on SIGUSR2, as (widget index, shell).
     on_signal: Vec<(usize, String)>,
     timers: Vec<RegistrationToken>,
+    /// An idle draw for changed output is queued; see the channel callback.
+    redraw_pending: bool,
     pub user: String,
     pub desc: String,
 }
 
 impl Labels {
-    /// Set up for `config`: start every command once, arm its interval, and arm the minute tick
+    /// Set up for `config`: start every command once, arm its interval, and arm the clock check
     /// if any label shows the time.
     pub fn new(
         config: &Config,
@@ -33,9 +38,22 @@ impl Labels {
         let token = handle
             .insert_source(rx, |event, _, app| {
                 if let calloop::channel::Event::Msg(out) = event {
-                    if let Some(slot) = app.labels.output.get_mut(out.id) {
-                        *slot = Some(out.text);
-                        app.draw_all();
+                    let Some(slot) = app.labels.output.get_mut(out.id) else {
+                        return;
+                    };
+                    // A result that says what is already shown needs no frame.
+                    if slot.as_deref() == Some(out.text.as_str()) {
+                        return;
+                    }
+                    *slot = Some(out.text);
+                    // One draw per loop iteration, however many results arrived in it: calloop
+                    // hands over up to 1024 messages per dispatch, and a full draw of every
+                    // surface per message starved input and signals behind the redraws.
+                    if !std::mem::replace(&mut app.labels.redraw_pending, true) {
+                        app.handle.insert_idle(|app| {
+                            app.labels.redraw_pending = false;
+                            app.draw_all();
+                        });
                     }
                 }
             })
@@ -47,6 +65,7 @@ impl Labels {
             output: vec![None; config.widgets.len()],
             on_signal: Vec::new(),
             timers: vec![token],
+            redraw_pending: false,
             user,
             desc,
         };
@@ -76,14 +95,20 @@ impl Labels {
         }
 
         if uses_time {
+            // Calloop timers count CLOCK_MONOTONIC, which stops during suspend, so a timer armed
+            // for the next minute fired up to a minute late after a resume and the clock showed
+            // the time from before the sleep. Look at the wall clock every second instead (as
+            // hyprlock does) and redraw when the minute shown changes.
+            let mut shown = textvars::local_time();
             let token = handle
-                .insert_source(
-                    Timer::from_duration(textvars::until_next_minute()),
-                    |_, _, app| {
+                .insert_source(Timer::from_duration(CLOCK_CHECK), move |_, _, app| {
+                    let now = textvars::local_time();
+                    if now != shown {
+                        shown = now;
                         app.draw_all();
-                        TimeoutAction::ToDuration(textvars::until_next_minute())
-                    },
-                )
+                    }
+                    TimeoutAction::ToDuration(CLOCK_CHECK)
+                })
                 .map_err(|e| anyhow::anyhow!("clock timer: {}", e.error))?;
             labels.timers.push(token);
         }

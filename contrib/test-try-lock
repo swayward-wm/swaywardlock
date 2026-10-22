@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# Smoke test for contrib/try-lock: usage errors, --help, a missing build, and a SIGTERM/SIGINT/
+# SIGHUP that must leave no temp dir and no process behind. Needs sway and a test-auth build
+# (target/debug/swaywardlock from `cargo build --features test-auth`, as the gate builds it).
+set -uo pipefail
+cd "$(dirname "$0")/.."
+export TRY_LOCK_BACKEND=headless TRY_LOCK_NATIVE=1 TMPDIR
+TMPDIR=$(mktemp -d /tmp/swl-trytest.XXXXXX)
+fails=0
+fail() { echo "FAIL test-try-lock: $*" >&2; fails=$((fails + 1)); }
+pass() { echo "ok   $*"; }
+trap 'rm -rf -- "$TMPDIR"' EXIT
+
+# Usage errors: exit 2 with a pointer to --help, never a bash internals message.
+for args in "-c" "--size" "--scale" "--unlock-after" "--size abc" "--bogus"; do
+    out=$(contrib/try-lock $args 2>&1); rc=$?
+    if [ "$rc" = 2 ] && grep -q -- '--help' <<<"$out" && ! grep -q 'unbound\|line [0-9]' <<<"$out"; then
+        pass "usage error: $args"
+    else
+        fail "usage error '$args': rc=$rc: $out"
+    fi
+done
+
+# --help is the header comment only: no stray script line.
+help=$(contrib/try-lock --help)
+if grep -q 'set -euo' <<<"$help" || ! grep -q 'TRY_LOCK_BACKEND' <<<"$help"; then
+    fail "--help is cut wrong: $(tail -2 <<<"$help")"
+else
+    pass "--help text"
+fi
+
+# A missing build is named before anything starts.
+if [ ! -x target/debug/swaywardlock ] || ! command -v sway >/dev/null; then
+    echo "skip test-try-lock: needs sway and target/debug/swaywardlock (test-auth build)"
+    exit "$fails"
+fi
+empty=$(mktemp -d "$TMPDIR/repo.XXXXXX")
+mkdir -p "$empty/contrib" "$empty/examples"
+cp contrib/try-lock "$empty/contrib/"
+cp examples/hyprlock-example.kdl "$empty/examples/"
+out=$("$empty/contrib/try-lock" --no-build 2>&1); rc=$?
+if [ "$rc" = 1 ] && grep -q 'cargo build --features test-auth' <<<"$out" && ! grep -q 'No such file' <<<"$out"; then
+    pass "--no-build without a build says what to build"
+else
+    fail "--no-build without a build: rc=$rc: $out"
+fi
+rm -rf -- "$empty"
+if [ -n "$(ls -d "$TMPDIR"/swl-try.* 2>/dev/null)" ]; then fail "a failed start left a temp dir"; fi
+
+# Each signal ends the run, cleans the temp dir and kills the nested sway and the locker.
+for sig in TERM INT HUP; do
+    # TERM also runs with --unlock-after: its sleep must not outlive the script (a unique N finds it).
+    unlock_args=()
+    [ "$sig" = TERM ] && unlock_args=(--unlock-after 7771)
+    # A background job of a script starts with SIGINT ignored, which a trap cannot undo: start
+    # it the way a terminal does, with the default dispositions.
+    python3 -c 'import os, signal, sys
+os.setsid()
+for s in (signal.SIGINT, signal.SIGHUP, signal.SIGTERM):
+    signal.signal(s, signal.SIG_DFL)
+os.execv(sys.argv[1], sys.argv[1:])' contrib/try-lock --no-build --preview "${unlock_args[@]}" >"$TMPDIR/out.$sig" 2>&1 &
+    pid=$!
+    for _ in $(seq 100); do
+        grep -q 'locker pid' "$TMPDIR/out.$sig" 2>/dev/null && break
+        sleep 0.1
+    done
+    grep -q 'locker pid' "$TMPDIR/out.$sig" || { fail "$sig: never started: $(cat "$TMPDIR/out.$sig")"; kill -KILL "$pid"; continue; }
+    sleep 0.5
+    kill -"$sig" "$pid"
+    for _ in $(seq 100); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+    if kill -0 "$pid" 2>/dev/null; then
+        fail "$sig: try-lock still running after 10 s"
+        pkill -KILL -g "$pid"
+        continue
+    fi
+    left=$(ls -d "$TMPDIR"/swl-try.* 2>/dev/null)
+    procs=$(pgrep -f "$TMPDIR/swl-try\.|^sleep 7771\$" || true)
+    if [ -z "$left" ] && [ -z "$procs" ]; then
+        pass "$sig: temp dir and children gone"
+    else
+        fail "$sig: left behind dir='$left' pids='$procs'"
+        # shellcheck disable=SC2086
+        [ -z "$procs" ] || kill -KILL $procs
+    fi
+done
+
+[ "$fails" = 0 ] && echo "test-try-lock: ok" || echo "test-try-lock: $fails failed" >&2
+exit "$fails"

@@ -267,6 +267,10 @@ launch feature.
 - Visual: render widgets offscreen with `GlesRenderer` and compare
   snapshots, the same way `swayward-visual-tests` does it.
 
+Outcome (see the spec's Testing section): auth has no trait or fake, only a `test-auth` build
+feature; config tests are plain assertions, not snapshots; there are no offscreen visual tests,
+only headless-sway pixel checks.
+
 ## Plan
 
 | Phase | Scope | Rough size |

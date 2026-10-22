@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+"""Keep docs/swaywardlock.1.scd honest about the CLI.
+
+Usage: contrib/check-man [BINARY]   (default target/debug/swaywardlock)
+
+Fails if the binary's --help lists a long flag or subcommand the man page does not mention, or
+if the man page mentions a long flag the binary lacks. Then, if scdoc is installed, checks that
+the page compiles. Without scdoc the syntax check is skipped (and said so); CI installs it.
+"""
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+binary = sys.argv[1] if len(sys.argv) > 1 else os.path.join(root, "target/debug/swaywardlock")
+scd_path = os.path.join(root, "docs/swaywardlock.1.scd")
+
+help_text = subprocess.run(
+    [binary, "--help"], check=True, capture_output=True, text=True
+).stdout
+scd = open(scd_path, encoding="utf-8").read()
+
+# Long flags in the Options block of --help; subcommands in the Commands block.
+flags = set(re.findall(r"^\s+(?:-\w, )?(--[a-z][a-z0-9-]*)", help_text, re.M))
+commands = set()
+in_commands = False
+for line in help_text.splitlines():
+    if line.startswith("Commands:"):
+        in_commands = True
+        continue
+    if in_commands:
+        if not line.startswith("  "):
+            break
+        name = line.split()[0]
+        if name != "help":  # clap's own
+            commands.add(name)
+
+if not flags or not commands:
+    sys.exit(f"check-man: could not parse flags/commands from {binary} --help")
+
+# The page writes flags as *--flag* and commands as *name* at the start of a line.
+documented_flags = set(re.findall(r"--[a-z][a-z0-9-]*", scd))
+commands_section = re.search(r"^# COMMANDS$(.*?)^# ", scd, re.M | re.S)
+documented_commands = set(
+    re.findall(r"^\*([a-z]+)\*", commands_section.group(1) if commands_section else "", re.M)
+)
+
+problems = []
+for flag in sorted(flags - documented_flags):
+    problems.append(f"flag {flag} is in --help but not in the man page")
+for flag in sorted(documented_flags - flags):
+    problems.append(f"flag {flag} is in the man page but not in --help")
+for name in sorted(commands - documented_commands):
+    problems.append(f"command {name} is in --help but not in the man page")
+for name in sorted(documented_commands - commands):
+    problems.append(f"command {name} is in the man page but not in --help")
+
+for problem in problems:
+    print(f"check-man: {problem}", file=sys.stderr)
+
+scdoc = shutil.which("scdoc")
+if scdoc:
+    with open(scd_path, "rb") as src:
+        result = subprocess.run([scdoc], stdin=src, stdout=subprocess.DEVNULL)
+    if result.returncode != 0:
+        problems.append("scdoc failed")
+else:
+    print("check-man: scdoc not installed; syntax not checked")
+
+if problems:
+    sys.exit(1)
+print(f"check-man: ok ({len(flags)} flags, {len(commands)} commands)")

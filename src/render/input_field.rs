@@ -16,12 +16,17 @@ pub struct Look {
     pub outline: Gradient,
     pub inner: Color,
     pub font: Color,
-    /// Number of dots (typed characters). 0 while checking unless a check text is set, as in
-    /// hyprlock.
+    /// Number of dots (typed characters) this state asks for: 0 while checking unless a check text
+    /// is set. Display only: the password is gone from the buffer while it is checked, so
+    /// `FieldAnim` holds the dots then (hyprlock's `updateDots`).
     pub dots: usize,
     /// The placeholder / check / fail text to show (already `$VAR`-substituted by the caller),
     /// or `None` when dots show instead.
     pub text_template: Option<String>,
+    /// The text hyprlock keeps as the field's text asset, whose width the field grows to fit
+    /// while empty: `text_template`, or the placeholder while checking with no check text (kept
+    /// but not drawn). `None` once there are characters.
+    pub asset_template: Option<String>,
     /// Hide-input: the random recolour for this keystroke, as (colour, quadrant 0..4).
     pub hidden: Option<(Color, u8)>,
     /// Overall opacity (fade-on-empty).
@@ -70,16 +75,27 @@ impl Look {
             }
         }
 
-        let text_template = if len > 0 {
+        let idle_text = if s.pam_follow_up {
+            // PAM asks for something besides the password (a one-time code): say what.
+            "$PAMPROMPT".to_owned()
+        } else {
+            f.placeholder.clone()
+        };
+        let asset_template = if len > 0 {
             None
         } else if fail_shown {
             Some(f.fail.text.clone())
         } else if checking && !f.check.text.is_empty() {
             Some(f.check.text.clone())
         } else if checking {
+            Some(f.placeholder.clone())
+        } else {
+            Some(idle_text)
+        };
+        let text_template = if checking && f.check.text.is_empty() && !fail_shown {
             None
         } else {
-            Some(f.placeholder.clone())
+            asset_template.clone()
         };
 
         let dots = if checking && f.check.text.is_empty() {
@@ -99,6 +115,7 @@ impl Look {
             font,
             dots,
             text_template,
+            asset_template,
             hidden,
             visible: true,
         }
@@ -117,7 +134,7 @@ fn hidden_colour(base: Color, keystrokes: u64) -> (Color, u8) {
     (c, (keystrokes % 4) as u8)
 }
 
-fn srgb_to_oklab(c: Color) -> (f32, f32, f32) {
+pub(crate) fn srgb_to_oklab(c: Color) -> (f32, f32, f32) {
     let lin = |v: f32| {
         if v <= 0.04045 {
             v / 12.92
@@ -136,7 +153,7 @@ fn srgb_to_oklab(c: Color) -> (f32, f32, f32) {
     )
 }
 
-fn oklab_to_srgb(l: f32, a: f32, b: f32, alpha: f32) -> Color {
+pub(crate) fn oklab_to_srgb(l: f32, a: f32, b: f32, alpha: f32) -> Color {
     let l_ = (l + 0.396_337_78 * a + 0.215_803_76 * b).powi(3);
     let m_ = (l - 0.105_561_346 * a - 0.063_854_17 * b).powi(3);
     let s_ = (l - 0.089_484_18 * a - 1.291_485_5 * b).powi(3);
@@ -160,32 +177,60 @@ pub fn dot_size(f: &InputField, h: f64) -> f64 {
     ((h * f.dots.size * 0.5).round() * 2.).max(1.)
 }
 
-/// Dot geometry within a field of `size`, following hyprlock's `draw`: returns the rectangles of
-/// visible dots (logical, relative to the field's top-left) and the dot corner radius. Text dots
-/// pass their texture's size as `text`; square dots pass `None`.
+/// A dot's rectangle (relative to the field) and its alpha factor.
+pub type Dot = (Rectangle<f64, Logical>, f32);
+
+/// Dot geometry within a field of `size`, following hyprlock's `draw`: returns the visible dots
+/// (logical rectangle relative to the field's top-left, and an alpha factor 0..1) and the dot
+/// corner radius. `amount` is the animated, fractional dot count: the dot being added fades in,
+/// and once more dots than fit are typed the last `max` are shown centred while the oldest one
+/// fades out. Text dots pass their texture's size as `text`; square dots pass `None`.
 pub fn dot_rects(
     f: &InputField,
     size: Size<f64, Logical>,
-    count: usize,
+    amount: f64,
     text: Option<Size<f64, Logical>>,
-) -> (Vec<Rectangle<f64, Logical>>, f64) {
+) -> (Vec<Dot>, f64) {
     let square = dot_size(f, size.h);
     let dot = text.unwrap_or(Size::from((square, square)));
     let d = dot.w.max(1.);
     let spacing = (d * f.dots.spacing).floor();
     let pad = (size.h - dot.h) / 2.;
     let area = size.w - 2. * pad;
-    let max_dots = ((area / (d + spacing)).round() as usize).max(1);
-    let shown = count.min(max_dots);
-    let width = (d + spacing) * shown as f64 - spacing;
-    let x0 = if f.dots.center {
+    let step = d + spacing;
+    let max_dots = ((area / step).round() as i64).max(1);
+    // The animated count can overshoot; only the last `max_dots` + 1 are ever drawn, but the
+    // window position needs a sane, finite count (a password holds at most 1024 bytes).
+    let amount = if amount.is_finite() {
+        amount.clamp(0., 4096.)
+    } else {
+        0.
+    };
+    let floored = amount.floor();
+    let frac = amount - floored;
+    let width = step * amount - spacing;
+    let mut x0 = if f.dots.center {
         (area - width) / 2. + pad
     } else {
         pad
     };
-    let rects = (0..shown)
-        .map(|i| Rectangle::new(Point::from((x0 + i as f64 * (d + spacing), pad)), dot))
-        .collect();
+    if amount > max_dots as f64 {
+        x0 = (size.w + max_dots as f64 * step - spacing - 2. * width) / 2.;
+    }
+    let mut rects = Vec::new();
+    // hyprlock walks every dot and skips all but the window; walk only the window.
+    for i in (floored as i64 - max_dots).max(0)..amount.ceil() as i64 {
+        let mut alpha = 1.;
+        if frac != 0. {
+            if i == floored as i64 {
+                alpha = frac as f32;
+            } else if i == floored as i64 - max_dots {
+                alpha = (1. - frac) as f32;
+            }
+        }
+        let loc = Point::from((x0 + i as f64 * step, pad));
+        rects.push((Rectangle::new(loc, dot), alpha));
+    }
     let round = d / 2.;
     let radius = match f.dots.corner_radius {
         DotRadius::Round => round,
@@ -263,6 +308,22 @@ mod tests {
     }
 
     #[test]
+    fn a_follow_up_pam_prompt_replaces_the_placeholder() {
+        let f = InputField::default();
+        let mut s = LockState::new(&General::default());
+        s.on_auth_prompt("OTP: ".into(), true);
+        assert_eq!(
+            Look::new(&f, &s, false).text_template.as_deref(),
+            Some("$PAMPROMPT")
+        );
+        s.on_auth_prompt("Password: ".into(), false);
+        assert_eq!(
+            Look::new(&f, &s, false).text_template,
+            Some(f.placeholder.clone())
+        );
+    }
+
+    #[test]
     fn borderless_recolours_the_inner_box() {
         let mut f = InputField::default();
         f.outline.width = 0.;
@@ -303,7 +364,8 @@ mod tests {
     fn text_dots_use_their_natural_size() {
         let f = InputField::default();
         let size = Size::from((400., 90.));
-        let (rects, _) = dot_rects(&f, size, 2, Some(Size::from((30., 20.))));
+        let (rects, _) = dot_rects(&f, size, 2., Some(Size::from((30., 20.))));
+        let rects: Vec<_> = rects.into_iter().map(|(r, _)| r).collect();
         assert_eq!(rects[0].size, Size::from((30., 20.)));
         // spacing floor(30 * 0.2) = 6; vertically centred.
         assert_eq!(rects[1].loc.x - rects[0].loc.x, 36.);
@@ -315,19 +377,20 @@ mod tests {
         let mut f = InputField::default();
         let size = Size::from((400., 90.));
         f.dots.corner_radius = DotRadius::Px(4.);
-        assert_eq!(dot_rects(&f, size, 1, None).1, 4.);
+        assert_eq!(dot_rects(&f, size, 1., None).1, 4.);
         // Inherit: the field's radius times the dot size, or round when the field is round.
         f.dots.corner_radius = DotRadius::Inherit;
-        assert_eq!(dot_rects(&f, size, 1, None).1, 11.);
+        assert_eq!(dot_rects(&f, size, 1., None).1, 11.);
         f.corner_radius = Some(crate::config::CornerRadius::from(20.));
-        assert_eq!(dot_rects(&f, size, 1, None).1, 5.);
+        assert_eq!(dot_rects(&f, size, 1., None).1, 5.);
     }
 
     #[test]
     fn dots_centre_and_cap_at_the_field_width() {
         let f = InputField::default();
         let size = Size::from((400., 90.));
-        let (rects, r) = dot_rects(&f, size, 3, None);
+        let (rects, r) = dot_rects(&f, size, 3., None);
+        let rects: Vec<_> = rects.into_iter().map(|(r, _)| r).collect();
         // hyprlock: dot = round(90 * 0.25 * 0.5) * 2 = 22, spacing floor(22 * 0.2) = 4.
         assert_eq!(rects[0].size, Size::from((22., 22.)));
         assert_eq!(rects[1].loc.x - rects[0].loc.x, 26.);
@@ -336,9 +399,65 @@ mod tests {
         assert!((mid - 200.).abs() < 0.5, "centred: {mid}");
         // hyprlock caps at round(area / (dot + spacing)) = round(332 / 26) = 13 dots, which can
         // run a little into the padding but never past the field.
-        let (many, _) = dot_rects(&f, size, 500, None);
+        let (many, _) = dot_rects(&f, size, 500., None);
         assert_eq!(many.len(), 13);
-        assert!(many.last().unwrap().loc.x + 22. <= 400.);
+        assert!(many.last().unwrap().0.loc.x + 22. <= 400.);
+    }
+
+    #[test]
+    fn a_fractional_amount_fades_the_newest_dot_in() {
+        let f = InputField::default();
+        let size = Size::from((400., 90.));
+        let (rects, _) = dot_rects(&f, size, 1.5, None);
+        assert_eq!(rects.len(), 2);
+        assert_eq!((rects[0].1, rects[1].1), (1., 0.5));
+        // Centred on the fractional width: 1.5 * 26 - 4 = 35.
+        let left = rects[0].0.loc.x;
+        assert!((left - (400. - 35.) / 2.).abs() < 0.5, "{left}");
+    }
+
+    /// hyprlock's overflow window: with 13 dots fitting (400 x 90), 13.5 dots draw 14 rects with
+    /// the oldest and the newest at half alpha, and whole counts draw exactly 13.
+    #[test]
+    fn overflow_shows_the_last_dots_with_partial_ends() {
+        let f = InputField::default();
+        let size = Size::from((400., 90.));
+        let (rects, _) = dot_rects(&f, size, 13.5, None);
+        assert_eq!(rects.len(), 14);
+        assert_eq!((rects[0].1, rects[13].1), (0.5, 0.5));
+        assert!(rects[1..13].iter().all(|r| r.1 == 1.));
+        // Window position: the first rect is dot 0, which sits left of the field's centre
+        // block; the block as a whole is centred on the field.
+        let (whole, _) = dot_rects(&f, size, 14., None);
+        assert_eq!(whole.len(), 13);
+        let span = whole.last().unwrap().0.loc.x + 22. - whole[0].0.loc.x;
+        let mid = whole[0].0.loc.x + span / 2.;
+        assert!((mid - 200.).abs() < 0.5, "centred: {mid}");
+    }
+
+    /// The loop ran once per (fractional) dot: an animated count of 1e15 never finished.
+    #[test]
+    fn a_huge_or_non_finite_amount_draws_at_most_the_window() {
+        let f = InputField::default();
+        let size = Size::from((400., 90.));
+        for amount in [1e15, f64::INFINITY, f64::NAN, -5.] {
+            let (rects, _) = dot_rects(&f, size, amount, None);
+            assert!(rects.len() <= 14, "{amount}: {}", rects.len());
+        }
+    }
+
+    /// An overflowing count is centred even with `center=false`.
+    #[test]
+    fn overflow_centres_even_when_dots_are_left_aligned() {
+        let mut f = InputField::default();
+        f.dots.center = false;
+        let size = Size::from((400., 90.));
+        let (few, _) = dot_rects(&f, size, 3., None);
+        assert_eq!(few[0].0.loc.x, 34.); // padding (90 - 22) / 2
+        let (many, _) = dot_rects(&f, size, 20., None);
+        let span = many.last().unwrap().0.loc.x + 22. - many[0].0.loc.x;
+        let mid = many[0].0.loc.x + span / 2.;
+        assert!((mid - 200.).abs() < 0.5, "centred: {mid}");
     }
 
     #[test]

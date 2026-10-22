@@ -72,10 +72,16 @@ impl SecretBuf {
         std::str::from_utf8(&self.buf[..self.len]).expect("buffer holds valid UTF-8")
     }
 
-    /// Move the contents out into a new buffer and clear this one.
-    pub fn take(&mut self) -> SecretBuf {
+    /// A second locked buffer with the same contents.
+    pub fn copy(&self) -> SecretBuf {
         let mut out = SecretBuf::new();
         out.push_str(self.as_str());
+        out
+    }
+
+    /// Move the contents out into a new buffer and clear this one.
+    pub fn take(&mut self) -> SecretBuf {
+        let out = self.copy();
         self.clear();
         out
     }

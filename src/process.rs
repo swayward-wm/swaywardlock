@@ -76,24 +76,122 @@ impl Daemon {
     }
 }
 
-/// Mark `fd` close-on-exec. Inherited descriptors such as `--ready-fd` arrive without it.
-pub fn set_cloexec(fd: i32) {
-    // SAFETY: fcntl on a caller-supplied descriptor; an invalid one just fails.
-    unsafe {
-        let flags = libc::fcntl(fd, libc::F_GETFD);
-        if flags >= 0 {
-            libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
-        }
+/// Check that `--ready-fd` names an open descriptor and mark it close-on-exec (inherited
+/// descriptors arrive without it, and `cmd[]` children must not get it). Called first thing, so
+/// a number that was not open cannot later name one of our own descriptors: writing to that and
+/// closing it after `locked` broke the event loop with the session locked.
+pub fn check_ready_fd(fd: i32) -> anyhow::Result<()> {
+    // SAFETY: fcntl on a caller-supplied number; an invalid one just fails.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        anyhow::bail!(
+            "--ready-fd {fd}: {}; pass a descriptor that is open",
+            std::io::Error::last_os_error()
+        );
     }
+    // SAFETY: as above, on a descriptor that is open.
+    unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+    Ok(())
 }
 
-/// Write `\n` to the ready fd and close it, as swaylock does.
-pub fn notify_ready(fd: Option<i32>) -> anyhow::Result<()> {
-    if let Some(fd) = fd {
-        // SAFETY: the user passed this descriptor to us for exactly this purpose; we take
-        // ownership and close it after writing.
-        let mut file = unsafe { File::from_raw_fd(fd) };
-        file.write_all(b"\n")?;
+/// Write `\n` to the ready fd and close it, as swaylock does. Raw calls rather than an owned
+/// `File`: the number came from the command line, and Rust's I/O-safety check aborts the process
+/// if it ever names a descriptor something else owns.
+pub fn notify_ready(fd: Option<i32>) -> std::io::Result<()> {
+    let Some(fd) = fd else {
+        return Ok(());
+    };
+    // SAFETY: plain write/close on the descriptor the user handed us for this; `check_ready_fd`
+    // made sure it was open at startup, and nothing else opened it since.
+    let written = unsafe { libc::write(fd, c"\n".as_ptr().cast(), 1) };
+    let result = if written == 1 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    };
+    // SAFETY: as above.
+    unsafe { libc::close(fd) };
+    result
+}
+
+/// At least this many descriptors must be available, or the locker refuses to lock. A locked
+/// session measured about 30 (Wayland, EGL/Mesa, eventfds, timers, PAM, `cmd[]` pipes); with
+/// 16 or 17 it locked and then crashed or failed, leaving a session nobody could unlock.
+const MIN_FDS: libc::rlim_t = 64;
+/// The soft limit is raised to at most this (the usual default), so `cmd[]` children never get
+/// a soft limit above what they would normally see.
+const RAISED_FDS: libc::rlim_t = 1024;
+
+/// Raise a low soft `RLIMIT_NOFILE` towards the hard limit, and refuse (before locking) if even
+/// the hard limit is too small to run a lock.
+pub fn ensure_fd_limit() -> anyhow::Result<()> {
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit/setrlimit on a local struct.
+    unsafe {
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
+            return Ok(()); // cannot tell; go on as before
+        }
+        let want = RAISED_FDS.min(lim.rlim_max);
+        if lim.rlim_cur < want {
+            lim.rlim_cur = want;
+            libc::setrlimit(libc::RLIMIT_NOFILE, &lim);
+            libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim);
+        }
+    }
+    check_fd_limit(lim.rlim_cur)
+}
+
+fn check_fd_limit(soft: libc::rlim_t) -> anyhow::Result<()> {
+    if soft < MIN_FDS {
+        anyhow::bail!(
+            "the open file limit is {soft} (ulimit -n); swaywardlock needs at least {MIN_FDS}"
+        );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_closed_ready_fd_is_refused() {
+        let mut fds = [0; 2];
+        // SAFETY: pipe into a local array.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        check_ready_fd(fds[1]).unwrap();
+        // SAFETY: we own both ends.
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+        assert!(check_ready_fd(fds[1]).is_err());
+        assert!(check_ready_fd(-1).is_err());
+    }
+
+    #[test]
+    fn notify_ready_writes_a_newline_and_closes() {
+        let mut fds = [0; 2];
+        // SAFETY: pipe into a local array.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        notify_ready(Some(fds[1])).unwrap();
+        let mut buf = [0u8; 4];
+        // SAFETY: read from the end we own; EOF follows because the write end is closed.
+        let n = unsafe { libc::read(fds[0], buf.as_mut_ptr().cast(), buf.len()) };
+        assert_eq!(&buf[..n as usize], b"\n");
+        // SAFETY: as above.
+        assert_eq!(unsafe { libc::read(fds[0], buf.as_mut_ptr().cast(), 1) }, 0);
+        // SAFETY: we own the read end.
+        unsafe { libc::close(fds[0]) };
+    }
+
+    #[test]
+    fn tiny_fd_limits_are_refused() {
+        assert!(check_fd_limit(16).is_err());
+        assert!(check_fd_limit(63).is_err());
+        assert!(check_fd_limit(64).is_ok());
+    }
 }

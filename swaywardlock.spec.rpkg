@@ -1,0 +1,165 @@
+%bcond_without check
+
+%global cargo_install_lib 0
+
+# We want panic backtraces to work without installing the debuginfo package,
+# so we leave the debuginfo in the main binary.
+%global debug_package %{nil}
+%global __strip /bin/true
+
+# To reduce the file size, do some convincing of rust-srpm-macros
+# to leave alone the chosen debug settings from Cargo.toml.
+%global rustflags_debuginfo please-remove-me
+%global build_rustflags %{shrink:
+  -Copt-level=%rustflags_opt_level
+  -Ccodegen-units=%rustflags_codegen_units
+  -Cstrip=none
+  %{expr:0%{?_include_frame_pointers} && ("%{_arch}" != "ppc64le" && "%{_arch}" != "s390x" && "%{_arch}" != "i386") ? "-Cforce-frame-pointers=yes" : ""}
+  -Clink-arg=-Wl,-z,relro
+  -Clink-arg=-Wl,-z,now
+  %[0%{?_package_note_status} ? "-Clink-arg=%_package_note_flags" : ""]
+  --cap-lints=warn
+}
+
+# Convince rust-srpm-macros to use Cargo.lock with the Smithay commit.
+%global __cargo_common_opts %{?_smp_mflags} -Z avoid-dev-deps --locked
+
+%global version {{{ git_dir_version }}}
+
+Name:           swaywardlock
+Version:        %{version}
+Release:        1%{?dist}
+Summary:        Screen locker for the swayward-wm family
+
+SourceLicense:  GPL-3.0-or-later
+
+# The license of the statically linked crates, from
+#   cargo tree --locked --edges=no-build,no-dev,no-proc-macro --target=all --prefix=none --format '{l}'
+# (cargo2rpm license-summary cannot run here: it passes --offline, and the Smithay git
+# dependency is not in the offline cache).
+# (MIT OR Apache-2.0) AND Unicode-3.0
+# 0BSD OR MIT OR Apache-2.0
+# Apache-2.0
+# Apache-2.0 AND MIT
+# Apache-2.0 OR MIT
+# Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
+# BSD-2-Clause OR Apache-2.0 OR MIT
+# BSD-3-Clause
+# BSD-3-Clause OR Apache-2.0
+# BSD-3-Clause OR MIT
+# BSD-3-Clause OR MIT OR Apache-2.0
+# GPL-3.0-or-later
+# ISC
+# MIT
+# MIT OR Apache-2.0 OR LGPL-2.1-or-later
+# MIT OR Apache-2.0 OR Zlib
+# MIT OR Zlib OR Apache-2.0
+# Unicode-3.0
+# Unlicense OR MIT
+# Zlib
+# Zlib OR Apache-2.0 OR MIT
+License:        ((MIT OR Apache-2.0) AND Unicode-3.0) AND (0BSD OR MIT OR Apache-2.0) AND Apache-2.0 AND (Apache-2.0 AND MIT) AND (Apache-2.0 OR MIT) AND (Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT) AND (BSD-2-Clause OR Apache-2.0 OR MIT) AND BSD-3-Clause AND (BSD-3-Clause OR Apache-2.0) AND (BSD-3-Clause OR MIT) AND (BSD-3-Clause OR MIT OR Apache-2.0) AND GPL-3.0-or-later AND ISC AND MIT AND (MIT OR Apache-2.0 OR LGPL-2.1-or-later) AND (MIT OR Apache-2.0 OR Zlib) AND (MIT OR Zlib OR Apache-2.0) AND Unicode-3.0 AND (Unlicense OR MIT) AND Zlib AND (Zlib OR Apache-2.0 OR MIT)
+
+URL:            https://github.com/swayward-wm/swaywardlock
+VCS:            {{{ git_dir_vcs }}}
+Source:         {{{ git_dir_pack }}}
+
+BuildRequires:  cargo-rpm-macros >= 26
+BuildRequires:  pam-devel
+BuildRequires:  pkgconfig(pango)
+BuildRequires:  pkgconfig(cairo)
+BuildRequires:  wayland-devel
+BuildRequires:  pkgconfig(xkbcommon)
+BuildRequires:  mesa-libEGL-devel
+BuildRequires:  scdoc
+
+Requires:       mesa-dri-drivers
+Requires:       mesa-libEGL
+
+# Loaded through dlopen (wayland-backend and wayland-egl), so rpm does not find them
+Requires:       libwayland-client
+Requires:       libwayland-egl
+
+# The shipped /etc/pam.d/swaywardlock includes login. rpm resolves this file
+# dependency to the owner (util-linux on Fedora, not util-linux-core). Without
+# it every password fails and only SIGUSR1 unlocks.
+Requires:       /etc/pam.d/login
+
+# swaywardlock-swaylock-to-kdl and swaywardlock-hyprlock-to-kdl are Python scripts
+Requires:       python3
+
+%description
+swaywardlock locks a Wayland session with ext-session-lock-v1, so it runs on any
+compositor that implements the protocol. It keeps swaylock's process contract
+(-f, --ready-fd, SIGUSR1) and aims for hyprlock's feature set: blurred
+screenshots, labels, images, shapes, an input field, gradients, animations and
+fingerprint unlock. It is configured in KDL, with the same colour, gradient,
+blur, shadow and animation syntax as swayward.
+
+Passwords are checked through PAM with the service swaywardlock. The package
+installs /etc/pam.d/swaywardlock (auth only, as swaylock and hyprlock) as a
+configuration file; swaywardlock refuses to lock without it.
+
+%prep
+{{{ git_dir_setup_macro }}}
+
+%cargo_prep -N
+
+# We're doing an online build.
+sed -i 's/^offline = true$//' .cargo/config.toml
+
+# Final step in leaving alone our debug settings.
+sed -i 's/.*please-remove-me$//' .cargo/config.toml
+
+%build
+# No --features test-auth: that feature replaces PAM with a fixed password.
+%cargo_build
+
+scdoc < docs/swaywardlock.1.scd > swaywardlock.1
+
+target/rpm/swaywardlock completions bash > ./swaywardlock
+target/rpm/swaywardlock completions fish > ./swaywardlock.fish
+target/rpm/swaywardlock completions zsh > ./_swaywardlock
+
+%install
+%cargo_install
+
+# swaywardlock refuses to lock without this file; it is a config file
+# (%%config(noreplace) in %%files).
+install -Dm644 -t %{buildroot}%{_sysconfdir}/pam.d ./pam/swaywardlock
+
+# The config translators are useless from a source checkout nobody has after
+# installing a package, so ship them on PATH under namespaced names.
+install -Dm755 ./contrib/swaylock-to-kdl %{buildroot}%{_bindir}/swaywardlock-swaylock-to-kdl
+install -Dm755 ./contrib/hyprlock-to-kdl %{buildroot}%{_bindir}/swaywardlock-hyprlock-to-kdl
+
+install -Dm644 swaywardlock.1 %{buildroot}%{_mandir}/man1/swaywardlock.1
+
+install -Dm644 -t %{buildroot}%{bash_completions_dir} ./swaywardlock
+install -Dm644 -t %{buildroot}%{fish_completions_dir} ./swaywardlock.fish
+install -Dm644 -t %{buildroot}%{zsh_completions_dir} ./_swaywardlock
+
+%if %{with check}
+%check
+# The headless-sway end-to-end suite (contrib/e2e-sway) needs a compositor, so run
+# the Rust tests only.
+%cargo_test
+%endif
+
+%files
+%license LICENSE
+%doc README.md
+# The man page points at these: the examples and the design document (the config reference).
+%doc examples
+%doc docs/specs
+%{_bindir}/swaywardlock
+%{_bindir}/swaywardlock-swaylock-to-kdl
+%{_bindir}/swaywardlock-hyprlock-to-kdl
+%config(noreplace) %{_sysconfdir}/pam.d/swaywardlock
+%{_mandir}/man1/swaywardlock.1*
+%{bash_completions_dir}/swaywardlock
+%{fish_completions_dir}/swaywardlock.fish
+%{zsh_completions_dir}/_swaywardlock
+
+%changelog
+{{{ git_dir_changelog }}}

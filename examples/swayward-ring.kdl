@@ -1,0 +1,33 @@
+// The animated ring: swaylock's indicator with colour crossfades, a sweeping highlight, a
+// verifying spinner, a shake on a wrong password and a glow.
+// Try it without locking: swaywardlock --preview -c examples/swayward-ring.kdl
+
+background {
+    color "#1e1e2e"
+}
+
+ring-indicator {
+    style "swayward"
+    glow 12
+    radius 60
+    thickness 8
+    idle-visible
+    show-failed-attempts
+    colors {
+        state "input"     inside="#1e1e2ec0" ring="#89b4faff" line="#00000000" text="#cdd6f4ff"
+        state "clear"     inside="#f9e2afc0" ring="#f9e2afff" line="#00000000" text="#1e1e2eff"
+        state "verifying" inside="#89b4fac0" ring="#74c7ecff" line="#00000000" text="#1e1e2eff"
+        state "wrong"     inside="#f38ba8c0" ring="#f38ba8ff" line="#00000000" text="#1e1e2eff"
+        state "caps-lock" inside="#1e1e2ec0" ring="#fab387ff" line="#00000000" text="#fab387ff"
+        key-highlight "#a6e3a1ff"
+        bs-highlight "#f38ba8ff"
+        separator "#00000000"
+    }
+}
+
+animations {
+    ring-colors    { duration-ms 250; curve "ease-out-cubic"; }
+    ring-highlight { duration-ms 180; curve "ease-out-cubic"; }
+    ring-appear    { duration-ms 250; curve "ease-out-cubic"; }
+    ring-wrong     { duration-ms 450; curve "linear"; }
+}

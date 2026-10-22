@@ -12,12 +12,15 @@ rust-version = "1.87"
 anyhow = "1.0"
 calloop = { version = "0.14", features = ["signals"] }
 clap = { version = "4.6", features = ["derive", "env"] }
+clap_complete = "4.6"
 csscolorparser = "0.9"
 fastrand = "2"
 glam = "0.33"
 keyframe = { version = "1.1.1", default-features = false }
 zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp", "tiff", "ico"] }
+# JPEG XL (Fedora's stock wallpaper format), pure Rust, through the image crate's decoder hook.
+jxl-oxide = { version = "0.12", default-features = false, features = ["image"] }
 knuffel = "3.2.0"
 libc = "0.2"
 miette = { version = "5.10.0", features = ["fancy-no-backtrace"] }

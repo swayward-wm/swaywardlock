@@ -7,14 +7,32 @@ cargo +nightly fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo clippy --all-targets --features test-auth -- -D warnings
 cargo test
+contrib/test-real-pam
 cargo build --features test-auth
 SWAYWARDLOCK=target/debug/swaywardlock python3 contrib/test-swaylock-to-kdl.py
+SWAYWARDLOCK=target/debug/swaywardlock python3 contrib/test-hyprlock-to-kdl.py
+python3 contrib/check-man target/debug/swaywardlock
+# The KDL snippets in the README and the man page are what users paste into their config.
+python3 contrib/check-doc-kdl target/debug/swaywardlock
+contrib/test-try-lock
+# completions must not read the config: they have to work with a broken one.
+for shell in bash zsh; do
+    SWAYWARDLOCK_CONFIG=<(echo "garbage {") target/debug/swaywardlock completions "$shell" > /dev/null
+done
 contrib/e2e-sway target/debug/swaywardlock
 
-# A release build must never contain the test-auth backdoor.
+# A release build must never contain the test-auth backdoor or its test hooks.
 cargo build --release
 if grep -q swaywardlock-test target/release/swaywardlock; then
     echo "FAIL release build contains the test-auth password" >&2
+    exit 1
+fi
+if grep -q SWAYWARDLOCK_TEST_SCREENCOPY target/release/swaywardlock; then
+    echo "FAIL release build contains the screencopy test hook" >&2
+    exit 1
+fi
+if grep -q SWAYWARDLOCK_TEST_AUTH_DELAY_MS target/release/swaywardlock; then
+    echo "FAIL release build contains the auth delay test hook" >&2
     exit 1
 fi
 echo "gate: ok"

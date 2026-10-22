@@ -53,6 +53,12 @@ impl Gpu {
     ///
     /// `conn` must outlive the returned value.
     pub fn new(conn: &Connection) -> anyhow::Result<Self> {
+        // wayland-sys loads libwayland-egl lazily on the first `WlEglSurface::new`, which runs on
+        // the first configure after `lock()`, and panics if it cannot. Check here, before locking.
+        anyhow::ensure!(
+            wayland_egl::is_available(),
+            "libwayland-egl cannot be loaded"
+        );
         let ptr = conn.backend().display_ptr() as *mut c_void;
         // SAFETY: the pointer is a live `wl_display` owned by `conn`, which the caller keeps alive.
         let display = unsafe { EGLDisplay::new(WaylandDisplay(ptr)) }
@@ -62,7 +68,8 @@ impl Gpu {
             version: (3, 0),
             profile: None,
             debug: false,
-            // Frame callbacks pace rendering; a blocking swap would stall the event loop.
+            // No frame callbacks are used (redraws are event driven); a vsynced swap would stall
+            // the event loop.
             vsync: false,
         };
         let context =
@@ -95,7 +102,33 @@ impl Gpu {
             .pixel_format()
             .context("EGL context has no pixel format")?;
         // SAFETY: the config comes from the renderer's context on the same display.
-        unsafe { EGLSurface::new(&self.display, pixel_format, context.config_id(), wl_egl) }
-            .context("error creating EGL surface")
+        let surface =
+            unsafe { EGLSurface::new(&self.display, pixel_format, context.config_id(), wl_egl) }
+                .context("error creating EGL surface")?;
+        // `vsync: false` above only picks a config; Mesa still defaults to swap interval 1, where
+        // eglSwapBuffers waits for the previous frame callback. A lock surface on a powered-off
+        // output gets none, so the next redraw would block the main thread (keyboard, auth and
+        // SIGUSR1 included) until the output wakes. The interval is per surface.
+        // SAFETY: main thread; the renderer binds its surface again before every draw.
+        unsafe {
+            context
+                .make_current_with_surface(&surface)
+                .context("error making the EGL surface current")?;
+            if ffi::egl::SwapInterval(**self.display.get_display_handle(), 0) == ffi::egl::FALSE {
+                tracing::warn!("eglSwapInterval(0) failed; a dark output may stall redraws");
+            }
+        }
+        Ok(surface)
+    }
+
+    /// Create and drop an EGL surface on `scratch`, a fresh role-less `wl_surface`, so window
+    /// surface setup fails here, before `lock()`, rather than on the first lock surface.
+    pub fn check_surface(&self, scratch: &WlSurface) -> anyhow::Result<()> {
+        let surface = self.create_surface(scratch, 1, 1)?;
+        // SAFETY: main thread. Release the surface before dropping it.
+        unsafe { self.renderer.egl_context().make_current() }
+            .context("error making the EGL context current")?;
+        drop(surface);
+        Ok(())
     }
 }

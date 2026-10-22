@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# Real PAM through the shipped lookup (pam_start and /etc/pam.d), which the confdir-based unit
+# tests in src/auth.rs do not reach. Installs a throwaway service /etc/pam.d/swl-test-<pid>:
+#
+#   auth    requisite pam_exec.so expose_authtok <script that accepts only "right-pw", and only
+#                                                 when PAM_USER is the user running the test>
+#   account required  pam_deny.so    (must not matter: only the auth phase runs)
+#
+# then runs the ignored unit test auth::tests::an_installed_service_in_etc_pam_d against it, and
+# removes the service again. Needs root (CI) or passwordless sudo (the dev container); without
+# either it says SKIP and exits 0.
+#
+# Opt-in, for a machine with a throwaway user password: SWAYWARDLOCK_TEST_REAL_PASSWORD=<pw>
+# also installs a service with "auth include login" and checks that password through pam_unix.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+if [ "$(id -u)" = 0 ]; then
+    SUDO=()
+elif sudo -n true 2>/dev/null; then
+    SUDO=(sudo -n)
+else
+    echo "SKIP test-real-pam: needs root or passwordless sudo to write /etc/pam.d" >&2
+    exit 0
+fi
+
+service="swl-test-$$"
+dir=$(mktemp -d /tmp/swl-real-pam.XXXXXX)
+cleanup() {
+    "${SUDO[@]}" rm -f "/etc/pam.d/$service" "/etc/pam.d/$service-login"
+    case "$dir" in
+        /tmp/swl-real-pam.?*) rm -rf -- "$dir" ;;
+    esac
+}
+trap cleanup EXIT
+
+# The user too: a locker that started PAM for another account would check the wrong password.
+cat >"$dir/check" <<EOF
+#!/bin/sh
+read -r pw
+[ "\$pw" = right-pw ] && [ "\$PAM_USER" = "$(id -un)" ]
+EOF
+chmod 755 "$dir/check"
+printf '%s\n' "auth requisite pam_exec.so log=$dir/log expose_authtok $dir/check" \
+    'account required pam_deny.so' | "${SUDO[@]}" tee "/etc/pam.d/$service" >/dev/null
+"${SUDO[@]}" chmod 644 "/etc/pam.d/$service"
+
+env=(SWAYWARDLOCK_TEST_PAM_SERVICE="$service")
+if [ -n "${SWAYWARDLOCK_TEST_REAL_PASSWORD:-}" ]; then
+    printf '%s\n' 'auth include login' 'account required pam_deny.so' \
+        | "${SUDO[@]}" tee "/etc/pam.d/$service-login" >/dev/null
+    "${SUDO[@]}" chmod 644 "/etc/pam.d/$service-login"
+    env+=(SWAYWARDLOCK_TEST_PAM_LOGIN_SERVICE="$service-login")
+fi
+
+out=$(env "${env[@]}" cargo test --bin swaywardlock -- --ignored --exact \
+    auth::tests::an_installed_service_in_etc_pam_d 2>&1) || { echo "$out"; exit 1; }
+echo "$out" | grep -q '1 passed' || { echo "$out"; echo "FAIL test-real-pam: the test did not run" >&2; exit 1; }
+echo "test-real-pam: ok (service $service${SWAYWARDLOCK_TEST_REAL_PASSWORD:+, and pam_unix})"

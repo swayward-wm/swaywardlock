@@ -3,6 +3,7 @@
 
 general {
     hide-cursor false
+    fail-timeout-ms 2000  // hyprlock's default; ours is 3000
 }
 
 // Uncomment to enable fingerprint authentication.
@@ -17,15 +18,20 @@ general {
 animations {
     fade-in { duration-ms 500; curve "linear"; }
     fade-out { duration-ms 500; curve "linear"; }
+    input-field-dots { duration-ms 200; curve "linear"; }
 }
 
-// hyprlock applies these defaults with blur_passes > 0; spelled out here.
+// hyprlock applies these defaults with blur_passes > 0 (blur_size 8, noise, contrast,
+// brightness, vibrancy, vibrancy_darkness); spelled out here. hyprlock has no blur saturation:
+// saturation 1 turns off ours (swayward's default is 1.5).
 background {
     screenshot
     color "#111111"
-    blur { passes 3; noise 0.0117; }
+    blur { passes 3; offset 8; noise 0.0117; saturation 1; }
     contrast 0.8917
     brightness 0.8172
+    vibrancy 0.1686
+    vibrancy-darkness 0.05
 }
 
 input-field {
@@ -51,6 +57,7 @@ input-field {
 label {
     text "$TIME"
     font "Monospace 90"
+    align "left"
     position -30 0
     halign "right"
     valign "top"
@@ -60,6 +67,7 @@ label {
 label {
     text "cmd[update:60000] date +\"%A, %d %B %Y\""
     font "Monospace 25"
+    align "left"
     position -30 -150
     halign "right"
     valign "top"
@@ -68,6 +76,7 @@ label {
 // Keyboard layout (hyprlock's onclick is not supported)
 label {
     text "$LAYOUT[en,ru]"
-    font "Monospace 24"
+    font "Sans 24"
+    align "left"
     position 250 -20
 }

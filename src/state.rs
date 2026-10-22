@@ -52,6 +52,9 @@ pub struct LockState {
     pub pam_failure: Option<String>,
     /// PAM's latest password prompt, for `$PAMPROMPT`.
     pub pam_prompt: String,
+    /// PAM asked a further question in the same transaction (a one-time code after the
+    /// password); the input field shows it instead of its placeholder.
+    pub pam_follow_up: bool,
     /// fprintd's current prompt and last failure, for `$FPRINTPROMPT` / `$FPRINTFAIL`.
     pub fprint_prompt: String,
     pub fprint_fail: String,
@@ -83,6 +86,7 @@ impl LockState {
             last_failure: None,
             pam_failure: None,
             pam_prompt: String::new(),
+            pam_follow_up: false,
             fprint_prompt: String::new(),
             fprint_fail: String::new(),
             caps_lock: false,
@@ -124,7 +128,9 @@ impl LockState {
         ctrl: bool,
         now: Instant,
     ) -> KeyOutcome {
-        // swaylock ignores input while a check runs.
+        // Keys typed while a check runs are dropped, as in hyprlock (swaylock keeps them, so a
+        // password typed ahead after a wrong one survives there). Deliberate: the field shows the
+        // checking state, and keys landing in a buffer nobody sees are a surprise either way.
         if self.auth == AuthState::Validating {
             return KeyOutcome::None;
         }
@@ -202,11 +208,22 @@ impl LockState {
         self.highlight_start = (self.highlight_start + self.rng.u32(0..1024) + 512) % 2048;
     }
 
+    /// A question from PAM. A follow-up (a one-time code after the password, in the same
+    /// transaction) pauses the check until the answer is typed and submitted.
+    pub fn on_auth_prompt(&mut self, text: String, follow_up: bool) {
+        self.pam_prompt = text;
+        self.pam_follow_up = follow_up;
+        if follow_up && self.auth == AuthState::Validating {
+            self.auth = AuthState::Idle;
+        }
+    }
+
     pub fn on_auth_failed(&mut self, now: Instant) {
         self.on_auth_failed_with(now, "Authentication failed");
     }
 
     pub fn on_auth_failed_with(&mut self, now: Instant, message: &str) {
+        self.pam_follow_up = false;
         self.pam_failure = Some(message.to_owned());
         self.failed(now, message);
     }
@@ -397,6 +414,34 @@ mod tests {
         assert_eq!(s.next_deadline(), None);
     }
 
+    /// A second PAM question (an OTP after the password) ends the checking state so the answer
+    /// can be typed and submitted; it is not a failed attempt.
+    #[test]
+    fn a_follow_up_prompt_lets_the_answer_be_typed() {
+        let mut s = state();
+        let now = Instant::now();
+        typed(&mut s, "pw", now);
+        s.on_key(Keysym::Return, None, false, now);
+        drop(s.take_password());
+        s.on_auth_prompt("OTP: ".into(), true);
+        assert_eq!((s.auth, s.failed_attempts), (AuthState::Idle, 0));
+        assert!(s.pam_follow_up);
+        assert_eq!(s.password_len(), 0);
+        typed(&mut s, "123456", now);
+        assert_eq!(
+            s.on_key(Keysym::Return, None, false, now),
+            KeyOutcome::Submit
+        );
+        assert_eq!(s.take_password().as_str(), "123456");
+        s.on_auth_failed_with(now, "Authentication failure");
+        assert!(!s.pam_follow_up);
+        // A new transaction's first question is not a follow-up and does not end a check.
+        typed(&mut s, "pw", now);
+        s.on_key(Keysym::Return, None, false, now);
+        s.on_auth_prompt("Password: ".into(), false);
+        assert_eq!(s.auth, AuthState::Validating);
+    }
+
     #[test]
     fn ctrl_a_clears_like_hyprlock() {
         let mut s = state();
@@ -405,6 +450,143 @@ mod tests {
         s.on_key(Keysym::a, Some("a"), true, now);
         assert_eq!(s.input, InputState::Clear);
         assert!(s.take_password().is_empty());
+    }
+
+    #[test]
+    fn escape_clears_the_password() {
+        let mut s = state();
+        let now = Instant::now();
+        typed(&mut s, "abc", now);
+        assert_eq!(
+            s.on_key(Keysym::Escape, Some("\u{1b}"), false, now),
+            KeyOutcome::Redraw
+        );
+        assert_eq!(s.input, InputState::Clear);
+        assert_eq!(s.password_len(), 0);
+    }
+
+    /// Tab, Escape's text and other control characters never enter the password: a stray Tab
+    /// would make the right password fail with nothing on screen to say why.
+    #[test]
+    fn control_characters_do_not_enter_the_password() {
+        let mut s = state();
+        let now = Instant::now();
+        typed(&mut s, "ab", now);
+        let keystrokes = s.keystrokes;
+        for (sym, text) in [
+            (Keysym::Tab, "\t"),
+            (Keysym::ISO_Left_Tab, "\t"),
+            (Keysym::a, "a\u{0}"),
+            (Keysym::a, ""),
+        ] {
+            assert_eq!(s.on_key(sym, Some(text), false, now), KeyOutcome::None);
+        }
+        assert_eq!(s.on_key(Keysym::F1, None, false, now), KeyOutcome::None);
+        assert_eq!((s.password_len(), s.keystrokes), (2, keystrokes));
+        s.on_key(Keysym::Return, None, false, now);
+        assert_eq!(s.take_password().as_str(), "ab");
+    }
+
+    /// Modifier keys show the neutral indicator (swaylock) and leave the password alone.
+    #[test]
+    fn modifier_keys_are_neutral() {
+        for sym in [
+            Keysym::Caps_Lock,
+            Keysym::Shift_L,
+            Keysym::Shift_R,
+            Keysym::Control_L,
+            Keysym::Control_R,
+            Keysym::Meta_L,
+            Keysym::Meta_R,
+            Keysym::Alt_L,
+            Keysym::Alt_R,
+            Keysym::Super_L,
+            Keysym::Super_R,
+        ] {
+            let mut s = state();
+            let now = Instant::now();
+            typed(&mut s, "ab", now);
+            let keystrokes = s.keystrokes;
+            assert_eq!(s.on_key(sym, None, false, now), KeyOutcome::Redraw);
+            assert_eq!(s.input, InputState::Neutral, "{sym:?}");
+            assert_eq!((s.password_len(), s.keystrokes), (2, keystrokes), "{sym:?}");
+            // The stale-password timer restarts, as for any key.
+            assert_eq!(s.clear_at, Some(now + s.clear_after));
+        }
+    }
+
+    /// Ctrl+BackSpace (and Ctrl+Delete) clear; without Ctrl they delete one character.
+    #[test]
+    fn backspace_deletes_one_character_and_ctrl_backspace_clears() {
+        let mut s = state();
+        let now = Instant::now();
+        typed(&mut s, "abc", now);
+        let keystrokes = s.keystrokes;
+        s.on_key(Keysym::BackSpace, None, false, now);
+        assert_eq!(s.password_len(), 2);
+        assert_eq!(s.keystrokes, keystrokes + 1);
+        s.on_key(Keysym::Delete, None, false, now);
+        assert_eq!(s.password_len(), 1);
+        assert_eq!(s.keystrokes, keystrokes + 2);
+        typed(&mut s, "xy", now);
+        s.on_key(Keysym::BackSpace, None, true, now);
+        assert_eq!((s.password_len(), s.input), (0, InputState::Clear));
+        typed(&mut s, "xy", now);
+        s.on_key(Keysym::Delete, None, true, now);
+        assert_eq!((s.password_len(), s.input), (0, InputState::Clear));
+    }
+
+    /// A typo fixed with one BackSpace keeps the rest of the password: the clear timer restarts
+    /// from the BackSpace, it does not fire on the next tick.
+    #[test]
+    fn backspace_restarts_the_clear_timer() {
+        let mut s = state();
+        let t0 = Instant::now();
+        typed(&mut s, "abcx", t0);
+        let t1 = t0 + Duration::from_secs(5);
+        s.on_key(Keysym::BackSpace, None, false, t1);
+        assert_eq!(s.next_deadline(), Some(t1 + INPUT_IDLE));
+        s.tick(t1 + INPUT_IDLE);
+        assert_eq!(s.password_len(), 3, "the next tick wiped the password");
+        // The 10 s clear timer counts from the BackSpace, not from the first key.
+        s.tick(t0 + Duration::from_secs(12));
+        assert_eq!(s.password_len(), 3);
+        s.tick(t1 + Duration::from_secs(10));
+        assert_eq!(s.password_len(), 0);
+    }
+
+    /// `ignore-empty-input` drops only an empty submit.
+    #[test]
+    fn ignore_empty_input_still_submits_a_password() {
+        let mut s = LockState::new(&General {
+            ignore_empty_input: true,
+            ..General::default()
+        });
+        let now = Instant::now();
+        typed(&mut s, "pw", now);
+        assert_eq!(
+            s.on_key(Keysym::Return, None, false, now),
+            KeyOutcome::Submit
+        );
+        assert_eq!(s.take_password().as_str(), "pw");
+        // Without the option an empty Enter is an attempt, as in swaylock.
+        let mut s = state();
+        assert_eq!(
+            s.on_key(Keysym::Return, None, false, now),
+            KeyOutcome::Submit
+        );
+    }
+
+    /// Every accepted key that changes the buffer counts, so hide-input recolours on each.
+    #[test]
+    fn keystrokes_count_letters_and_deletions() {
+        let mut s = state();
+        let now = Instant::now();
+        typed(&mut s, "abc", now);
+        assert_eq!(s.keystrokes, 3);
+        s.on_key(Keysym::BackSpace, None, false, now);
+        s.on_key(Keysym::BackSpace, None, false, now);
+        assert_eq!(s.keystrokes, 5);
     }
 
     #[test]

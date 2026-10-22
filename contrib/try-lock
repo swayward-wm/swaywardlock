@@ -1,0 +1,263 @@
+#!/usr/bin/env bash
+# Try swaywardlock interactively without locking your session: a nested sway opens as a window
+# on your desktop and the test-auth build locks only that nested session.
+#
+#   contrib/try-lock [options] [-- extra swaywardlock args]
+#
+#   -c FILE        config to use (default: examples/hyprlock-example.kdl)
+#   --preview      run --preview instead of locking (layout work, config reload)
+#   --real-pam     use a normal build with real PAM instead of the test-auth password
+#   --no-build     skip cargo build and use the binary of an earlier run (see BUILDS)
+#   --size WxH     nested output size (default 1280x800)
+#   --scale S      nested output scale (e.g. 1.5)
+#   --unlock-after N   send SIGUSR1 after N seconds (smoke tests)
+#   -v, --verbose  show the locker's full log, EGL and GL lines included (default: only
+#                  swaywardlock's own messages)
+#   -h, --help     this text
+#
+# Unlock with the password swaywardlock-test (test-auth build) or your own (--real-pam), or
+# send SIGUSR1 from another terminal (the pid is printed). Closing the nested window ends
+# everything; with TRY_LOCK_BACKEND=headless there is no window, so press Ctrl+C or send SIGTERM
+# to this script. Whatever ends it, the nested sway, the locker and the temporary directory go
+# with it. A crashed locker only ever locks the nested session.
+#
+# WHERE: needs sway, a Wayland session to open the window in, and cargo unless --no-build.
+# Started on the host it re-runs itself in the distrobox named swayward-dev when that box
+# exists. Without the box it runs right here, which works on any machine with sway and cargo;
+# TRY_LOCK_NATIVE=1 forces that.
+# BUILDS: it builds into target/try-lock (test-auth) or target/debug (--real-pam). --no-build
+# uses what is already there; target/debug/swaywardlock works too when it was built with
+# `cargo build --features test-auth`.
+# TRY_LOCK_BACKEND=headless runs the nested sway without a window (used by the smoke test).
+set -euo pipefail
+
+here=$(cd "$(dirname "$0")" && pwd)
+repo=$(cd "$here/.." && pwd)
+me=$(basename "$0")
+orig_args=("$@")
+
+usage_error() {
+    echo "$me: $1 (try --help)" >&2
+    exit 2
+}
+
+config="$repo/examples/hyprlock-example.kdl"
+preview=0 real_pam=0 build=1 verbose=0 size=1280x800 scale="" unlock_after=""
+extra=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -c|--size|--scale|--unlock-after)
+            [ $# -ge 2 ] || usage_error "$1 needs a value"
+            case "$1" in
+                -c) config=$(realpath -m -- "$2") ;;
+                --size) size=$2 ;;
+                --scale) scale=$2 ;;
+                --unlock-after) unlock_after=$2 ;;
+            esac
+            shift 2 ;;
+        --preview) preview=1; shift ;;
+        --real-pam) real_pam=1; shift ;;
+        --no-build) build=0; shift ;;
+        -v|--verbose) verbose=1; shift ;;
+        --) shift; extra=("$@"); break ;;
+        -h|--help) sed -n '2,/^# TRY_LOCK_BACKEND/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) usage_error "unknown option $1" ;;
+    esac
+done
+case "$size" in [0-9]*x[0-9]*) ;; *) usage_error "--size wants WIDTHxHEIGHT, got '$size'" ;; esac
+case "$unlock_after" in ""|*[!0-9]*) [ -z "$unlock_after" ] || usage_error "--unlock-after wants whole seconds, got '$unlock_after'" ;; esac
+[ -e "$config" ] || { echo "$me: config $config does not exist" >&2; exit 1; }
+
+tmp_base=${TMPDIR:-/tmp}
+
+# On the host, re-run inside the dev box when there is one. It runs as a child, not an exec: a
+# signal that ends this wrapper does not reach the process in the box by itself, so it is passed on.
+in_box() { [ -e /run/.containerenv ] || [ -n "${container:-}" ]; }
+box_exists() {
+    command -v distrobox >/dev/null 2>&1 &&
+        distrobox list --no-color 2>/dev/null | awk -F'|' 'NR > 1 { gsub(/ /, "", $2); print $2 }' |
+        grep -qx swayward-dev
+}
+if ! in_box && [ -z "${TRY_LOCK_NATIVE:-}" ] && box_exists; then
+    pidfile=$(mktemp "$tmp_base/swl-try-pid.XXXXXX")
+    box_pid=""
+    forward() {
+        box_pid=$(cat "$pidfile" 2>/dev/null || true)
+        if [ -n "$box_pid" ]; then
+            kill -TERM "$box_pid" 2>/dev/null || true
+            for _ in $(seq 100); do
+                kill -0 "$box_pid" 2>/dev/null || break
+                sleep 0.1
+            done
+        fi
+        rm -f -- "$pidfile"
+        exit 143
+    }
+    trap forward INT TERM HUP
+    distrobox enter swayward-dev -- env TRY_LOCK_PIDFILE="$pidfile" TRY_LOCK_PARENT=$$ "$0" "${orig_args[@]}" &
+    status=0
+    wait $! || status=$?
+    rm -f -- "$pidfile"
+    exit "$status"
+fi
+[ -z "${TRY_LOCK_PIDFILE:-}" ] || echo $$ >"$TRY_LOCK_PIDFILE"
+
+command -v sway >/dev/null 2>&1 || {
+    echo "$me: sway is not installed here; install it, or run this inside the swayward-dev distrobox" >&2
+    exit 1
+}
+if [ "$build" = 1 ] && ! command -v cargo >/dev/null 2>&1; then
+    echo "$me: cargo is not installed here; install it, or build elsewhere and use --no-build" >&2
+    exit 1
+fi
+if [ -z "${WAYLAND_DISPLAY:-}" ] && [ "${TRY_LOCK_BACKEND:-wayland}" = wayland ]; then
+    echo "$me: WAYLAND_DISPLAY is not set; run it from a Wayland session (the window opens there)" >&2
+    exit 1
+fi
+
+cd "$repo"
+if [ "$real_pam" = 1 ]; then
+    [ "$build" = 1 ] && cargo build -q
+    bin="$repo/target/debug/swaywardlock"
+    [ -x "$bin" ] || {
+        echo "$me: $bin is missing; build it first (cargo build) or drop --no-build" >&2
+        exit 1
+    }
+    if [ ! -e /etc/pam.d/swaywardlock ]; then
+        echo "$me: /etc/pam.d/swaywardlock is missing; install pam/swaywardlock first" >&2
+        exit 1
+    fi
+else
+    # A separate target dir, so the real-PAM and test-auth builds never overwrite each other.
+    [ "$build" = 1 ] && CARGO_TARGET_DIR="$repo/target/try-lock" cargo build -q --features test-auth
+    bin="$repo/target/try-lock/debug/swaywardlock"
+    if [ ! -x "$bin" ]; then
+        # A plain `cargo build --features test-auth` puts the same binary in target/debug.
+        if [ -x "$repo/target/debug/swaywardlock" ] && grep -q swaywardlock-test "$repo/target/debug/swaywardlock"; then
+            bin="$repo/target/debug/swaywardlock"
+        else
+            echo "$me: no test-auth build found; run one of" >&2
+            echo "    CARGO_TARGET_DIR=target/try-lock cargo build --features test-auth" >&2
+            echo "    cargo build --features test-auth" >&2
+            echo "or drop --no-build" >&2
+            exit 1
+        fi
+    fi
+fi
+
+# The nested sway connects to the outer compositor by absolute socket path and gets its own
+# runtime dir; the outer XDG_RUNTIME_DIR is never written to and never removed.
+outer_runtime=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+outer_display=${WAYLAND_DISPLAY:-wayland-0}
+case "$outer_display" in /*) ;; *) outer_display="$outer_runtime/$outer_display" ;; esac
+
+run_dir=$(mktemp -d "$tmp_base/swl-try.XXXXXX")
+cleanup() {
+    trap '' INT TERM HUP
+    local pid
+    for pid in "${tail_pid:-}" "${lock_pid:-}" "${sway_pid:-}" "${unlock_pid:-}"; do
+        [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
+    done
+    # A child that ignores SIGTERM must not hang the cleanup: give it a second, then SIGKILL.
+    sleep 0.2
+    for pid in "${tail_pid:-}" "${lock_pid:-}" "${sway_pid:-}" "${unlock_pid:-}"; do
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            sleep 1
+            kill -KILL "$pid" 2>/dev/null || true
+        fi
+    done
+    wait 2>/dev/null || true
+    case "$run_dir" in */swl-try.?*) rm -rf -- "$run_dir" ;; esac
+}
+trap cleanup EXIT
+# bash runs the EXIT trap on exit from a trapped signal, so one handler covers all of them.
+trap 'exit 143' INT TERM HUP
+
+backend=${TRY_LOCK_BACKEND:-wayland}
+{
+    printf 'output * resolution %s%s\n' "$size" "${scale:+ scale $scale}"
+    printf 'output * bg #3a5f8a solid_color\n'
+    printf 'default_border none\n'
+} >"$run_dir/sway.conf"
+
+(
+    unset SWAYSOCK
+    export XDG_RUNTIME_DIR="$run_dir" WLR_BACKENDS="$backend"
+    [ "$backend" = wayland ] && export WAYLAND_DISPLAY="$outer_display"
+    [ "$backend" = headless ] && export WLR_LIBINPUT_NO_DEVICES=1 WLR_RENDERER=pixman
+    exec sway -c "$run_dir/sway.conf"
+) >"$run_dir/sway.log" 2>&1 &
+sway_pid=$!
+
+nested=""
+for _ in $(seq 100); do
+    nested=$(ls "$run_dir" 2>/dev/null | grep -m1 '^wayland-[0-9]*$' || true)
+    [ -n "$nested" ] && break
+    kill -0 "$sway_pid" 2>/dev/null || { cat "$run_dir/sway.log" >&2; exit 1; }
+    sleep 0.1
+done
+[ -n "$nested" ] || { echo "$me: nested sway did not start" >&2; cat "$run_dir/sway.log" >&2; exit 1; }
+
+args=(-c "$config")
+[ "$preview" = 1 ] && args+=(--preview)
+args+=("${extra[@]}")
+
+echo "$me: nested sway pid $sway_pid, config $config"
+if [ "$preview" = 1 ]; then
+    echo "$me: preview mode; edit the config to reload, close the window (or Ctrl+C) to quit"
+elif [ "$real_pam" = 1 ]; then
+    echo "$me: real PAM; unlock with your password"
+else
+    echo "$me: unlock with the password swaywardlock-test"
+fi
+
+# The EGL and GL lines the nested software renderer logs are harmless but bury the result, so
+# only swaywardlock's own messages show unless -v. The log goes to a file, so no colour codes.
+if [ "$verbose" = 1 ]; then
+    log_filter=info egl_log=warning
+else
+    # EGL_LOG_LEVEL silences Mesa's own "failed to get driver name" lines.
+    log_filter=swaywardlock=info egl_log=fatal
+fi
+env -u SWAYSOCK XDG_RUNTIME_DIR="$run_dir" WAYLAND_DISPLAY="$nested" RUST_LOG="$log_filter" \
+    EGL_LOG_LEVEL="$egl_log" \
+    "$bin" "${args[@]}" >"$run_dir/lock.log" 2>&1 &
+lock_pid=$!
+tail -n +1 -f "$run_dir/lock.log" --pid="$lock_pid" &
+tail_pid=$!
+echo "$me: locker pid $lock_pid (kill -USR1 $lock_pid to unlock)"
+
+if [ -n "$unlock_after" ]; then
+    # The subshell forwards TERM to its sleep, so cleanup leaves no orphan behind.
+    (
+        sleep "$unlock_after" &
+        sleep_pid=$!
+        trap 'kill "$sleep_pid" 2>/dev/null; exit 0' TERM
+        wait "$sleep_pid" && kill -USR1 "$lock_pid" 2>/dev/null
+    ) &
+    unlock_pid=$!
+fi
+
+# Poll rather than `wait`, so the loop also ends when the nested sway is gone or the wrapper
+# that started this script (host side of the box) has died.
+while kill -0 "$lock_pid" 2>/dev/null; do
+    if ! kill -0 "$sway_pid" 2>/dev/null; then
+        echo "$me: the nested sway ended" >&2
+        break
+    fi
+    if [ -n "${TRY_LOCK_PARENT:-}" ] && ! kill -0 "$TRY_LOCK_PARENT" 2>/dev/null; then
+        echo "$me: the launching process is gone" >&2
+        exit 143
+    fi
+    sleep 0.2
+done
+status=0
+if kill -0 "$lock_pid" 2>/dev/null; then
+    kill "$lock_pid" 2>/dev/null || true
+fi
+wait "$lock_pid" || status=$?
+lock_pid=""
+wait "$tail_pid" 2>/dev/null || true  # the rest of the log
+tail_pid=""
+echo "$me: locker exited with $status"
+exit "$status"

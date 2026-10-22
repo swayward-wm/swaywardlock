@@ -6,7 +6,11 @@
 
 Prints KDL on stdout. On stderr it prints the swaywardlock command line to use (process flags
 such as -f and --ready-fd carry over; styling flags become KDL) and a warning for every option it
-could not translate. It never drops an option silently.
+could not translate. It never drops an option silently. Long options may be abbreviated to any
+unambiguous prefix, on the command line and in the config file, as swaylock's getopt_long allows.
+
+Typing is not configurable and differs from swaylock in two ways (spec, Input): only Backspace
+and Delete repeat, and keys typed while a password is being checked are dropped.
 """
 
 from __future__ import annotations
@@ -21,6 +25,16 @@ from pathlib import Path
 # swaylock defaults the ring position depends on (main.c).
 DEFAULT_RADIUS = 50
 DEFAULT_THICKNESS = 10
+
+# Ranges swaywardlock's config decoder accepts (src/config/widgets.rs); a value outside them makes
+# the whole config fail to load, so the converter clamps and warns instead.
+RING_SIZE = (1, 10000)  # radius, thickness
+FONT_SIZE = (0, 10000)
+POSITION = (-100000, 100000)
+
+# Image formats the decoder reads (the image crate features in Cargo.toml). It sniffs the file
+# content, so the extension is only a hint, but another extension is a likely mismatch.
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff", ".ico", ".jxl"}
 
 # --<set>-<state>-color: (set, state) for the ring's per-state colours.
 SETS = ("inside", "ring", "line", "text")
@@ -38,6 +52,27 @@ LAYOUT_COLORS = {"layout-bg-color": "bg", "layout-border-color": "border", "layo
 
 # swaylock scaling mode -> swaywardlock fit.
 FITS = {"fill": "cover", "fit": "contain", "stretch": "fill", "center": "center", "tile": "tile"}
+
+# swaylock-effects options that have a swaywardlock equivalent (or none): the warning says which.
+# Each maps to (takes a value, hint). `grace` also carries over to the command line.
+EFFECTS = {
+    "grace": (True, "swaywardlock has -g/--grace SECONDS on the command line"),
+    "grace-no-mouse": (False, "no equivalent: swaywardlock's grace also reacts to the pointer"),
+    "grace-no-touch": (False, "no equivalent: swaywardlock's grace also reacts to the pointer"),
+    "fade-in": (True, 'use `animations { fade-in { duration-ms MS; }; }` (--no-fade-in turns it off)'),
+    "effect-blur": (True, "use `blur { passes N; offset PX; }` inside the `background` node"),
+    "effect-pixelate": (True, "no swaywardlock equivalent"),
+    "effect-scale": (True, "no swaywardlock equivalent"),
+    "effect-greyscale": (False, "use `blur { saturation 0; }` inside the `background` node"),
+    "effect-vignette": (True, "no swaywardlock equivalent"),
+    "effect-compose": (True, "no swaywardlock equivalent"),
+    "effect-custom": (True, "no swaywardlock equivalent"),
+    "screenshots": (False, "use `screenshot` inside the `background` node"),
+    "clock": (False, 'use a `label { text "$TIME"; }` widget'),
+    "timestr": (True, 'use a `label { text "$TIME"; }` widget'),
+    "datestr": (True, 'use a `label` widget with a `cmd[update:60000] date` text'),
+}
+
 
 # Short options and whether they take a value (swaylock's getopt string).
 SHORT = {
@@ -58,9 +93,40 @@ TAKES_VALUE = (
     | STATE_COLOR_OPTIONS
     | set(RING_COLORS)
     | set(LAYOUT_COLORS)
+    | {n for n, (takes, _) in EFFECTS.items() if takes}
     | {"font", "font-size", "indicator-radius", "indicator-thickness",
        "indicator-x-position", "indicator-y-position"}
 )
+
+# swaylock's long_options (main.c), for getopt_long's unambiguous-prefix matching.
+LONG_OPTIONS = (
+    "config", "color", "debug", "ignore-empty-password", "daemonize", "ready-fd", "help", "image",
+    "disable-caps-lock-text", "indicator-caps-lock", "line-uses-inside", "line-uses-ring",
+    "scaling", "tiling", "no-unlock-indicator", "show-keyboard-layout", "hide-keyboard-layout",
+    "show-failed-attempts", "version", "bs-hl-color", "caps-lock-bs-hl-color",
+    "caps-lock-key-hl-color", "font", "font-size", "indicator-idle-visible", "indicator-radius",
+    "indicator-thickness", "indicator-x-position", "indicator-y-position", "inside-color",
+    "inside-clear-color", "inside-caps-lock-color", "inside-ver-color", "inside-wrong-color",
+    "key-hl-color", "layout-bg-color", "layout-border-color", "layout-text-color", "line-color",
+    "line-clear-color", "line-caps-lock-color", "line-ver-color", "line-wrong-color", "ring-color",
+    "ring-clear-color", "ring-caps-lock-color", "ring-ver-color", "ring-wrong-color",
+    "separator-color", "text-color", "text-clear-color", "text-caps-lock-color", "text-ver-color",
+    "text-wrong-color",
+)
+
+
+def long_option(name: str, warnings: list[str]) -> str | None:
+    """getopt_long's lookup: an exact name, else the one option `name` is a prefix of. An ambiguous
+    prefix warns and returns None; an unknown name comes back as is (and warns later)."""
+    if name in LONG_OPTIONS or not name:
+        return name
+    matches = [o for o in LONG_OPTIONS if o.startswith(name)]
+    if len(matches) == 1:
+        return matches[0]
+    if matches:
+        warnings.append(f"--{name}: ambiguous (could be {', '.join('--' + m for m in matches)}); skipped")
+        return None
+    return name
 
 
 def c_atoi(s: str) -> int:
@@ -82,6 +148,15 @@ def c_strtol(s: str) -> int:
     else:
         n = int(digits)
     return -n if sign == "-" else n
+
+
+def clamp(value: int, bounds: tuple[int, int], what: str, warnings: list[str]) -> int:
+    """Clamp to what the decoder accepts, warning when the value changes."""
+    lo, hi = bounds
+    out = min(max(value, lo), hi)
+    if out != value:
+        warnings.append(f"{what} {value} is outside {lo}..{hi}, which swaywardlock rejects; using {out}")
+    return out
 
 
 def kdl_str(s: str) -> str:
@@ -146,8 +221,16 @@ class Translator:
             # swaylock runs wordexp on the path. swaywardlock expands only a leading '~', so
             # expand variables here, and warn about anything still left for a shell.
             path = os.path.expandvars(path)
+            if Path(path).suffix.lower() not in IMAGE_EXTENSIONS:
+                self.warnings.append(
+                    f"--image: {path!r} does not have a supported image extension "
+                    f"({', '.join(sorted(IMAGE_EXTENSIONS))}); it may fail to load"
+                )
             if any(c in path for c in "$`*?["):
                 self.warnings.append(f"--image: {path!r} needs shell expansion; check the path")
+            # swaywardlock may daemonize (chdir to /), so a relative path would not resolve.
+            if path and not path.startswith(("/", "~")) and not any(c in path for c in "$`*?["):
+                path = os.path.abspath(path)
             self.images[output] = path
         elif name == "scaling":
             if value == "solid_color":
@@ -187,15 +270,20 @@ class Translator:
         elif name == "font":
             self.ring_props["font"] = kdl_str(value)
         elif name == "font-size":
-            self.ring_props["font-size"] = str(c_atoi(value))
+            # A negative size means "auto" in swaylock, which is swaywardlock's 0.
+            size = c_atoi(value)
+            if size < 0:
+                self.warnings.append(f"--font-size: {size} means automatic size in swaylock; using 0")
+                size = 0
+            self.ring_props["font-size"] = str(clamp(size, FONT_SIZE, "--font-size", self.warnings))
         elif name == "indicator-radius":
-            self.radius = c_strtol(value)
+            self.radius = clamp(c_strtol(value), RING_SIZE, "--indicator-radius", self.warnings)
         elif name == "indicator-thickness":
-            self.thickness = c_strtol(value)
+            self.thickness = clamp(c_strtol(value), RING_SIZE, "--indicator-thickness", self.warnings)
         elif name == "indicator-x-position":
-            self.x = c_atoi(value)
+            self.x = clamp(c_atoi(value), POSITION, "--indicator-x-position", self.warnings)
         elif name == "indicator-y-position":
-            self.y = c_atoi(value)
+            self.y = clamp(c_atoi(value), POSITION, "--indicator-y-position", self.warnings)
         # Ring colours.
         elif name in RING_COLORS:
             self.ring_colors[RING_COLORS[name]] = color(value)
@@ -203,6 +291,18 @@ class Translator:
             self.layout_colors[LAYOUT_COLORS[name]] = color(value)
         elif name.endswith("-color") and self._state_color(name, value):
             pass
+        elif name in EFFECTS:
+            if name == "grace":
+                # Whole seconds only: swaywardlock's -g takes an integer.
+                seconds = c_atoi(value)
+                if seconds >= 2**64:
+                    self.warnings.append("--grace: too large for swaywardlock's -g (u64); not carried over")
+                else:
+                    if seconds > 0:
+                        self.command += ["-g", str(seconds)]
+                    self.warnings.append(f"--grace: a swaylock-effects option, carried over as -g {seconds}")
+            else:
+                self.warnings.append(f"--{name}: a swaylock-effects option, not translated; {EFFECTS[name][1]}")
         else:
             self.warnings.append(f"--{name}: not a swaylock option; skipped")
 
@@ -253,6 +353,8 @@ class Translator:
                 px = self.x - edge if self.x is not None else 0
                 # Positive y moves up.
                 py = edge - self.y if self.y is not None else 0
+                px = clamp(px, POSITION, "ring x position", self.warnings)
+                py = clamp(py, POSITION, "ring y position", self.warnings)
                 body.append(f"position {px} {py}")
             for key, val in self.ring_props.items():
                 body.append(f"{key} {val}".rstrip())
@@ -277,6 +379,10 @@ def parse_args(t: Translator, argv: list[str]) -> None:
         i += 1
         if arg.startswith("--"):
             name, eq, value = arg[2:].partition("=")
+            name = long_option(name, t.warnings)
+            if name is None:
+                # An ambiguous prefix: swaylock does not know whether it takes a value either.
+                continue
             if not eq and name in TAKES_VALUE:
                 if i >= len(argv):
                     t.warnings.append(f"--{name}: missing value")
@@ -316,7 +422,9 @@ def parse_config(t: Translator, text: str) -> None:
         if not line or line.startswith("#"):
             continue
         name, eq, value = line.partition("=")
-        t.option(name.strip(), value.strip() if eq else None)
+        name = long_option(name.strip(), t.warnings)
+        if name is not None:
+            t.option(name, value.strip() if eq else None)
 
 
 def default_config() -> Path | None:
@@ -345,7 +453,13 @@ def main() -> int:
         if path is None:
             print("no swaylock config found; pass a path or --args", file=sys.stderr)
             return 1
-        parse_config(t, path.read_text())
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as err:
+            reason = err.strerror if isinstance(err, OSError) else "not valid UTF-8"
+            print(f"swaylock-to-kdl: cannot read {path}: {reason}", file=sys.stderr)
+            return 1
+        parse_config(t, text)
 
     sys.stdout.write(t.emit())
     print("command: " + shlex.join(t.command), file=sys.stderr)

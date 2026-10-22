@@ -1,2 +1,7 @@
-# PAM configuration for swaywardlock; see /etc/pam.d/login
-auth include login
+#%PAM-1.0
+# PAM configuration for swaywardlock (the default `auth { pam service="swaywardlock"; }`).
+# Install as /etc/pam.d/swaywardlock; swaywardlock refuses to lock without it.
+# Only the auth phase runs (pam_authenticate, then pam_setcred to refresh credentials), as with
+# swaylock and hyprlock: account policy such as pam_nologin or password expiry governs new
+# logins and must not refuse the right password at the lock screen of a running session.
+auth     include login
