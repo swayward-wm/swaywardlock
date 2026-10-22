@@ -20,8 +20,9 @@ jobs:
             git gcc clang rustup pam-devel wayland-devel libxkbcommon-devel \
             pango-devel cairo-devel cairo-gobject-devel glib2-devel \
             mesa-libEGL-devel mesa-dri-drivers mesa-libgbm-devel \
-            sway wtype grim python3 scdoc procps-ng libcap dejavu-sans-fonts swaybg \
-            dbus-daemon python3-dbus python3-gobject
+            sway wtype grim python3 scdoc procps-ng libcap dejavu-sans-fonts liberation-sans-fonts swaybg \
+            dbus-daemon python3-dbus python3-gobject \
+            python3-pytest python3-pytest-xdist python3-pytest-timeout
           # Fedora ships sway with cap_sys_nice; the CI container may not grant it, so exec fails
           # with EPERM. The tests do not need realtime scheduling.
           setcap -r /usr/bin/sway
@@ -34,38 +35,10 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
           key: cargo-${{ hashFiles('Cargo.lock') }}
-      - name: fmt
-        run: cargo +nightly fmt --check
-      - name: clippy
-        run: |
-          cargo clippy --all-targets -- -D warnings
-          cargo clippy --all-targets --features test-auth -- -D warnings
-      - name: test
-        run: cargo test
-      - name: real PAM (/etc/pam.d)
-        run: contrib/test-real-pam
-      - name: converters
-        run: |
-          cargo build --features test-auth
-          SWAYWARDLOCK=target/debug/swaywardlock python3 contrib/test-swaylock-to-kdl.py
-          SWAYWARDLOCK=target/debug/swaywardlock python3 contrib/test-hyprlock-to-kdl.py
-      - name: man page and completions
-        run: |
-          python3 contrib/check-man target/debug/swaywardlock
-          python3 contrib/check-doc-kdl target/debug/swaywardlock
-          echo "garbage {" > "$RUNNER_TEMP/broken.kdl"
-          for shell in bash zsh; do
-            SWAYWARDLOCK_CONFIG="$RUNNER_TEMP/broken.kdl" target/debug/swaywardlock completions "$shell" > /dev/null
-          done
-      - name: try-lock (headless sway)
-        timeout-minutes: 5
-        run: contrib/test-try-lock
-      - name: e2e (headless sway)
-        timeout-minutes: 5
-        run: contrib/e2e-sway target/debug/swaywardlock
-      - name: release has no test-auth
-        run: |
-          cargo build --release
-          ! grep -q swaywardlock-test target/release/swaywardlock
+      - name: Fast gate
+        run: contrib/gate --fast
+      - name: Slow gate
+        env:
+          E2E_JOBS: "4"
+        run: contrib/gate --slow

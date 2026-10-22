@@ -344,9 +344,6 @@ UNSUPPORTED = {
     "text_trim": unsupported(1, "swaywardlock trims only the end of a cmd[] output"),
     "fractional_scaling": unsupported(2, "not configurable (swaywardlock follows the compositor)"),
     "screencopy_mode": unsupported(0, "not configurable (swaywardlock uses wlr-screencopy, then ext-image-copy-capture)"),
-    "reload_time": unsupported(-1),
-    "reload_cmd": unsupported(""),
-    "crossfade_time": unsupported(-1),
     "onclick": unsupported(""),
     "shadow_boost": unsupported(1.2, "the shadow's colour boost has no KDL counterpart"),
 }
@@ -930,7 +927,42 @@ class Converter:
                            ("vibrancy", vibrancy), ("vibrancy_darkness", darkness)):
                 if v is not None:
                     self.warn(self.loc(s, key), key, "ignored: hyprlock applies it only with blur_passes > 0")
+        self.reload(s, "background")
+        crossfade = self.get(s, "crossfade_time", "float")
+        if crossfade is not None and crossfade > 0:
+            ms = int(self.clamp(s, "crossfade_time", round(crossfade * 1000), (1, 2**32 - 1), "crossfade"))
+            s.lines.append(f"crossfade-ms {ms}")
+            self.note(self.loc(s, "crossfade_time"), "crossfade_time",
+                      "hyprlock itself ignores this key (its crossfade follows the fadeIn animation); "
+                      "swaywardlock's crossfade-ms is honoured")
         self.common(s, -1)
+
+    def reload(self, s: Scope, kind: str) -> None:
+        """reload_time (seconds) and reload_cmd as `reload-ms` and `reload-cmd`. hyprlock reloads a
+        background only when it has a command and a time, an image whenever it has a time; a key
+        hyprlock never acts on is left out with a warning, so the output does what hyprlock did."""
+        t = self.get(s, "reload_time", "int")
+        cmd = self.get(s, "reload_cmd", "str") or ""
+        has_time = t is not None and t > -1
+        if kind == "background" and has_time and not cmd:
+            self.warn(self.loc(s, "reload_time"), "reload_time",
+                      "hyprlock reloads a background only with reload_cmd; left out")
+            has_time = False
+        if kind == "image" and cmd and not has_time:
+            self.warn(self.loc(s, "reload_cmd"), "reload_cmd",
+                      "hyprlock runs an image's reload_cmd only on a reload_time timer; left out")
+            cmd = ""
+        if kind == "background" and cmd and not has_time and s.vals.get("path", ("",))[0]:
+            self.warn(self.loc(s, "reload_cmd"), "reload_cmd",
+                      "hyprlock runs a background's reload_cmd once only without a path (and then "
+                      "never again without reload_time); left out")
+            cmd = ""
+        if cmd:
+            s.lines.append(f"reload-cmd {kdl_str(cmd)}")
+        if has_time:
+            ms = t * 1000
+            ms = int(self.clamp(s, "reload_time", ms, (0, 2**32 - 1), "reload time"))
+            s.lines.append(f"reload-ms {ms}")
 
     def tr_shape(self, s: Scope) -> None:
         self.size(s)
@@ -961,6 +993,7 @@ class Converter:
         self.border(s, "border", "border_size", "border_color", 4, hexcolor((221, 221, 221, 255)), always=True)
         self.rotate(s)
         self.shadow(s)
+        self.reload(s, "image")
         self.common(s, 0)
 
     def tr_label(self, s: Scope) -> None:

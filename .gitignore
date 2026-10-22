@@ -5,3 +5,4 @@ __pycache__/
 /contrib/src/
 /contrib/pkg/
 /contrib/*.pkg.tar.*
+.pytest_cache/

@@ -32,6 +32,11 @@ Source: `swayward-wm/swayward` at `339f99e8d70c099f75aaad86dcc8b23c9cd32bd2`.
 | `src/config/copied/animations/types.rs` | `swayward-config/src/animations/types.rs` | trimmed: only `Animation`, `Kind`, `EasingParams`, `Curve`, `SpringParams` |
 | `src/render/shaders/mod.rs` | `src/render_helpers/shaders/mod.rs` | rewritten from the original: only border, shadow and blur programs |
 | `src/render/shaders/postprocess.frag` (`hash12`, `saturate`) | `src/render_helpers/shaders/postprocess.frag` | ported: the two functions and the noise/saturation lines of `postprocess()`, in a new shader with hyprlock's vibrancy (see Other copied files); not checked by `contrib/copied-diff`. `hash12` is David Hoskins' (MIT) |
+| `contrib/package-version` | `contrib/package-version` | verbatim |
+| `contrib/check-release-consistency` | `contrib/check-release-consistency` | trimmed: one package, no workspace crates, no `.SRCINFO`, tag `swaywardlock-vVERSION`; adds the `Cargo.lock` check for a single package |
+| `contrib/test-release-consistency` | `contrib/test-release-consistency` | trimmed: swaywardlock's spec and `build-deb` greps instead of the foot recommendation, no `.SRCINFO` case, adds a wrong-tag case |
+| `contrib/build-deb` | `contrib/build-deb` | rewritten around the same skeleton: one binary, the PAM conffile, man page, completions, converters, examples; the same shlibdeps handling, with `login` and `python3` added by hand |
+| `.github/workflows/release.yml` | `.github/workflows/release.yml` | modelled on it, not diffed: same jobs and names, no wiki checks, nothing compositor-specific; verify jobs run `contrib/verify-installed` (not copied; written here) |
 | `src/render/shaders/blur.vert`, `blur_down.frag`, `blur_up.frag`, `border.frag`, `shadow.frag`, `rounding_alpha.frag`, `texture.vert` | `src/render_helpers/shaders/` | verbatim |
 
 Not copied, written for swaywardlock: the widget nodes (`src/config/widgets.rs`), the ring

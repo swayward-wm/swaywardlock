@@ -94,7 +94,7 @@ knows the screen is locked.
 
 Signals: SIGUSR1 unlocks (fade out, then unlock); a second SIGUSR1, password
 or fingerprint match during the fade-out unlocks at once. SIGUSR2 forces `cmd[]`
-labels to refresh now (and, once the Phase 3 `reload-cmd` unit lands, images and backgrounds). SIGTERM,
+labels, reload-enabled images and backgrounds to refresh now. SIGTERM,
 SIGINT and SIGHUP keep their default action: the process dies and the
 compositor keeps the session locked. They never unlock. This is swaylock's
 behaviour, and it lets a service manager stop a stuck locker. A handler
@@ -274,6 +274,9 @@ background output="DP-1" {
     brightness 0.8172
     vibrancy 0.1686            // 0 to 10, default 0 (off); hyprlock's default is 0.1686
     vibrancy-darkness 0.05     // 0 to 1, default 0
+    reload-cmd "~/bin/wallpaper-path"   // picture changes while locked (see "Reloading")
+    reload-ms 60000
+    crossfade-ms 1000
 }
 ```
 
@@ -283,7 +286,44 @@ less. Order after the blur: vibrancy, then the blur's `saturation`, then its `no
 need blur (`blur` with `passes` above 0), as in hyprlock and swayward; without it they do
 nothing and the locker logs a warning.
 
-hyprlock's `reload_time`, `reload_cmd` and `crossfade_time` are Phase 3 leftovers.
+**Reloading** (`background` and `image`): the picture can change while the session is locked.
+
+- `reload-cmd "<shell>"`: run with `sh -c`; its output (first line, NULs and surrounding white
+  space dropped, a `file://` prefix dropped, `~` expanded, a relative path taken against the
+  directory of the config file) is the path to show. An empty output, or a command that fails,
+  keeps the picture. A `background` with a command and no `path` runs it once at startup for
+  its first picture.
+- `reload-ms <ms>`: run the command (or, without one, look at the widget's own `path`) every
+  that many ms; at least 100. `0` means only on SIGUSR2. Without it nothing reloads on a timer.
+  SIGUSR2 reloads every widget that has either key at once.
+- A reload decodes a file only when its path or modification time differs from the last one
+  looked at, and skips a round while the previous decode is still running. Writing a new file
+  and renaming it over the old one avoids a half-written read.
+- `crossfade-ms <ms>` (`background` only): the new picture fades in over the old one, linearly,
+  in that time; absent or `0` swaps at once, and so does `animations { off; }`. A picture that
+  arrives while a crossfade runs waits for it to end (as in hyprlock, which skips reloads until
+  then), then fades in.
+- The command and the decode run off the main thread, so a slow command or a huge file never
+  delays input or the unlock. The worker reads the picture's size first and refuses one with
+  more than 64 megapixels or a side over the GPU texture limit (the decoder gets the same
+  bounds), then scales it down, aspect kept, until it just covers the largest output's buffer
+  (`cover`, `contain`, `fill`) or the `image`'s `size` in pixels; `tile` and `center` keep the
+  full size. So the main thread only wraps a screen-sized buffer. The first look waits for an
+  output to have a size; a larger output later makes the next look decode again.
+- A failed reload (a missing, corrupt or refused file, a command that cannot start, a picture
+  that cannot be drawn, such as an `image` whose texture would be over the GPU limit) keeps the
+  old picture and logs one warning; the file is not tried again until it changes. A new picture
+  replaces the old one only once every output has rendered it. Nothing in a reload affects the
+  lock or can unlock the session. Commands run like `cmd[]` ones (own process group, output capped at 64
+  KiB) and are killed on unlock and on SIGTERM, SIGINT and SIGHUP.
+- `reload-*` on a `background { screenshot; }` is ignored with a warning (as in hyprlock).
+
+Deliberate differences from hyprlock: the keys are in ms (`reload_time` is seconds, and
+`hyprlock-to-kdl` multiplies by 1000); a `background` without a command also follows its file's
+modification time (hyprlock reloads a background only with `reload_cmd`); an `image` is
+refreshed by SIGUSR2 at any `reload-ms` (hyprlock skips it for a positive interval); the command
+runs off the main thread (hyprlock blocks on it); and the crossfade lasts `crossfade-ms`,
+linear (hyprlock parses `crossfade_time` but ignores it, fading with its `fadeIn` animation).
 
 **Image paths** (`background` and `image` `path`): a leading `~` is the home directory; a
 relative path resolves against the directory of the file it is written in (as `include`
@@ -364,10 +404,11 @@ image {
     corner-radius "full"       // the default: a circle (hyprlock's rounding -1); or px, or 4 values
     border { width 4; color "#dddddd"; }   // or gradient from=... to=...; around the picture
     rotate 0                   // degrees, counter-clockwise
+    reload-ms 30000            // optional; see "Reloading" under `background`
 }
 ```
 
-Image `reload_time`/`reload_cmd` are Phase 3 leftovers.
+An image swaps at once when it reloads (no crossfade, as in hyprlock).
 
 **`shape`**
 
@@ -514,6 +555,7 @@ thread (auth and commands/resources). Modules:
 | `state` | input and auth state machine with swaylock's timers, grace period (pure logic, unit tested) | none |
 | `secret` | the locked, zeroed password buffer | libc |
 | `textvars`, `commands`, `labels` | `$VARIABLE` and `cmd[]` substitution, the command runner, label refresh timers | none |
+| `reload` | `reload-ms`/`reload-cmd` timers, off-thread command and decode, the path each picture shows | none |
 | `screencopy` | wlr-screencopy screenshots before locking | sctk |
 | `preview` | `--preview` window and config watcher | sctk |
 | `process` | ready-fd, daemonize, open-file limit | libc |
@@ -799,7 +841,7 @@ stdout/stderr split and the same clamping of values the decoder rejects.
   becomes `pam "off"`, with a warning unless the fingerprint is enabled.
 - Unlike `swaylock-to-kdl`, which only warns, every key that has no KDL counterpart gets a
   warning on stderr and a `// hyprlock: key = value (reason)` comment inside its node, so the
-  KDL shows what was left behind: `reload_time`, `reload_cmd`, `crossfade_time`, `onclick`, `shadow_boost`, and
+  KDL shows what was left behind: `onclick`, `shadow_boost`, and
   `general:text_trim`, `fractional_scaling` and `screencopy_mode`, plus unknown keys and sections.
   The handlers live in one table (`UNSUPPORTED`); the unit that adds a KDL key moves it from the
   table to a translator and extends the converter's tests. Keys hyprlock itself ignores (blur
@@ -823,7 +865,7 @@ stdout/stderr split and the same clamping of values the decoder rejects.
 | Input/auth | key handling (Escape, control characters, modifiers, Ctrl shortcuts, ignore-empty-input), timers, grace (`state.rs`) | unit tests; there is no `FakeAuth`, the `test-auth` build feature swaps PAM for a fixed password |
 | Real PAM | `src/auth.rs` against libpam: wrong and right password, auth phase only, follow-up questions, faillock text, setcred | unit tests with throwaway service files through `pam_start_confdir` and the probe module `contrib/test-pam-probe.c`; `contrib/test-real-pam` (in the gate) installs a throwaway `/etc/pam.d/swl-test-<pid>` (`pam_exec` script, then `account required pam_deny.so`) so the shipped `pam_start` lookup runs too; it needs root or passwordless sudo and says SKIP otherwise. `SWAYWARDLOCK_TEST_REAL_PASSWORD=<pw> contrib/test-real-pam` also checks a real password through `auth include login` (opt-in: it needs a user with a throwaway password) |
 | Process | ready-fd ordering, daemonize, SIGUSR1, exit 2 on `finished` | integration |
-| End to end | lock, wrong password, right password, screenshots, widgets by pixel sampling (`contrib/e2e-sway`). Every unlock path checks that the compositor unlocked (a `swaybg` desktop is visible again), not only the exit code. Also: `pam { off; }` with Enter, an unlock before `locked` (a proxy holds `locked` back), outputs plugged and unplugged while locked, scale changes, fade direction, blur and brightness, the fprintd call order and retry delay, pointer grace and hide-cursor, the daemon's session and stdio | headless sway (`WLR_BACKENDS=headless`, `WLR_RENDERER=pixman` or llvmpipe), `wtype` for keys (`contrib/vkbd` for a chosen seat or a multi-layout keymap, which wtype cannot do), `contrib/vptr` for a pointer, the `test-auth` build feature |
+| End to end | lock, wrong password, right password, screenshots, widgets by pixel sampling (`contrib/e2e-sway`, moving to the pytest suite `tests/e2e`). Every unlock path checks that the compositor unlocked (a `swaybg` desktop is visible again), not only the exit code. Also: `pam { off; }` with Enter, an unlock before `locked` (a proxy holds `locked` back), outputs plugged and unplugged while locked, scale changes, fade direction, blur and brightness, the fprintd call order and retry delay, pointer grace and hide-cursor, the daemon's session and stdio | headless sway (`WLR_BACKENDS=headless`, `WLR_RENDERER=pixman` or llvmpipe), `wtype` for keys (`contrib/vkbd` for a chosen seat or a multi-layout keymap, which wtype cannot do), `contrib/vptr` for a pointer, the `test-auth` build feature |
 | Visual | the ring against swaylock's pixels | one e2e check (`converted`) compares a row measured on swaylock 1.8.6; there are no reference PNGs and no offscreen render tests |
 
 The test password exists only behind the cargo feature `test-auth`, which release builds don't
@@ -831,7 +873,9 @@ enable. The gate checks that a release build does not contain it. Not done: test
 itself, and snapshot or offscreen-render tests.
 
 Gate: `contrib/gate` runs nightly fmt, clippy, `cargo test`, `contrib/test-real-pam`, the
-converter corpus and the headless-sway end-to-end run.
+converter corpus and the headless-sway end-to-end runs: `contrib/e2e-sway`, then the pytest
+suite in `tests/e2e` (`pytest tests/e2e -n auto`; one area: `pytest tests/e2e -k password`),
+which the bash tests move to area by area (`2026-10-21-e2e-pytest.md`).
 
 ## Phases
 
@@ -856,7 +900,7 @@ the converted examples from hyprlock's wiki render.
 
 **Phase 3: rest.** ext-image-copy-capture (done), input-field animations and fade-on-empty
 (done), the animated ring style (done), `rotate` (done), `hyprlock-to-kdl` (done; keys without KDL stay comments until their units land),
-`reload-cmd`/crossfade, packaging (PKGBUILD, rpm spec, pam file) and man page (done),
+`reload-cmd`/crossfade (done), packaging (PKGBUILD, rpm spec, pam file) and man page (done),
 offering the EGL display impl upstream to smithay.
 
 ## Risks
@@ -950,9 +994,10 @@ Recorded after the spike; the sections above are unchanged.
   `docs/swaywardlock.1.scd`, bash/zsh/fish completions, both converters
   (`swaywardlock-swaylock-to-kdl`, `swaywardlock-hyprlock-to-kdl`, hence the `python` dependency),
   `examples/*.kdl` and `docs/specs/*.md` under `/usr/share/doc/swaywardlock` (the man page's
-  CONFIGURATION section points there). The PKGBUILD builds the checkout it sits in (no tag
-  tarball yet); `.gitignore` covers its `contrib/src`, `contrib/pkg` and package files, and
-  `BUILDDIR`/`PKGDEST` can point outside the tree. Both
+  CONFIGURATION section points there). The PKGBUILD downloads the tag tarball
+  (`swaywardlock-v$_tagver`) by default and builds the checkout it sits in with
+  `SWAYWARDLOCK_LOCAL=1`; `.gitignore` covers its `contrib/src`, `contrib/pkg` and package files,
+  and `BUILDDIR`/`PKGDEST` can point outside the tree. Both
   run the Rust tests but not the headless-sway e2e suite. `swaywardlock completions <SHELL>` is
   implemented with clap_complete (swayward's choice) and handled before the config is loaded.
   `contrib/check-man`, the gate and CI keep the man page in step with `--help`; the gate also runs
@@ -961,6 +1006,40 @@ Recorded after the spike; the sections above are unchanged.
   `contrib/test-try-lock` checks `contrib/try-lock`'s usage errors, `--help`, and that SIGTERM,
   SIGINT and SIGHUP leave no temp dir, no nested sway, no locker and no `--unlock-after` sleep.
   Both run in the gate and in CI.
+
+- Release machinery, following swayward's (`.github/workflows/release.yml`, `contrib/package-version`,
+  `check-release-consistency`, `test-release-consistency`, `build-deb`; see COPIED.md). The workflow
+  is `workflow_dispatch` with a `version` input and only drafts: validate (tag
+  `swaywardlock-vVERSION`, `Cargo.toml`, `Cargo.lock`, PKGBUILD and spec agree), build-ubuntu
+  (vendored dependencies archive, build, test, the tarball with `.sha256`, the `.deb`),
+  build-rpm (Fedora 43 and 44, in containers, through rpkg), build-arch (`archlinux:latest`,
+  makepkg from `git archive` of the tagged commit packed under GitHub's own tag-tarball
+  top directory `swaywardlock-swaywardlock-vVERSION`, which is the directory the PKGBUILD's release
+  mode builds in, so the workflow exercises the user's path; namcap with no errors), a verify job per
+  package that installs it in a clean container and runs `contrib/verify-installed`
+  (`--version` equal to the version, `validate` on every shipped example, `cmp` of
+  `/etc/pam.d/swaywardlock` with `pam/swaywardlock`, no `swaywardlock-test` or
+  `SWAYWARDLOCK_TEST_` string in the installed binary, both converters' `--help`, man page and
+  completions installed) plus the package manager's own "marked as config" check (dpkg conffiles,
+  `rpm -qc`, pacman backup), and draft-release (`softprops/action-gh-release`, `draft: true`).
+  Naming: `swaywardlock_VERSION_amd64.deb`, `swaywardlock-VERSION-fedora43|44-x86_64.rpm`,
+  `swaywardlock-VERSION-arch-x86_64.pkg.tar.zst`, `swaywardlock-VERSION-ubuntu24.04-x86_64.tar.gz`.
+  The `.deb` depends on `login` (the owner of `/etc/pam.d/login` on Ubuntu 24.04, from `dpkg -S`)
+  and `python3` besides the shlibs. Tagging and dispatching stay with the maintainer. No
+  CHANGELOG.md: swayward has none either (release notes are GitHub's generated ones).
+  `contrib/test-release-consistency` is in the gate and CI.
+
+- Test fonts. The unit tests that measure or draw text (`layout_box_geometry_and_colours`,
+  `scale_doubles_the_size_and_markup_falls_back`, `text_over_the_texture_limit_is_refused`) need
+  Pango to load some font; a bare container has none, and they failed there. They now compare
+  geometry that does not depend on glyph metrics (the layout box's right edge is read at the pixel
+  `x + bw` the stroke covers whatever the text width), and skip with a `SKIPPED` message when
+  Pango can load no font. Every package declares Liberation Sans, the font they are verified with
+  in clean containers: `checkdepends=('ttf-liberation')` in the PKGBUILD, `BuildRequires:
+  liberation-sans-fonts` in the spec, `fonts-liberation` in the release workflow's build-ubuntu
+  job (the `.deb` is a binary package without a source package, so it has no Build-Depends field;
+  `contrib/build-deb` says where the dependency is declared), and the CI image. The Arch build job installs
+  it explicitly because makepkg runs with `--nodeps`.
 
 ## Phase 2 notes (2026-10-19)
 
@@ -1052,9 +1131,9 @@ Left out of the translation: `onclick` (out of scope).
 
 Phase 2 leftovers, moved to Phase 3: `rotate`, label shadows, background and image
 reload/crossfade, fractional scale and `vibrancy`/`vibrancy-darkness` (rotate, label shadows,
-fractional scale and vibrancy done in Phase 3). Ring shadows are not planned: neither swaylock
-nor hyprlock has them (hyprlock has no ring widget, and its shadows apply to shape, image,
-input-field and label only).
+reload/crossfade, fractional scale and vibrancy done in Phase 3). Ring shadows are not planned:
+neither swaylock nor hyprlock has them (hyprlock has no ring widget, and its shadows apply to
+shape, image, input-field and label only).
 
 ### Phase 2 review (2026-10-19)
 
@@ -1181,6 +1260,33 @@ section of the spec was brought back in line with the code: every `kdl` example 
   `hyprlock-to-kdl` writes the `text-shadow` node (`shadow_passes 0` is none). **Ring shadows are
   dropped from scope**: hyprlock applies SHADOWABLE to shape, image, input-field and label only
   and has no ring widget, and swaylock's ring has no shadow.
+
+- `background`/`image` `reload-ms`, `reload-cmd` and `crossfade-ms` (see "Reloading" under
+  `background`): `src/reload.rs` runs the command on `commands::Runner` (its own channel, like
+  `labels.rs`) and decodes on a thread per request (`render::background::decode_for_reload`:
+  header check, `image::Limits`, scaled down to the outputs, premultiplied ARGB that
+  `Image::from_decoded` wraps without a copy). The pictures and a generation counter per widget
+  live in `Reload`, passed to `draw` in `Dynamic`; a changed generation re-renders the cached
+  texture (the image arm's clipped texture, the background's blur and fit). A new picture is a
+  trial: each surface reports whether it rendered it (`Surface::trials`), and `Reload::settle`
+  after the frame keeps it or drops it, in which case the old picture comes back (re-rendered on
+  an output that had drawn the failed one). The crossfade keeps the old texture in
+  `Cached::Background` and draws it opaque under the new one at alpha `elapsed / crossfade-ms`;
+  `field_animating` covers it, so the redraw ticker runs and an unlock never waits for it. A
+  picture decoded during it is held, the widget stays pending, and a timer at the fade's end
+  puts it on trial. `hyprlock-to-kdl` maps `reload_time` (seconds, to ms; -1 is off),
+  `reload_cmd` and `crossfade_time` (note: hyprlock itself ignores it), and warns for the
+  combinations hyprlock never acts on. e2e test `reload`: command, SIGUSR2-only, image mtime,
+  crossfade samples, failures (corrupt file, empty output), unlock with a slow command running
+  (its process group is gone afterwards). e2e test `reload-keep` (review round 2): an image
+  reload that decodes but is over the GPU texture limit keeps the old picture and warns once; a
+  144-megapixel PNG of a few hundred KB is refused from its header (peak RSS stays about 120 MB
+  instead of over 1 GB); a 2000x1000 picture is scaled to 480x240 for a 320x240 output; a reload
+  during a crossfade waits for it. SIGUSR1 latency right at the handoff (release build,
+  llvmpipe, baseline about 60 ms) was 281 ms for an 8000x8000 picture and 1.4 s for 22000x22000
+  (main-thread copy and cairo scale of the full picture); now 59 to 65 ms from 1000 to 8000 px,
+  and larger pictures are refused. Under `ulimit -v 3000000` a 16000x16000 grey PNG aborted the
+  locker after lock; now it is refused with a peak RSS of about 110 MB.
 
 ## Phase 1 findings (2026-10-19)
 

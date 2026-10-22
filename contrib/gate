@@ -1,38 +1,82 @@
 #!/usr/bin/env bash
-# The local and CI gate. Run inside the dev container (needs sway, wtype, grim, pam-devel).
+# The local and CI gate. Run inside the dev container (needs sway, wtype, grim, pam-devel, and
+# python3-pytest, python3-pytest-xdist, python3-pytest-timeout).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-cargo +nightly fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo clippy --all-targets --features test-auth -- -D warnings
-cargo test
-contrib/test-real-pam
-cargo build --features test-auth
-SWAYWARDLOCK=target/debug/swaywardlock python3 contrib/test-swaylock-to-kdl.py
-SWAYWARDLOCK=target/debug/swaywardlock python3 contrib/test-hyprlock-to-kdl.py
-python3 contrib/check-man target/debug/swaywardlock
-# The KDL snippets in the README and the man page are what users paste into their config.
-python3 contrib/check-doc-kdl target/debug/swaywardlock
-contrib/test-try-lock
-# completions must not read the config: they have to work with a broken one.
-for shell in bash zsh; do
-    SWAYWARDLOCK_CONFIG=<(echo "garbage {") target/debug/swaywardlock completions "$shell" > /dev/null
-done
-contrib/e2e-sway target/debug/swaywardlock
+mode=${1:---both}
+if [ "$#" -gt 1 ]; then
+    echo "usage: contrib/gate [--fast|--slow] (default: both)" >&2
+    exit 2
+fi
+case "$mode" in
+    --fast|--slow|--both) ;;
+    *) echo "usage: contrib/gate [--fast|--slow] (default: both)" >&2; exit 2 ;;
+esac
 
-# A release build must never contain the test-auth backdoor or its test hooks.
-cargo build --release
-if grep -q swaywardlock-test target/release/swaywardlock; then
-    echo "FAIL release build contains the test-auth password" >&2
-    exit 1
+# Never inherit a target shared with another workspace. Keep normal-auth tests,
+# test-auth executables and release artifacts separate; try-lock expects target/debug.
+export CARGO_TARGET_DIR="$PWD/target"
+normal_target="$PWD/target/gate-normal"
+release_target="$PWD/target/gate-release"
+bin="$CARGO_TARGET_DIR/debug/swaywardlock"
+release_bin="$release_target/release/swaywardlock"
+
+step() {
+    local name=$1
+    shift
+    echo "gate: $name"
+    # A subshell EXIT trap times failures too, without disabling errexit inside
+    # shell functions or replacing the command's exit status.
+    (
+        start=$(date +%s%N)
+        trap 'rc=$?; end=$(date +%s%N); printf "gate timing: %s %d ms (exit %d)\n" "$name" "$(( (end - start) / 1000000 ))" "$rc"; exit "$rc"' EXIT
+        "$@"
+    )
+}
+
+completions() {
+    local shell=$1
+    # completions must not read the config: they have to work with a broken one.
+    SWAYWARDLOCK_CONFIG=<(echo "garbage {") "$bin" completions "$shell" > /dev/null
+}
+
+release_scan() {
+    if grep -q "$1" "$release_bin"; then
+        echo "FAIL release build contains $2" >&2
+        exit 1
+    fi
+}
+
+if [ "$mode" != --slow ]; then
+    step fmt cargo +nightly fmt --check
+    step clippy-default env CARGO_TARGET_DIR="$normal_target" cargo clippy --all-targets -- -D warnings
+    step clippy-test-auth cargo clippy --all-targets --features test-auth -- -D warnings
+    step test-default env CARGO_TARGET_DIR="$normal_target" cargo test
+    step build-test-auth-fast cargo build --features test-auth
+    step swaylock-converter env SWAYWARDLOCK="$bin" python3 contrib/test-swaylock-to-kdl.py
+    step hyprlock-converter env SWAYWARDLOCK="$bin" python3 contrib/test-hyprlock-to-kdl.py
+    step man python3 contrib/check-man "$bin"
+    # README, USING and man-page KDL snippets are what users paste into their config.
+    step doc-kdl python3 contrib/check-doc-kdl "$bin"
+    # The release metadata (version, tag, PKGBUILD, spec) must agree.
+    step release-metadata contrib/test-release-consistency
+    step completions-bash completions bash
+    step completions-zsh completions zsh
 fi
-if grep -q SWAYWARDLOCK_TEST_SCREENCOPY target/release/swaywardlock; then
-    echo "FAIL release build contains the screencopy test hook" >&2
-    exit 1
+
+if [ "$mode" != --fast ]; then
+    step real-pam env CARGO_TARGET_DIR="$normal_target" contrib/test-real-pam
+    # Slow works on its own; in the default sequential run this is usually warm.
+    step build-test-auth-slow cargo build --features test-auth
+    # Retain CI's per-harness timeout protection, not a five-minute build timeout.
+    step try-lock timeout 5m contrib/test-try-lock
+    step e2e-pytest env -u PYTEST_ADDOPTS timeout 5m python3 -m pytest tests/e2e -n "${E2E_JOBS:-auto}" --timeout 60 --swaywardlock "$bin"
+    # A default-feature release must contain neither the backdoor nor its hooks.
+    step build-release env CARGO_TARGET_DIR="$release_target" cargo build --release
+    step release-password release_scan swaywardlock-test 'the test-auth password'
+    step release-screencopy release_scan SWAYWARDLOCK_TEST_SCREENCOPY 'the screencopy test hook'
+    step release-auth-delay release_scan SWAYWARDLOCK_TEST_AUTH_DELAY_MS 'the auth delay test hook'
 fi
-if grep -q SWAYWARDLOCK_TEST_AUTH_DELAY_MS target/release/swaywardlock; then
-    echo "FAIL release build contains the auth delay test hook" >&2
-    exit 1
-fi
-echo "gate: ok"
+
+echo "gate: $mode ok (see output for privileged or scdoc skips)"

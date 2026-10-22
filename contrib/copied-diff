@@ -27,6 +27,10 @@ FILES=(
     src/render/texture.rs:src/render_helpers/texture.rs:trimmed
     src/render/solid_color.rs:src/render_helpers/solid_color.rs:verbatim
     src/render/blur.rs:src/render_helpers/blur.rs:trimmed
+    contrib/package-version:contrib/package-version:verbatim
+    contrib/check-release-consistency:contrib/check-release-consistency:trimmed
+    contrib/test-release-consistency:contrib/test-release-consistency:trimmed
+    contrib/build-deb:contrib/build-deb:trimmed
     src/render/shaders/blur.vert:src/render_helpers/shaders/blur.vert:verbatim
     src/render/shaders/blur_down.frag:src/render_helpers/shaders/blur_down.frag:verbatim
     src/render/shaders/blur_up.frag:src/render_helpers/shaders/blur_up.frag:verbatim

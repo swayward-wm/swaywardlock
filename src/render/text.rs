@@ -132,6 +132,28 @@ pub fn strip_nul(s: &str) -> Cow<'_, str> {
 }
 
 #[cfg(test)]
+/// Whether Pango can load any font. Without one (a bare container) the tests that measure or
+/// draw text cannot pass, so they skip with a message instead of failing for a reason that is
+/// not in the code. The packages and CI jobs declare a font (ttf-liberation, fonts-liberation,
+/// liberation-sans-fonts), so they do run there.
+pub(crate) fn fonts_available(test: &str) -> bool {
+    use pango::prelude::FontMapExt;
+    // Pango lists the virtual families (Sans, Serif, Monospace) even with no font behind them,
+    // so ask it to load one.
+    let map = pangocairo::FontMap::default();
+    let any = map
+        .load_font(
+            &map.create_context(),
+            &pango::FontDescription::from_string("Sans 12"),
+        )
+        .is_some();
+    if !any {
+        eprintln!("SKIPPED {test}: no font installed (install ttf-liberation or equivalent)");
+    }
+    any
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -154,6 +176,9 @@ mod tests {
     /// Text over the GPU texture limit is refused before cairo allocates it.
     #[test]
     fn text_over_the_texture_limit_is_refused() {
+        if !fonts_available("text_over_the_texture_limit_is_refused") {
+            return;
+        }
         let c = Color::from_rgba8_unpremul(255, 255, 255, 255);
         let err = render("WWWW", "Sans 20000", c, TextAlign::Left, false, 1.).unwrap_err();
         assert!(err.to_string().contains("texture limit"), "{err}");
@@ -260,6 +285,9 @@ mod tests {
 
     #[test]
     fn scale_doubles_the_size_and_markup_falls_back() {
+        if !fonts_available("scale_doubles_the_size_and_markup_falls_back") {
+            return;
+        }
         let c = Color::from_rgba8_unpremul(255, 255, 255, 255);
         let a = render("Hello", "Sans 20", c, TextAlign::Left, true, 1.)
             .unwrap()

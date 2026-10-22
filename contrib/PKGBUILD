@@ -1,24 +1,33 @@
 # Maintainer: Martin Trojer <martin.trojer@gmail.com>
 #
-# Reference PKGBUILD, in the style of swayward's. There is no release tag yet, so for now it
-# builds the checkout it sits in (contrib/..), not a downloaded tarball: run makepkg in this
-# directory of a git checkout. Build and lint it with an Arch container:
+# Reference PKGBUILD, in the style of swayward's. Two modes:
+#
+# - Release (the default): downloads the tag tarball swaywardlock-v$_tagver from GitHub, which
+#   unpacks to <repo>-<tag>/ (swaywardlock-swaywardlock-v$_tagver/; GitHub drops only a leading
+#   "v" of the tag). The release workflow's build-arch job rewrites pkgver and _tagver for the
+#   version being released, packs `git archive HEAD` under that same top directory as the tarball
+#   and swaps source= for that local file (the only change), then builds and lints the package
+#   with namcap. contrib/check-release-consistency keeps pkgver, _tagver and the source line in
+#   step with Cargo.toml.
+# - Development: SWAYWARDLOCK_LOCAL=1 builds the checkout this file sits in (contrib/..), not a
+#   download. Run makepkg in this directory of a git checkout. Build and lint it with an Arch
+#   container:
 #
 #   distrobox create --name arch-pkg --image docker.io/library/archlinux:latest
 #   distrobox enter arch-pkg -- bash -lc 'sudo pacman -S --needed base-devel namcap scdoc'
-#   cd contrib && BUILDDIR=/tmp/swl-build PKGDEST=/tmp/swl-build makepkg -sf && namcap PKGBUILD /tmp/swl-build/*.pkg.tar.zst
+#   cd contrib && SWAYWARDLOCK_LOCAL=1 BUILDDIR=/tmp/swl-build PKGDEST=/tmp/swl-build makepkg -sf && namcap PKGBUILD /tmp/swl-build/*.pkg.tar.zst
 #
 # makepkg's src/ and pkg/ (with the cargo target dir, ~2.5 GB) and the packages land in contrib/
 # unless BUILDDIR and PKGDEST say otherwise; .gitignore covers them, but a /tmp BUILDDIR keeps
 # the checkout clean.
 #
-# To publish a release: tag it, replace source=() and the _root lines with the tag tarball
-# ("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz", and cd "$pkgname-$pkgver"
-# in each function), and set a real sha256sum. Publishing needs an AUR account with an SSH key; see
-# https://wiki.archlinux.org/title/AUR_submission_guidelines
+# Publishing to the AUR needs an account with an SSH key; see
+# https://wiki.archlinux.org/title/AUR_submission_guidelines. There is no AUR package yet: it
+# waits until the release packages have survived real installations.
 
 pkgname=swaywardlock
 pkgver=0.1.0
+_tagver=0.1.0
 pkgrel=1
 pkgdesc="Screen locker for the swayward-wm family (ext-session-lock-v1, hyprlock-style widgets)"
 arch=('x86_64' 'aarch64')
@@ -33,7 +42,7 @@ depends=(
   'pam'
   'pango'
   # Owns /etc/pam.d/login, which the shipped /etc/pam.d/swaywardlock includes.
-  # Without it every password fails and only SIGUSR1 unlocks.
+  # Without it passwords fail; SIGUSR1, fingerprint or enabled grace can still unlock.
   'util-linux'
   'python'        # swaywardlock-swaylock-to-kdl, swaywardlock-hyprlock-to-kdl
   # Not linked at build time (wayland-backend and wayland-egl dlopen
@@ -47,23 +56,45 @@ makedepends=(
   'scdoc'
 )
 
-# The checkout this file is in. Nothing is downloaded; cargo builds in $srcdir/target, which is
+# check() draws text, and the unit tests that measure it need a font to load. Liberation Sans is
+# the font they are verified with (DejaVu alone is not enough for one of them).
+checkdepends=(
+  'ttf-liberation'
+)
+
+# Release mode downloads the tag tarball. The release workflow rewrites this line, so keep it as
+# it is (contrib/check-release-consistency matches it exactly). Development mode builds the
+# checkout this file is in: nothing is downloaded, and cargo builds in $srcdir/target, which is
 # contrib/src/target unless BUILDDIR is set (ignored by git either way).
-source=()
-sha256sums=()
-_root=$(realpath "$(dirname "${BASH_SOURCE[0]}")/..")
+if [ -n "${SWAYWARDLOCK_LOCAL:-}" ]; then
+  source=()
+  sha256sums=()
+else
+  source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/swaywardlock-v$_tagver.tar.gz")
+  sha256sums=('SKIP')
+fi
+# The tree to build. Development mode resolves it now, while makepkg still sits in the directory of
+# this file; the functions below run in $srcdir.
+if [ -n "${SWAYWARDLOCK_LOCAL:-}" ]; then
+  _root=$(realpath "$(dirname "${BASH_SOURCE[0]}")/..")
+fi
+_tree() {
+  # GitHub's tag tarball unpacks to <repo>-<tag>; the repository and the package are both
+  # swaywardlock. contrib/test-release-consistency keeps the release workflow's archive prefix equal.
+  echo "${_root:-$srcdir/$pkgname-$pkgname-v$_tagver}"
+}
 backup=('etc/pam.d/swaywardlock')
 
 prepare() {
-  [ -f "$_root/Cargo.toml" ] || { echo "run makepkg from contrib/ in a swaywardlock checkout" >&2; return 1; }
-  cd "$_root"
+  cd "$(_tree)"
+  [ -f Cargo.toml ] || { echo "no swaywardlock tree at $PWD (SWAYWARDLOCK_LOCAL=1: run makepkg from contrib/ in a checkout)" >&2; return 1; }
   export RUSTUP_TOOLCHAIN=stable
   export CARGO_TARGET_DIR="$srcdir/target"
   cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
 }
 
 build() {
-  cd "$_root"
+  cd "$(_tree)"
   export RUSTUP_TOOLCHAIN=stable
   export CARGO_TARGET_DIR="$srcdir/target"
   # No --features test-auth: that feature replaces PAM with a fixed password.
@@ -77,16 +108,16 @@ build() {
 }
 
 check() {
-  cd "$_root"
+  cd "$(_tree)"
   export RUSTUP_TOOLCHAIN=stable
   export CARGO_TARGET_DIR="$srcdir/target"
-  # The headless-sway end-to-end suite (contrib/e2e-sway) needs a compositor,
+  # The headless-sway end-to-end suite (tests/e2e) needs a compositor,
   # so run the Rust tests only.
   cargo test --frozen --release
 }
 
 package() {
-  cd "$_root"
+  cd "$(_tree)"
 
   install -Dm755 "$srcdir/target/release/swaywardlock" "$pkgdir/usr/bin/swaywardlock"
   # The config translators are useless from a source checkout nobody has after
@@ -112,5 +143,9 @@ package() {
   install -Dm644 -t "$pkgdir/usr/share/doc/$pkgname/examples" examples/*.kdl
   install -Dm644 -t "$pkgdir/usr/share/doc/$pkgname/specs" docs/specs/*.md
   install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dm644 docs/USING.md "$pkgdir/usr/share/doc/$pkgname/docs/USING.md"
+  install -Dm644 docs/screenshots/README.md "$pkgdir/usr/share/doc/$pkgname/docs/screenshots/README.md"
+  # Keep README/USING repository links, and the man page's existing specs path.
+  ln -s ../specs "$pkgdir/usr/share/doc/$pkgname/docs/specs"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

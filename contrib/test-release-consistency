@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# Prove that the release metadata checker accepts this tree and rejects drift.
+
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
+./contrib/check-release-consistency "swaywardlock-v$version"
+
+! grep -q '^\[package.metadata\.\(generate-rpm\|deb\)\]' Cargo.toml
+grep -q '^Requires:       /etc/pam.d/login$' swaywardlock.spec.rpkg
+grep -q '^Depends: .*login' contrib/build-deb
+
+# The Arch release build packs its source with the top directory GitHub gives a tag tarball
+# (<repo>-<tag>) and the PKGBUILD's release mode cds into that same name, so what the workflow
+# builds is what a user's download is.
+grep -qF -- '--prefix="swaywardlock-swaywardlock-v$RELEASE_VERSION/"' .github/workflows/release.yml
+grep -qF -- 'echo "${_root:-$srcdir/$pkgname-$pkgname-v$_tagver}"' contrib/PKGBUILD
+
+# Every package declares the font the text unit tests need.
+grep -q "^  'ttf-liberation'" contrib/PKGBUILD
+grep -q '^BuildRequires:  liberation-sans-fonts$' swaywardlock.spec.rpkg
+grep -q 'fonts-liberation' .github/workflows/release.yml
+grep -q 'liberation-sans-fonts' .github/workflows/ci.yml
+
+test "$(./contrib/package-version debian 26.10.0-beta.1)" = '26.10.0~beta.1'
+test "$(./contrib/package-version rpm 26.10.0-beta.1)" = '26.10.0~beta.1'
+test "$(./contrib/package-version arch 26.10.0-beta.1)" = '26.10.0beta1'
+if command -v dpkg >/dev/null; then
+    dpkg --compare-versions "$(./contrib/package-version debian 26.10.0-beta.1)" lt 26.10.0
+fi
+
+root=$(mktemp -d)
+trap 'rm -rf "$root"' EXIT
+mkdir -p "$root/contrib"
+cp Cargo.toml Cargo.lock swaywardlock.spec.rpkg "$root/"
+cp contrib/PKGBUILD contrib/package-version "$root/contrib/"
+
+python3 - "$root/contrib/PKGBUILD" <<'PY'
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+text = path.read_text()
+text, count = re.subn(r"^pkgver=\S+$", "pkgver=99.0.0", text, count=1, flags=re.MULTILINE)
+assert count == 1
+path.write_text(text)
+PY
+
+if ./contrib/check-release-consistency --root "$root" >/dev/null 2>"$root/error"; then
+    echo "test-release-consistency: checker accepted a mismatched PKGBUILD" >&2
+    exit 1
+fi
+arch_version=$(./contrib/package-version arch "$version")
+grep -q "contrib/PKGBUILD: pkgver is '99.0.0'; expected '$arch_version'" "$root/error"
+echo "deliberate PKGBUILD mismatch rejected"
+
+if ./contrib/check-release-consistency "swaywardlock-v99.0.0" >/dev/null 2>"$root/error"; then
+    echo "test-release-consistency: checker accepted a wrong release tag" >&2
+    exit 1
+fi
+grep -q "release tag is 'swaywardlock-v99.0.0'; expected 'swaywardlock-v$version'" "$root/error"
+echo "deliberate release tag mismatch rejected"

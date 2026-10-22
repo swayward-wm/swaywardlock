@@ -1,0 +1,404 @@
+name: Prepare release
+
+# Drafts a release; it never publishes one. Running it (tagging, dispatching, and
+# publishing the draft) stays with a human. Modelled on swayward's release
+# workflow: same job names, same file names, same checks, trimmed to what
+# swaywardlock ships.
+#
+# Dispatch it from the tag: the validate job fails unless GITHUB_REF is
+# refs/tags/swaywardlock-v<version>.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Public version, without the leading v'
+        required: true
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          show-progress: false
+      - name: Validate release metadata
+        env:
+          VERSION: ${{ github.event.inputs.version }}
+        run: |
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]
+          test "$GITHUB_REF" = "refs/tags/swaywardlock-v$VERSION"
+          ./contrib/check-release-consistency "swaywardlock-v$VERSION"
+
+  build-ubuntu:
+    needs: validate
+    # Ubuntu 24.04 is the oldest runner worth building on: glibc is forward
+    # compatible only, so the build machine's glibc becomes every user's floor.
+    # swaywardlock links glibc, libpam, pango, cairo, glib and libxkbcommon
+    # dynamically and dlopens libwayland-client, libwayland-egl and libEGL, so
+    # this artifact targets Ubuntu 24.04 and its derivatives, the same
+    # statement swayward makes. Other distributions get their own package
+    # below, or build from source.
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          show-progress: false
+
+      - name: Install dependencies
+        run: |
+          # scdoc compiles the man page; libgl1-mesa-dri and libegl1 let the
+          # unit tests that make an EGL context run; fonts-liberation is the font
+          # the text-measuring unit tests are verified with (the runner image
+          # has fonts, a bare container does not, so declare it).
+          sudo apt-get update -y
+          sudo apt-get install -y curl gcc clang pkg-config scdoc python3 \
+            libpam0g-dev libwayland-dev libxkbcommon-dev \
+            libegl1-mesa-dev libgbm-dev libgl1-mesa-dri \
+            libpango1.0-dev libcairo2-dev libglib2.0-dev fonts-liberation
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Create vendored dependencies archive
+        run: |
+          mkdir .cargo
+          cargo vendor --locked > .cargo/config.toml
+          tar cJf swaywardlock-${{ github.event.inputs.version }}-vendored-dependencies.tar.xz vendor .cargo
+
+      - name: Build
+        # No --features test-auth: that feature replaces PAM with a fixed
+        # password. The vendored sources are used, so a missing vendor entry
+        # fails here rather than at a user's build.
+        run: cargo build --frozen --release
+
+      - name: Test
+        run: cargo test --frozen --release -- --nocapture
+
+      - name: Check the binary has no test hooks
+        # The packaged binary must contain neither the test-auth password nor
+        # any SWAYWARDLOCK_TEST_ hook string. contrib/gate checks the same on
+        # every change; this is the check on the exact binary being shipped.
+        run: |
+          set -eu
+          for needle in swaywardlock-test SWAYWARDLOCK_TEST_; do
+            count=$(grep --text --count "$needle" target/release/swaywardlock || true)
+            test "$count" = 0 || { echo "::error::release binary contains $needle"; exit 1; }
+          done
+
+      - name: Stage the binary tarball
+        run: |
+          set -eux
+          version=${{ github.event.inputs.version }}
+          # Named for the distribution it was built on, not "linux-gnu": the
+          # glibc floor and the library sonames are Ubuntu 24.04's.
+          stage=swaywardlock-$version-ubuntu24.04-x86_64
+          mkdir -p "$stage"/{bin,share}
+
+          install -Dm755 target/release/swaywardlock "$stage/bin/swaywardlock"
+          install -Dm755 contrib/swaylock-to-kdl "$stage/bin/swaywardlock-swaylock-to-kdl"
+          install -Dm755 contrib/hyprlock-to-kdl "$stage/bin/swaywardlock-hyprlock-to-kdl"
+
+          install -Dm644 pam/swaywardlock "$stage/share/pam.d/swaywardlock"
+          scdoc < docs/swaywardlock.1.scd > "$stage/share/swaywardlock.1"
+          install -Dm644 -t "$stage/share/examples" examples/*.kdl
+          install -Dm644 LICENSE "$stage/LICENSE"
+
+          # Record what the binary actually needs, measured rather than
+          # guessed, so an installer can check before unpacking.
+          {
+            echo "swaywardlock $version, x86_64, dynamically linked against the system libraries."
+            echo
+            echo "Minimum glibc: $(objdump -T target/release/swaywardlock |
+              grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -uV | tail -1)"
+            echo
+            echo "Built on Ubuntu 24.04. TARGETS UBUNTU 24.04 AND ITS DERIVATIVES."
+            echo "On other distributions use the package for it, or build from source."
+            echo
+            echo "This build is not self-contained. On Ubuntu 24.04:"
+            echo
+            echo "  apt install libpam0g libxkbcommon0 libpango-1.0-0 libpangocairo-1.0-0 \\"
+            echo "              libcairo2 libglib2.0-0t64 libwayland-client0 libwayland-egl1 \\"
+            echo "              libegl1 libgl1-mesa-dri login python3"
+            echo
+            echo "Install share/pam.d/swaywardlock as /etc/pam.d/swaywardlock (as root)."
+            echo "swaywardlock refuses to lock without it, and without 'login' (which"
+            echo "owns /etc/pam.d/login, included by that file) every password fails."
+            echo "The man page is share/swaywardlock.1; the examples are in share/examples."
+            echo "The Ubuntu .deb does all of this for you."
+          } > "$stage/RUNTIME.txt"
+          install -Dm644 README.md "$stage/README.md"
+          install -Dm644 docs/USING.md "$stage/docs/USING.md"
+          install -Dm644 docs/screenshots/README.md "$stage/docs/screenshots/README.md"
+          # The tarball still omits design documents; point those links at the exact tag.
+          python3 - "$stage" "$version" <<'PY'
+          import pathlib
+          import sys
+
+          stage = pathlib.Path(sys.argv[1])
+          base = f"https://github.com/swayward-wm/swaywardlock/blob/swaywardlock-v{sys.argv[2]}/docs/specs/"
+          for name, prefix in (("README.md", "docs/specs/"), ("docs/USING.md", "specs/")):
+              path = stage / name
+              path.write_text(path.read_text().replace(f"]({prefix}", f"]({base}"))
+          PY
+          echo "Usage and gate reference: docs/USING.md; design links go to the tag online." >> "$stage/RUNTIME.txt"
+
+          tar czf "$stage.tar.gz" "$stage"
+          sha256sum "$stage.tar.gz" > "$stage.tar.gz.sha256"
+
+      - name: Build Debian package
+        run: ./contrib/build-deb '${{ github.event.inputs.version }}'
+
+      - name: Upload Ubuntu artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ubuntu-artifacts
+          path: |
+            swaywardlock-${{ github.event.inputs.version }}-vendored-dependencies.tar.xz
+            swaywardlock-${{ github.event.inputs.version }}-ubuntu24.04-x86_64.tar.gz
+            swaywardlock-${{ github.event.inputs.version }}-ubuntu24.04-x86_64.tar.gz.sha256
+            swaywardlock_${{ github.event.inputs.version }}_amd64.deb
+          if-no-files-found: error
+
+  verify-ubuntu:
+    needs: build-ubuntu
+    runs-on: ubuntu-24.04
+    steps:
+      # The tree is needed for the files the package must match byte for byte
+      # (pam/swaywardlock) and the checks themselves (contrib/verify-installed).
+      - uses: actions/checkout@v6
+        with:
+          show-progress: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: ubuntu-artifacts
+          path: artifact
+      - name: Verify tarball checksum
+        working-directory: artifact
+        run: sha256sum -c swaywardlock-${{ github.event.inputs.version }}-ubuntu24.04-x86_64.tar.gz.sha256
+      - name: Install the Debian package
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y ./artifact/swaywardlock_${{ github.event.inputs.version }}_amd64.deb
+      - name: The PAM file is a conffile
+        run: dpkg-query --show --showformat='${Conffiles}\n' swaywardlock | grep --fixed-strings '/etc/pam.d/swaywardlock '
+      - name: Execute the installed package
+        run: ./contrib/verify-installed ${{ github.event.inputs.version }}
+      - name: Execute the tarball
+        run: |
+          tar xzf artifact/swaywardlock-${{ github.event.inputs.version }}-ubuntu24.04-x86_64.tar.gz
+          stage=./swaywardlock-${{ github.event.inputs.version }}-ubuntu24.04-x86_64
+          "$stage/bin/swaywardlock" --version
+          cmp "$stage/share/pam.d/swaywardlock" pam/swaywardlock
+          test -s "$stage/docs/USING.md"
+          cmp "$stage/docs/screenshots/README.md" docs/screenshots/README.md
+          grep -F ']('"https://github.com/swayward-wm/swaywardlock/blob/swaywardlock-v${{ github.event.inputs.version }}/docs/specs/" "$stage/README.md" "$stage/docs/USING.md"
+          "$stage/bin/swaywardlock-swaylock-to-kdl" --help > /dev/null
+          "$stage/bin/swaywardlock-hyprlock-to-kdl" --help > /dev/null
+
+  build-rpm:
+    needs: validate
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        # Fedora supports two releases at a time. Build for both, so a package
+        # never targets an end-of-life release.
+        fedora: [43, 44]
+    container: fedora:${{ matrix.fedora }}
+    steps:
+      - name: Install RPM tooling
+        # dnf builddep below installs the spec's BuildRequires, which include
+        # liberation-sans-fonts for the unit tests in %check.
+        run: dnf install -y rpkg rpm-build dnf-plugins-core git-core
+      - name: Build RPM
+        env:
+          RELEASE_VERSION: ${{ github.event.inputs.version }}
+          FEDORA_RELEASE: ${{ matrix.fedora }}
+        run: |
+          # rpkg requires an ordinary Git top-level. GitHub's container checkout
+          # is mounted under aliases that rpkg rejects even though Git accepts
+          # them, so clone the exact workflow SHA into the container filesystem.
+          repo=/tmp/swaywardlock-rpm-source
+          git clone --no-checkout \
+            "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" "$repo"
+          git -C "$repo" fetch --depth=1 origin "$GITHUB_SHA"
+          git -C "$repo" checkout --detach FETCH_HEAD
+          cd "$repo"
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import subprocess
+
+          path = pathlib.Path("swaywardlock.spec.rpkg")
+          text = path.read_text()
+          version = subprocess.check_output(
+              ["./contrib/package-version", "rpm", os.environ["RELEASE_VERSION"]],
+              text=True,
+          ).strip()
+          old = "%global version {{{ git_dir_version }}}"
+          assert old in text
+          path.write_text(text.replace(old, f"%global version {version}", 1))
+          PY
+          spec=$(rpkg --path "$repo" spec --spec swaywardlock.spec.rpkg | sed -n 's/^Wrote: //p')
+          test -f "$spec"
+          dnf builddep -y "$spec"
+          mkdir -p "$RUNNER_TEMP/rpm"
+          rpkg --path "$repo" local --spec swaywardlock.spec.rpkg --nocheck \
+            --outdir "$RUNNER_TEMP/rpm"
+          rpm=$(find "$RUNNER_TEMP/rpm" -name 'swaywardlock-*.x86_64.rpm' \
+            ! -name '*-debuginfo-*' -print -quit)
+          test -n "$rpm"
+          cp "$rpm" \
+            "$GITHUB_WORKSPACE/swaywardlock-$RELEASE_VERSION-fedora$FEDORA_RELEASE-x86_64.rpm"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: rpm-artifact-fedora${{ matrix.fedora }}
+          path: swaywardlock-${{ github.event.inputs.version }}-fedora${{ matrix.fedora }}-x86_64.rpm
+          if-no-files-found: error
+
+  verify-rpm:
+    needs: build-rpm
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        fedora: [43, 44]
+    container: fedora:${{ matrix.fedora }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          show-progress: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: rpm-artifact-fedora${{ matrix.fedora }}
+          path: artifact
+      - name: Install RPM
+        # The fedora container image sets tsflags=nodocs, which would leave out
+        # the examples and the man page that the checks below look for. diffutils
+        # is for cmp, which the stock image lacks.
+        run: dnf install -y --setopt=install_weak_deps=False --setopt=tsflags= artifact/*.rpm diffutils
+      - name: The PAM file is a config file
+        run: rpm -qc swaywardlock | grep --line-regexp '/etc/pam.d/swaywardlock'
+      - name: Execute the installed package
+        run: ./contrib/verify-installed ${{ github.event.inputs.version }}
+
+  build-arch:
+    needs: validate
+    runs-on: ubuntu-24.04
+    container: archlinux:latest
+    steps:
+      # Install Git before checkout. Otherwise actions/checkout falls back to a
+      # REST archive, and the exact-SHA source tarball cannot be produced.
+      - name: Install Arch build dependencies
+        run: |
+          # ttf-liberation is the PKGBUILD's checkdepends (the unit tests in check()
+          # need a font); makepkg runs with --nodeps, so install it here.
+          pacman -Syu --needed --noconfirm base-devel namcap cargo git scdoc \
+            cairo glib2 libxkbcommon mesa pam pango python util-linux wayland \
+            ttf-liberation
+      - uses: actions/checkout@v6
+        with:
+          show-progress: false
+      - name: Build and lint Arch package
+        env:
+          RELEASE_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          cd "$GITHUB_WORKSPACE"
+          pkg_version=$(./contrib/package-version arch "$RELEASE_VERSION")
+          # The same layout GitHub's tag tarball has: the top directory is
+          # <repo>-<tag>, swaywardlock-swaywardlock-v<version>. The PKGBUILD's
+          # release mode finds the tree by that name, so a path that works here
+          # works for a user's download. (contrib/test-release-consistency keeps
+          # the two in step.)
+          git archive --format=tar.gz \
+            --prefix="swaywardlock-swaywardlock-v$RELEASE_VERSION/" HEAD \
+            > "contrib/swaywardlock-$pkg_version.tar.gz"
+          python3 - "$pkg_version" <<'PY'
+          import os
+          import pathlib
+          import re
+          import sys
+
+          path = pathlib.Path("contrib/PKGBUILD")
+          text = path.read_text()
+          text, pkgver_count = re.subn(
+              r"^pkgver=\S+$", f"pkgver={sys.argv[1]}", text,
+              count=1, flags=re.MULTILINE,
+          )
+          text, tagver_count = re.subn(
+              r"^_tagver=\S+$", f"_tagver={os.environ['RELEASE_VERSION']}", text,
+              count=1, flags=re.MULTILINE,
+          )
+          assert pkgver_count == tagver_count == 1
+          source = 'source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/swaywardlock-v$_tagver.tar.gz")'
+          assert source in text
+          path.write_text(text.replace(source, 'source=("$pkgname-$pkgver.tar.gz")', 1))
+          PY
+          useradd -m builder
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+          runuser -u builder -- bash -lc \
+            "cd '$GITHUB_WORKSPACE/contrib' && makepkg --nodeps --noconfirm"
+          package=$(find contrib -maxdepth 1 -name 'swaywardlock-*.pkg.tar.zst' \
+            ! -name '*-debug-*' -print -quit)
+          test -n "$package"
+          namcap_output=$(namcap contrib/PKGBUILD "$package" || true)
+          printf '%s\n' "$namcap_output"
+          # A namcap error (' E:') fails the build; warnings do not.
+          if grep -q ' E:' <<<"$namcap_output"; then exit 1; fi
+          cp "$package" "swaywardlock-$RELEASE_VERSION-arch-x86_64.pkg.tar.zst"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: arch-artifact
+          path: swaywardlock-${{ github.event.inputs.version }}-arch-x86_64.pkg.tar.zst
+          if-no-files-found: error
+
+  verify-arch:
+    needs: build-arch
+    runs-on: ubuntu-24.04
+    container: archlinux:latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          show-progress: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: arch-artifact
+          path: artifact
+      - name: Install Arch package
+        run: |
+          # The archlinux container image has NoExtract rules for usr/share/doc
+          # and usr/share/man, which would leave out the examples and the man
+          # page that the checks below look for.
+          sed -i '/^NoExtract/d' /etc/pacman.conf
+          pacman -Sy --noconfirm
+          # diffutils is for cmp, which the stock image lacks.
+          pacman -S --needed --noconfirm diffutils
+          pacman -U --noconfirm artifact/*.pkg.tar.zst
+      - name: The PAM file is a backup file
+        # Backup Files lists it as '/etc/pam.d/swaywardlock [unmodified]'.
+        run: pacman -Qii swaywardlock | grep --extended-regexp '^Backup Files[[:space:]]*:.*/etc/pam.d/swaywardlock \['
+      - name: Execute the installed package
+        run: ./contrib/verify-installed ${{ github.event.inputs.version }}
+
+  draft-release:
+    needs: [verify-ubuntu, verify-rpm, verify-arch]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: release-files
+          merge-multiple: true
+      - name: Draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          tag_name: swaywardlock-v${{ github.event.inputs.version }}
+          files: release-files/*
+          fail_on_unmatched_files: true

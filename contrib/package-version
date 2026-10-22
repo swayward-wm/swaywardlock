@@ -1,0 +1,23 @@
+#!/usr/bin/env python3
+"""Translate the public version into distribution package versions."""
+
+import re
+import sys
+
+
+def main() -> int:
+    if len(sys.argv) != 3 or sys.argv[1] not in {"arch", "debian", "rpm"}:
+        print("usage: package-version <arch|debian|rpm> <version>", file=sys.stderr)
+        return 2
+
+    target, version = sys.argv[1:]
+    version = version.removeprefix("v")
+    if target in {"debian", "rpm"}:
+        print(version.replace("-", "~", 1))
+    else:
+        print(re.sub(r"-([0-9A-Za-z.]+)$", lambda match: match[1].replace(".", ""), version))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

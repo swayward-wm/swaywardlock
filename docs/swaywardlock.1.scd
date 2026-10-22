@@ -214,7 +214,9 @@ _specs/2026-10-19-swaywardlock.md_ under /usr/share/doc/swaywardlock (see *SEE A
 	the lock is held until then. Wait for *--ready-fd*, or for *-f* to return, before sending it.
 
 *SIGUSR2*
-	Re-run the labels whose command is marked to refresh on this signal, *cmd[update:MS:1]*.
+	Re-run the labels whose command is marked to refresh on this signal, *cmd[update:MS:1]*,
+	and reload the picture of every *background* and *image* with *reload-ms* or *reload-cmd*.
+	A picture that fails to load or to draw keeps the old one.
 
 *SIGTERM*, *SIGINT*, *SIGHUP*
 	Keep their default action: the process ends and the compositor keeps the session locked.
@@ -248,8 +250,9 @@ _/etc/swaywardlock/config.kdl_
 	default applies.
 
 _/etc/pam.d/swaywardlock_
-	The PAM service file, _auth include login_. Packages install it and mark it as a config
-	file. Without it swaywardlock refuses to lock.
+	The PAM service file, _auth include login_. The release packages (.deb, .rpm, Arch) install
+	it and mark it as a config file, so a local edit survives an upgrade. Without it
+	swaywardlock refuses to lock.
 
 # ENVIRONMENT
 
@@ -268,6 +271,9 @@ _/etc/pam.d/swaywardlock_
 # SEE ALSO
 
 *swaylock*(1), *hyprlock*(1)
+
+Packages for Ubuntu 24.04, Fedora and Arch are on
+_https://github.com/swayward-wm/swaywardlock/releases_.
 
 Under /usr/share/doc/swaywardlock: _specs/2026-10-19-swaywardlock.md_, the design document and
 config reference; _examples/hyprlock-example.kdl_, hyprlock's sample config in swaywardlock KDL;

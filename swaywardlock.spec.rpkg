@@ -24,6 +24,9 @@
 # Convince rust-srpm-macros to use Cargo.lock with the Smithay commit.
 %global __cargo_common_opts %{?_smp_mflags} -Z avoid-dev-deps --locked
 
+# The release workflow replaces this line with the version being released (rpm spelling, from
+# contrib/package-version) before it builds, and Source below packs the exact tagged commit, so
+# a release build is the tag's tree. contrib/check-release-consistency checks the line is intact.
 %global version {{{ git_dir_version }}}
 
 Name:           swaywardlock
@@ -68,10 +71,14 @@ BuildRequires:  cargo-rpm-macros >= 26
 BuildRequires:  pam-devel
 BuildRequires:  pkgconfig(pango)
 BuildRequires:  pkgconfig(cairo)
+BuildRequires:  pkgconfig(cairo-gobject)
+BuildRequires:  pkgconfig(glib-2.0)
 BuildRequires:  wayland-devel
 BuildRequires:  pkgconfig(xkbcommon)
 BuildRequires:  mesa-libEGL-devel
 BuildRequires:  scdoc
+# %check draws text; the unit tests that measure it need a font to load.
+BuildRequires:  liberation-sans-fonts
 
 Requires:       mesa-dri-drivers
 Requires:       mesa-libEGL
@@ -82,7 +89,7 @@ Requires:       libwayland-egl
 
 # The shipped /etc/pam.d/swaywardlock includes login. rpm resolves this file
 # dependency to the owner (util-linux on Fedora, not util-linux-core). Without
-# it every password fails and only SIGUSR1 unlocks.
+# it passwords fail; SIGUSR1, fingerprint or enabled grace can still unlock.
 Requires:       /etc/pam.d/login
 
 # swaywardlock-swaylock-to-kdl and swaywardlock-hyprlock-to-kdl are Python scripts
@@ -139,9 +146,14 @@ install -Dm644 -t %{buildroot}%{bash_completions_dir} ./swaywardlock
 install -Dm644 -t %{buildroot}%{fish_completions_dir} ./swaywardlock.fish
 install -Dm644 -t %{buildroot}%{zsh_completions_dir} ./_swaywardlock
 
+install -Dm644 docs/USING.md %{buildroot}%{_docdir}/%{name}/docs/USING.md
+install -Dm644 docs/screenshots/README.md %{buildroot}%{_docdir}/%{name}/docs/screenshots/README.md
+# Keep repository links as well as the man page's existing specs path.
+ln -s ../specs %{buildroot}%{_docdir}/%{name}/docs/specs
+
 %if %{with check}
 %check
-# The headless-sway end-to-end suite (contrib/e2e-sway) needs a compositor, so run
+# The headless-sway end-to-end suite (tests/e2e) needs a compositor, so run
 # the Rust tests only.
 %cargo_test
 %endif
@@ -149,6 +161,7 @@ install -Dm644 -t %{buildroot}%{zsh_completions_dir} ./_swaywardlock
 %files
 %license LICENSE
 %doc README.md
+%doc %{_docdir}/%{name}/docs
 # The man page points at these: the examples and the design document (the config reference).
 %doc examples
 %doc docs/specs

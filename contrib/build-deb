@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# Build a .deb from an already-built release binary.
+#
+# This is deliberately a plain dpkg-deb build rather than a debhelper source
+# package. swaywardlock is not in Debian and is not seeking to be yet; the goal
+# is an installable artefact for Ubuntu users, produced by the release workflow
+# that already builds on ubuntu-24.04.
+#
+# UBUNTU 24.04 ONLY. The binary links the glibc and the pango, cairo and PAM
+# sonames Ubuntu 24.04 ships, and the package depends on the owner of
+# /etc/pam.d/login there (login). Other releases and Debian are not tested.
+# See the rationale block in .github/workflows/release.yml.
+#
+# Usage: contrib/build-deb <version> [output-dir]
+#   Expects target/release/swaywardlock to exist, built WITHOUT the test-auth
+#   feature, and scdoc installed (the man page is compiled here).
+#
+# This is a binary package without a source package, so there is no Build-Depends field. What the
+# build needs is installed by the release workflow's build-ubuntu job: besides the -dev packages
+# and scdoc, fonts-liberation, the font the unit tests (cargo test --release) are verified with.
+
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+version=${1:?usage: build-deb <version> [output-dir]}
+version=${version#v}
+deb_version=$(./contrib/package-version debian "$version")
+outdir=${2:-.}
+
+arch=$(dpkg --print-architecture 2>/dev/null || echo amd64)
+pkgdir=$(mktemp -d)
+trap 'rm -rf "$pkgdir"' EXIT
+
+if [ ! -x target/release/swaywardlock ]; then
+    echo "build-deb: target/release/swaywardlock is missing; cargo build --release first" >&2
+    exit 1
+fi
+
+install -Dm755 target/release/swaywardlock "$pkgdir/usr/bin/swaywardlock"
+# The config translators are useless from a source checkout nobody has after
+# installing a package, so ship them on PATH under namespaced names.
+install -Dm755 contrib/swaylock-to-kdl "$pkgdir/usr/bin/swaywardlock-swaylock-to-kdl"
+install -Dm755 contrib/hyprlock-to-kdl "$pkgdir/usr/bin/swaywardlock-hyprlock-to-kdl"
+
+# swaywardlock refuses to lock without this file, so it is a conffile: a local
+# edit survives upgrades, and dpkg asks before replacing it. Byte for byte the
+# file in the tree; the release workflow compares them after installing.
+install -Dm644 pam/swaywardlock "$pkgdir/etc/pam.d/swaywardlock"
+
+mkdir -p "$pkgdir/usr/share/man/man1"
+scdoc < docs/swaywardlock.1.scd > "$pkgdir/usr/share/man/man1/swaywardlock.1"
+gzip -9n "$pkgdir/usr/share/man/man1/swaywardlock.1"
+
+# The completion scripts come from the binary itself, which handles
+# `completions` before it reads any config.
+completions() {
+    ./target/release/swaywardlock completions "$1" > "$2"
+    chmod 644 "$2"
+}
+install -dm755 "$pkgdir/usr/share/bash-completion/completions" \
+    "$pkgdir/usr/share/fish/vendor_completions.d" \
+    "$pkgdir/usr/share/zsh/vendor-completions"
+completions bash "$pkgdir/usr/share/bash-completion/completions/swaywardlock"
+completions fish "$pkgdir/usr/share/fish/vendor_completions.d/swaywardlock.fish"
+completions zsh "$pkgdir/usr/share/zsh/vendor-completions/_swaywardlock"
+
+# The man page points here: the examples and the design document (the config
+# reference).
+install -Dm644 -t "$pkgdir/usr/share/doc/swaywardlock/examples" examples/*.kdl
+install -Dm644 -t "$pkgdir/usr/share/doc/swaywardlock/specs" docs/specs/*.md
+install -Dm644 README.md "$pkgdir/usr/share/doc/swaywardlock/README.md"
+install -Dm644 docs/USING.md "$pkgdir/usr/share/doc/swaywardlock/docs/USING.md"
+install -Dm644 docs/screenshots/README.md "$pkgdir/usr/share/doc/swaywardlock/docs/screenshots/README.md"
+# Keep README/USING repository links, and the man page's existing specs path.
+ln -s ../specs "$pkgdir/usr/share/doc/swaywardlock/docs/specs"
+install -Dm644 LICENSE "$pkgdir/usr/share/doc/swaywardlock/copyright"
+
+# Runtime dependencies are the libraries the binary actually links, resolved
+# from the build machine rather than guessed. Anything dlopened at runtime
+# (mesa drivers, libwayland-client, libwayland-egl) or invoked as a program
+# (python3) has to be listed by hand, because dpkg-shlibdeps cannot see either.
+shlibdeps=""
+if command -v dpkg-shlibdeps >/dev/null 2>&1; then
+    # dpkg-shlibdeps insists on running from a package root with debian/control.
+    ctldir=$(mktemp -d)
+    mkdir -p "$ctldir/debian"
+    printf 'Source: swaywardlock\n\nPackage: swaywardlock\nArchitecture: any\n' \
+        > "$ctldir/debian/control"
+    # $pkgdir is already absolute (mktemp -d), so pass it unprefixed. A path
+    # prefixed with $OLDPWD, which bash expands after the cd, never exists, and
+    # dpkg-shlibdeps then fails on every run and every .deb silently ships the
+    # hand-written fallback below. (swayward's build-deb had exactly that bug.)
+    if (cd "$ctldir" && dpkg-shlibdeps -O --ignore-missing-info \
+            "$pkgdir/usr/bin/swaywardlock" 2>/dev/null) > "$ctldir/deps"; then
+        shlibdeps=$(sed 's/^shlibs:Depends=//' "$ctldir/deps")
+    fi
+    # dpkg-shlibdeps sees only what the binary links. wayland-backend dlopens
+    # libwayland-client and wayland-egl dlopens libwayland-egl, and libEGL
+    # comes in through the mesa drivers, so none of them appears in its output
+    # and all are required at runtime.
+    if [ -n "$shlibdeps" ]; then
+        shlibdeps="$shlibdeps, libwayland-client0, libwayland-egl1, libegl1"
+    fi
+    rm -rf "$ctldir"
+fi
+
+# Fall back to the minimum set if shlibdeps was unavailable, so the package is
+# still installable rather than silently dependency-free.
+if [ -z "$shlibdeps" ]; then
+    shlibdeps="libc6, libpam0g, libxkbcommon0, libpango-1.0-0, libpangocairo-1.0-0, libcairo2, libglib2.0-0t64, libwayland-client0, libwayland-egl1, libegl1"
+fi
+
+# login owns /etc/pam.d/login on Ubuntu 24.04 (checked with dpkg -S in a clean
+# container). The shipped /etc/pam.d/swaywardlock includes it, and without it
+# passwords fail; SIGUSR1, fingerprint or enabled grace can still unlock.
+mkdir -p "$pkgdir/DEBIAN"
+cat > "$pkgdir/DEBIAN/control" <<CONTROL
+Package: swaywardlock
+Version: $deb_version
+Section: x11
+Priority: optional
+Architecture: $arch
+Maintainer: Martin Trojer <martin.trojer@gmail.com>
+Depends: $shlibdeps, login, python3, libgl1-mesa-dri
+Suggests: swayidle
+Homepage: https://github.com/swayward-wm/swaywardlock
+Description: Screen locker for the swayward-wm family
+ swaywardlock locks a Wayland session with ext-session-lock-v1, so it runs
+ on any compositor that implements the protocol. It keeps swaylock's process
+ contract (-f, --ready-fd, SIGUSR1) and aims for hyprlock's feature set:
+ blurred screenshots, labels, images, shapes, an input field, gradients,
+ animations and fingerprint unlock.
+ .
+ It is configured in KDL; the bundled swaywardlock-swaylock-to-kdl and
+ swaywardlock-hyprlock-to-kdl translate an existing swaylock or hyprlock
+ config. Passwords are checked through PAM with the service swaywardlock.
+CONTROL
+
+# Everything under /etc is a conffile by debhelper's rule; with a plain
+# dpkg-deb build it has to be listed.
+printf '/etc/pam.d/swaywardlock\n' > "$pkgdir/DEBIAN/conffiles"
+
+deb="$outdir/swaywardlock_${version}_${arch}.deb"
+dpkg-deb --build --root-owner-group "$pkgdir" "$deb" >/dev/null
+echo "$deb"

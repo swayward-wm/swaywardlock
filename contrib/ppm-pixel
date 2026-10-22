@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Test helper for contrib/e2e-sway.
+"""Image fixture and pixel helper for the headless-sway end-to-end tests.
 
     grim -t ppm - | ppm-pixel [X Y]     print the pixel at (X, Y) as "r g b" (default: centre)
     ppm-pixel --write-test-png PATH     write a 64x64 PNG, top half red, bottom half blue

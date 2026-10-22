@@ -1,119 +1,137 @@
 # swaywardlock
 
-A screen locker for the swayward-wm family, written in Rust on Smithay.
+**A screen locker for Wayland, built in Rust on Smithay. swaylock's contract, hyprlock's wardrobe.**
 
-It keeps swaylock's process contract (`-f`, `--ready-fd`, SIGUSR1), so
-swayidle and scripts keep working, and aims for hyprlock's feature set:
-blurred screenshots, labels, an input field, gradients, animations and
-fingerprint unlock. It is configured in KDL with the same colour, gradient,
-blur, shadow and animation syntax as swayward. It runs on any compositor
-with `ext-session-lock-v1`.
+> The ring got a glow-up.
 
-**Status: early.** swaylock parity and most of hyprlock's features are implemented and tested
-headless; the spec lists what is left for Phase 3. Not yet used daily on real hardware.
-Typing follows hyprlock where the two lockers differ: only Backspace and Delete repeat, and
-keys typed while a password is being checked are dropped. swaylock's control keys are kept:
-Ctrl+J, Ctrl+M and Ctrl+D submit, Ctrl+C and Ctrl+U clear (as do Escape, Ctrl+A and
-Ctrl+Backspace). The man page's KEYS section and the spec's Input section have the details.
+<!-- SCREENSHOT: the animated ring style mid-typing over a blurred screenshot (examples/swayward-ring.kdl) -->
+![PLACEHOLDER: swaywardlock's animated ring over a blurred screenshot](docs/screenshots/PLACEHOLDER-ring.png)
 
-To try it without locking your own session, `contrib/try-lock` starts a nested sway in a window
-and locks only that (password `swaywardlock-test`, or `--real-pam`; `--preview` for layout work;
-`-c FILE` for another config; `-v` for the full log). It needs `sway`, `cargo` and a Wayland
-session to open the window in. It runs inside a distrobox named `swayward-dev` when you have one,
-and otherwise right where you start it, so any machine with sway and cargo works
-(`TRY_LOCK_NATIVE=1` forces that). `--no-build` reuses an earlier build (`target/try-lock`, or
-`target/debug` built with `--features test-auth`). Closing the window, Ctrl+C or SIGTERM ends it
-and cleans up.
+swaywardlock draws a modern lock screen: blurred screenshots with vibrancy, labels and clocks,
+an input field, images, shapes, gradients, shadows, rotation, animations, a ring that glows and
+sweeps, and fingerprint unlock. It preserves swaylock's `-f`, `--ready-fd` and SIGUSR1 conventions,
+so it drops into the swayidle line you already have. See the man page for exit statuses, including status 3 for
+post-lock errors. It runs on compositors supporting `ext-session-lock-v1`, with working
+EGL/OpenGL ES.
 
-`examples/hyprlock-example.kdl` is hyprlock's sample config in swaywardlock KDL;
-`examples/swayward-ring.kdl` shows the animated ring (`ring-indicator { style "swayward"; }`).
-`contrib/swaylock-to-kdl` and `contrib/hyprlock-to-kdl` convert a swaylock or hyprlock config to
-KDL, warning about every key they cannot carry over (installed as
-`swaywardlock-swaylock-to-kdl` and `swaywardlock-hyprlock-to-kdl`). Design and config reference:
-[`docs/specs/2026-10-19-swaywardlock.md`](docs/specs/2026-10-19-swaywardlock.md); the man page
-(`man swaywardlock`) lists the config nodes too.
+The migration aids `swaywardlock-swaylock-to-kdl` and `swaywardlock-hyprlock-to-kdl`
+convert your current config to swaywardlock's and report omissions.
+
+**Status: early.** The swaylock-style process conventions and the widgets described here are
+implemented and tested headless; this is not a claim of complete hyprlock parity.
+Nobody uses it daily on real hardware yet, including the maintainer, who is mostly busy writing
+tests.
+
+## Why it exists
+
+swaylock is the dependable default: a colour or an image, and a ring. hyprlock showed what a
+lock screen can look like, with its own config language and its home on Hyprland. The shells
+(Noctalia, DankMaterialShell, the Quickshell setups) ship polished lock screens as part of the
+whole desktop.
+
+swaywardlock is for the space between: people who pick their pieces one at a time, already have
+an idle setup built around swaylock, and want the lock screen to look like this decade without
+rebuilding that setup. It belongs to the [swayward](https://github.com/swayward-wm/swayward)
+family and shares its KDL syntax for colours, gradients, blur, shadows and animations, but it is
+a standalone locker and does not need swayward.
+
+## A modern stack
+
+swaywardlock is written in Rust and renders on the GPU with OpenGL ES through
+[Smithay](https://github.com/Smithay/smithay)'s renderer, the same one under swayward and niri.
+Text is laid out by Pango, so fonts and font descriptions work the way they do in the rest of
+your desktop. It talks to the compositor through the Wayland protocols it needs and nothing
+more: `ext-session-lock-v1` to lock, fractional scale and viewporter for sharp HiDPI, and
+`ext-image-copy-capture` or wlr-screencopy for the screenshot behind the blur.
+
+The parts that touch your password are kept small and careful. The password lives in a
+fixed-size buffer that attempts `mlock` and is zeroed when cleared or dropped. Failure to lock
+memory warns but does not stop locking. PAM response copies are outside this protection, and
+abort or fatal signals do not run the buffer's destructor. PAM runs on its own thread so a slow
+PAM stack does not block the UI thread. Fingerprints go through fprintd over D-Bus, and only messages from the real fprintd are trusted. The shaders
+and the KDL vocabulary are shared with swayward, so a colour, gradient or animation means the
+same thing in your compositor config and your lock screen.
+
+## Security: what we tested
+
+A lock screen has one job. Under `ext-session-lock-v1` the compositor keeps the session locked
+even if the locker crashes. The compositor holds the lock; swaywardlock requests unlock after
+successful authentication, an explicitly enabled grace period, or SIGUSR1. We test that failures
+do not request unlock. We also test input and unlock under output changes, resource failures
+and slow workers. A crash can still leave a locked session requiring recovery.
+
+- **PAM done carefully.** One transaction starts per initial submit, as in swaylock. Follow-up
+  questions normally require another answer, so password-then-one-time-code stacks work;
+  `reuse-password` can reuse the previous answer once for an immediately repeated, identical
+  prompt; further questions require another answer. The account
+  phase is not run, but `pam_nologin` in the auth stack is still enforced. The service file is
+  looked up as libpam looks it up, and swaywardlock refuses to lock if it is missing or unreadable.
+- **Real PAM in the test gate.** The tests drive the real libpam with throwaway services: stock
+  modules, faillock lockouts, one-time-code stacks, fingerprint stand-ins and `pam_permit` stacks
+  that must still need an Enter. The slow gate checks the installed service with real PAM when
+  root or passwordless sudo is available; the fast gate excludes that privileged check. CI runs
+  both modes. A skipped privileged check is not real-PAM coverage, and test-auth e2e is not PAM.
+  An optional real-user password check must be requested separately.
+- **Hostile conditions.** Monitors turned off (DPMS) or unplugged while locked, the compositor
+  sending protocol errors, broken log pipes, exhausted process limits, slow or noisy `cmd[]`
+  labels, huge images and absurd config values are covered by fault-injection and regression
+  tests.
+- **Tests that bite.** Rust unit tests and shell and pytest suites against a real headless sway
+  run locally and in CI. Mutation testing exposed coverage gaps; surviving medium-severity
+  mutants from round two were subsequently caught. The final-feature mutation round remains
+  required. [The gates](docs/USING.md#gates) spell out the scope and what a pass means.
+- **Audited in rounds.** Repeated AI-assisted reviews and fault-injection runs found bugs that
+  were fixed and regression-tested. Reviews covered PAM bypass attempts, protocol traces,
+  fuzzing, concurrency and claims in the docs.
+
+## Which locker is for you
+
+- **swaylock**, if a colour and a ring are all you want. It is small, mature and widely
+  packaged. swaywardlock has a swaylock-style default, in a much bigger program that needs
+  working EGL/OpenGL ES.
+- **hyprlock**, if you are on Hyprland and at home in hyprlang. swaywardlock follows its widget
+  model closely; its converter helps migrate to KDL and reports what it cannot carry over.
+- **gtklock**, if you want GTK and its module ecosystem (media controls, a power bar, user info).
+- **waylock**, if you want a minimal standalone locker.
+- **Noctalia, DankMaterialShell or a Quickshell setup**, if you run that shell: its lock screen
+  is themed and integrated with everything else.
+- **swaywardlock**, if you want hyprlock's looks with swaylock's process contract, configured in
+  KDL, on a compositor with `ext-session-lock-v1` and working EGL/OpenGL ES.
 
 ## Quickstart
 
-Without a config file swaywardlock uses a built-in swaylock-style look, so
-`swaywardlock` works as it is. To make it yours, start from an example or a converter. The
-config goes in `~/.config/swaywardlock/config.kdl` (or `/etc/swaywardlock/config.kdl`, or
-anywhere with `-c FILE` or `$SWAYWARDLOCK_CONFIG`):
-
 ```
 mkdir -p ~/.config/swaywardlock
-# from an example (installed under /usr/share/doc/swaywardlock/examples):
-cp examples/hyprlock-example.kdl ~/.config/swaywardlock/config.kdl
-# or from a hyprlock or swaylock config (warnings and the command line go to stderr):
-contrib/hyprlock-to-kdl ~/.config/hypr/hyprlock.conf > ~/.config/swaywardlock/config.kdl
-contrib/swaylock-to-kdl ~/.config/swaylock/config > ~/.config/swaywardlock/config.kdl
-
-swaywardlock validate                # parse it without drawing anything
-swaywardlock --preview               # see it in a window; edit the file and it redraws
-swaywardlock -f                      # lock; -f returns once the session is locked
+swaywardlock-hyprlock-to-kdl ~/.config/hypr/hyprlock.conf > ~/.config/swaywardlock/config.kdl
+#   or: swaywardlock-swaylock-to-kdl ~/.config/swaylock/config > ~/.config/swaywardlock/config.kdl
+#   or: cp /usr/share/doc/swaywardlock/examples/swayward-ring.kdl ~/.config/swaywardlock/config.kdl
+swaywardlock --preview        # see it in a window; edit the file and it redraws
+swaywardlock -f               # lock
 ```
 
-Use it from swayidle like swaylock (`-f` makes the lock the thing swayidle waits for):
+In your idle setup, replace `swaylock` with `swaywardlock`:
 
 ```
 swayidle -w timeout 300 'swaywardlock -f' before-sleep 'swaywardlock -f'
 ```
 
-or bind a key, e.g. in sway: `bindsym $mod+l exec swaywardlock -f`.
+Without a config file you get the classic swaylock look.
 
-A config is KDL, where a block written on one line needs a `;` (or a newline) before its
-closing `}`, as in `auth { pam { off; }; }`.
+<!-- SCREENSHOT: hyprlock's sample config converted (examples/hyprlock-example.kdl) -->
+![PLACEHOLDER: hyprlock's sample config, converted and drawn by swaywardlock](docs/screenshots/PLACEHOLDER-hyprlock-example.png)
 
-## Install
+## More
 
-Packages (both ship the PAM file, the man page, shell completions, the config converters, the
-examples and the design document):
+- [Installing, PAM and fingerprints, trying it safely, working on a layout](docs/USING.md)
+- `man swaywardlock`: options, signals, exit codes, keys and the config nodes
+- [Design and full config reference](docs/specs/2026-10-19-swaywardlock.md)
+- [The animated ring style](docs/specs/2026-10-20-ring-style.md)
 
-- Arch: `contrib/PKGBUILD` (`cd contrib && makepkg -si`). There is no release tag yet, so it
-  builds the checkout it is in (not a downloaded tarball); needs `base-devel`, `cargo` and
-  `scdoc`. Run it in a git checkout, not from a copied PKGBUILD.
-- Fedora: `swaywardlock.spec.rpkg` (`rpkg local`, then install the rpm from the printed path).
-  Needs `rpkg`, `rpm-build`, `cargo-rpm-macros` >= 26 and a git checkout; it packs the committed
-  state of the tree.
+## Developed with AI assistance
 
-They install `/etc/pam.d/swaywardlock` as a config file (it includes `login`, so the packages depend
-on the owner of `/etc/pam.d/login`: `util-linux` on Fedora and Arch), `swaywardlock(1)` (`man swaywardlock`,
-built from `docs/swaywardlock.1.scd` with scdoc) and
-the converters on `PATH`; the examples are in `/usr/share/doc/swaywardlock/examples` and the design
-document in `/usr/share/doc/swaywardlock/specs`. `swaywardlock completions bash|zsh|fish|elvish|powershell`
-prints a completion script.
-
-From source, swaywardlock authenticates through PAM with the service `swaywardlock`, so install
-the shipped PAM file yourself (as root):
-
-```
-install -Dm644 pam/swaywardlock /etc/pam.d/swaywardlock
-```
-
-Without it, PAM would fall back to `/etc/pam.d/other`, which refuses every password; swaywardlock
-checks that the file is there and readable (as libpam looks for it: the service name
-lowercased) and exits with an error before locking. The file is swaylock's and
-hyprlock's: `auth include login`, so `/etc/pam.d/login` (util-linux) must exist too. `auth { pam service="login"; }` uses another service instead,
-and `auth { pam { off; }; }` disables PAM (only SIGUSR1 or a fingerprint can unlock then).
-
-Like swaylock, swaywardlock starts PAM when you press Enter, so a stack with `pam_fprintd` first
-(Fedora's authselect `with-fingerprint`) reads the finger after Enter; `auth { fingerprint { }; }`
-unlocks on a touch at any time. Each question PAM asks after the first (a one-time code) is
-shown and answered with the next Enter. If your stack has two modules that both ask for the
-password, `auth { pam { reuse-password; }; }` answers the second from the first.
-
-## Working on a layout
-
-```
-swaywardlock --preview -c ~/.config/swaywardlock/config.kdl
-```
-
-draws the lock screen in an ordinary window instead of locking, and redraws whenever the config
-(or anything it includes) changes. A config that fails to parse prints the error and keeps the
-last good frame. Typing drives the indicator; Enter shows the checking and wrong-password states
-but never checks a password. `--preview-output DP-1` makes the window match `output="DP-1"`
-widgets. Close the window to quit.
-
-`swaywardlock validate` checks a config without drawing anything.
+swaywardlock was built largely with AI assistance. A human reviews every change and is
+responsible for it, following the Linux kernel's rule that
+[AI does not sign off](https://www.kernel.org/doc/html/next/process/coding-assistants.html). Most
+of the tokens went into trying to break it.
 
 License: GPL-3.0-or-later.

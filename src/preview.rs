@@ -118,6 +118,12 @@ fn poll(app: &mut App) {
             preview.options.files = files;
             app.images = Images::load_all(&config);
             app.state = LockState::new(&config.general);
+            app.reload.stop(&app.handle);
+            let screens = app.reload.screens();
+            match crate::reload::Reload::new(&config, &app.images, screens, &app.handle) {
+                Ok(reload) => app.reload = reload,
+                Err(err) => tracing::warn!("preview: reload: {err:#}"),
+            }
             app.labels.stop(&app.handle);
             match crate::labels::Labels::new(&config, &app.state, &app.handle) {
                 Ok(labels) => app.labels = labels,

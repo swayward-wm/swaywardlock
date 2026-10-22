@@ -204,6 +204,31 @@ pub struct ImageWidget {
     pub shadow: Shadow,
     /// Degrees counter-clockwise, 0..360 (hyprlock's `rotate`).
     pub rotate: f64,
+    pub reload: ReloadSpec,
+}
+
+/// When and how a `background` or `image` picks up a new picture while locked (hyprlock's
+/// `reload_time` and `reload_cmd`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ReloadSpec {
+    /// `reload-ms`: look again this often; `Some(0)` only on SIGUSR2; `None` never.
+    pub every_ms: Option<u32>,
+    /// `reload-cmd`: a shell command whose output names the picture's path.
+    pub cmd: Option<String>,
+    /// The directory of the file that wrote the command: a relative path it prints resolves
+    /// against it, like `path` does. Only kept with a command.
+    pub base: Option<PathBuf>,
+}
+
+impl ReloadSpec {
+    fn set_base(&mut self, base: Option<PathBuf>) {
+        self.base = base.filter(|_| self.cmd.is_some());
+    }
+
+    /// Whether any key was written.
+    pub fn is_set(&self) -> bool {
+        self.every_ms.is_some() || self.cmd.is_some()
+    }
 }
 
 /// A rectangle with optional rounded corners, border and shadow (hyprlock's `shape`).
@@ -361,6 +386,9 @@ pub struct Background {
     pub vibrancy: f64,
     /// How much less dark colours are boosted, 0 to 1.
     pub vibrancy_darkness: f64,
+    pub reload: ReloadSpec,
+    /// How long a reloaded picture takes to fade in over the old one; 0 swaps at once.
+    pub crossfade_ms: u32,
 }
 
 impl Background {
@@ -387,6 +415,8 @@ impl Default for Background {
             brightness: 1.,
             vibrancy: 0.,
             vibrancy_darkness: 0.,
+            reload: ReloadSpec::default(),
+            crossfade_ms: 0,
         }
     }
 }
@@ -724,6 +754,8 @@ impl<S: knuffel::traits::ErrorSpan> knuffel::Decode<S> for Background {
                     bg.vibrancy_darkness = arg::<_, FloatOrInt<0, 1>>(child, ctx)?.0;
                     post_set.push("vibrancy-darkness");
                 }
+                "reload-ms" | "reload-cmd" => decode_reload(child, ctx, &mut bg.reload)?,
+                "crossfade-ms" => bg.crossfade_ms = arg(child, ctx)?,
                 "blur" => {
                     // A `blur` block turns blur on unless it says `off`.
                     let part: BlurPart = knuffel::Decode::decode_node(child, ctx)?;
@@ -750,8 +782,46 @@ impl<S: knuffel::traits::ErrorSpan> knuffel::Decode<S> for Background {
         } else if post_set.contains(&"vibrancy-darkness") && bg.vibrancy == 0. {
             tracing::warn!("background: vibrancy-darkness needs vibrancy above 0; ignored");
         }
+        bg.reload.set_base(base_dir(ctx));
         Ok(bg)
     }
+}
+
+/// The directory of the file being decoded, if known.
+fn base_dir<S: knuffel::traits::ErrorSpan>(ctx: &Ctx<S>) -> Option<PathBuf> {
+    ctx.get::<super::decode::BasePath>().map(|b| b.0.clone())
+}
+
+/// Shortest `reload-ms` that is not 0: shorter would run a shell command hundreds of times a
+/// second.
+const MIN_RELOAD_MS: u32 = 100;
+
+/// `reload-ms N` or `reload-cmd "shell"`.
+fn decode_reload<S: knuffel::traits::ErrorSpan>(
+    node: &Node<S>,
+    ctx: &mut Ctx<S>,
+    spec: &mut ReloadSpec,
+) -> Result<(), DecodeError<S>> {
+    if &**node.node_name == "reload-cmd" {
+        let cmd: String = arg(node, ctx)?;
+        if cmd.trim().is_empty() {
+            return Err(DecodeError::conversion(
+                &node.arguments[0].literal,
+                "the command must not be empty",
+            ));
+        }
+        spec.cmd = Some(cmd);
+        return Ok(());
+    }
+    let ms: u32 = arg(node, ctx)?;
+    if ms != 0 && ms < MIN_RELOAD_MS {
+        ctx.emit_error(DecodeError::conversion(
+            &node.arguments[0].literal,
+            "must be 0 (only on SIGUSR2) or at least 100 ms",
+        ));
+    }
+    spec.every_ms = Some(ms);
+    Ok(())
 }
 
 /// An image path: `~` expands to the home directory, and a relative path resolves against the
@@ -1080,9 +1150,11 @@ impl<S: knuffel::traits::ErrorSpan> knuffel::Decode<S> for ImageWidget {
         let mut border = None;
         let mut shadow = Shadow::default();
         let mut rotation = 0.;
+        let mut reload = ReloadSpec::default();
         for child in decode_common(node, ctx, &mut common)? {
             match &**child.node_name {
                 "path" => path = Some(image_path(child, ctx)?),
+                "reload-ms" | "reload-cmd" => decode_reload(child, ctx, &mut reload)?,
                 "size" => size = arg::<_, FloatOrInt<1, 10000>>(child, ctx)?.0,
                 "corner-radius" => corner_radius = decode_corner_radius(child, ctx)?,
                 "border" => border = Some(decode_border(child, ctx)?),
@@ -1092,6 +1164,7 @@ impl<S: knuffel::traits::ErrorSpan> knuffel::Decode<S> for ImageWidget {
             }
         }
         let path = path.ok_or_else(|| DecodeError::missing(node, "image needs `path`"))?;
+        reload.set_base(base_dir(ctx));
         Ok(ImageWidget {
             common,
             path,
@@ -1100,6 +1173,7 @@ impl<S: knuffel::traits::ErrorSpan> knuffel::Decode<S> for ImageWidget {
             border,
             shadow,
             rotate: rotation,
+            reload,
         })
     }
 }

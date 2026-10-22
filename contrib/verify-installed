@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# Check an INSTALLED swaywardlock package, as the release workflow's verify jobs do after
+# installing the .deb, .rpm or Arch package in a clean container. Run it from a checkout of the
+# release tag (it compares the installed PAM file with pam/swaywardlock).
+#
+#   contrib/verify-installed [VERSION]
+#
+# With VERSION, the version the binary reports must match it. Needs nothing but bash, coreutils
+# and python3 (the converters are Python), and does not touch the system: it only reads installed
+# files. Used by the workflow only; the package-specific "is it marked as
+# config" checks (dpkg conffiles, rpm -qc, pacman backup) stay in the workflow beside the
+# install step, because each is a different package manager.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+want_version=${1:-}
+fail() { echo "verify-installed: FAIL $*" >&2; exit 1; }
+
+command -v cmp > /dev/null || fail "cmp is not installed (diffutils)"
+bin=$(command -v swaywardlock) || fail "swaywardlock is not on PATH"
+
+reported=$(swaywardlock --version)
+echo "$reported"
+if [ -n "$want_version" ]; then
+    [ "$reported" = "swaywardlock $want_version" ] \
+        || fail "--version printed '$reported'; expected 'swaywardlock $want_version'"
+fi
+
+# Every shipped example must be a valid config. Fail on none, so a packaging change that stops
+# shipping them cannot pass by checking nothing.
+doc=/usr/share/doc/swaywardlock
+shopt -s nullglob
+examples=("$doc"/examples/*.kdl)
+[ "${#examples[@]}" -gt 0 ] || fail "no examples under $doc/examples"
+for example in "${examples[@]}"; do
+    swaywardlock validate -c "$example" || fail "validate rejected $example"
+done
+# And every example in the tree is shipped.
+for example in examples/*.kdl; do
+    cmp "$example" "$doc/examples/$(basename "$example")" || fail "$example is not shipped as is"
+done
+
+# The moved reference and its linked design documents must ship byte for byte.
+cmp README.md "$doc/README.md" || fail "README.md is not shipped as is"
+cmp docs/USING.md "$doc/docs/USING.md" || fail "docs/USING.md is not shipped as is"
+cmp docs/screenshots/README.md "$doc/docs/screenshots/README.md" \
+    || fail "screenshot placeholder note is missing or changed"
+for spec in docs/specs/*.md; do
+    cmp "$spec" "$doc/$spec" || fail "$spec link is missing or changed"
+done
+
+# The PAM file: byte for byte the one in the tree. swaywardlock refuses to lock without it.
+cmp /etc/pam.d/swaywardlock pam/swaywardlock \
+    || fail "/etc/pam.d/swaywardlock differs from pam/swaywardlock"
+
+# The release binary contains neither the test-auth password nor any test hook. The strings are
+# built from parts so this script does not contain them either.
+for needle in "swaywardlock-te""st" "SWAYWARDLOCK_TE""ST_"; do
+    count=$(grep --text --count "$needle" "$(readlink -f "$bin")" || true)
+    [ "$count" = 0 ] || fail "the installed binary contains $needle ($count lines)"
+done
+
+# The converters run (they are Python scripts under namespaced names).
+for converter in swaywardlock-swaylock-to-kdl swaywardlock-hyprlock-to-kdl; do
+    "$converter" --help > /dev/null || fail "$converter --help failed"
+done
+
+# The man page and the completions are installed.
+man=(/usr/share/man/man1/swaywardlock.1*)
+[ "${#man[@]}" -gt 0 ] || fail "no man page"
+completions=(/usr/share/bash-completion/completions/swaywardlock \
+    /usr/share/fish/vendor_completions.d/swaywardlock.fish)
+for file in "${completions[@]}"; do
+    [ -s "$file" ] || fail "missing $file"
+done
+swaywardlock completions bash > /dev/null || fail "completions bash failed"
+
+echo "verify-installed: ok"

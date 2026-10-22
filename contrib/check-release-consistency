@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""Check that release and package versions agree with Cargo.toml."""
+
+import argparse
+import re
+import subprocess
+import sys
+import tomllib
+from pathlib import Path
+
+
+def load_toml(path: Path):
+    with path.open("rb") as file:
+        return tomllib.load(file)
+
+
+def field(pattern: str, path: Path, errors: list[str]) -> str | None:
+    match = re.search(pattern, path.read_text(), re.MULTILINE)
+    if match is None:
+        errors.append(f"{path.name}: expected version field is missing")
+        return None
+    return match.group(1)
+
+
+def check(root: Path, tag: str | None) -> list[str]:
+    errors: list[str] = []
+    version = load_toml(root / "Cargo.toml")["package"]["version"]
+    arch_version = subprocess.check_output(
+        [root / "contrib/package-version", "arch", version], text=True
+    ).strip()
+
+    if tag is not None:
+        expected_tag = f"swaywardlock-v{version}"
+        if tag != expected_tag:
+            errors.append(f"release tag is {tag!r}; expected {expected_tag!r}")
+
+    pkgbuild_path = root / "contrib/PKGBUILD"
+    pkgbuild = field(r"^pkgver=(\S+)$", pkgbuild_path, errors)
+    if pkgbuild is not None and pkgbuild != arch_version:
+        errors.append(
+            f"contrib/PKGBUILD: pkgver is {pkgbuild!r}; expected {arch_version!r}"
+        )
+    tag_version = field(r"^_tagver=(\S+)$", pkgbuild_path, errors)
+    if tag_version is not None and tag_version != version:
+        errors.append(
+            f"contrib/PKGBUILD: _tagver is {tag_version!r}; expected {version!r}"
+        )
+
+    lock = load_toml(root / "Cargo.lock")
+    locked = [
+        package["version"]
+        for package in lock["package"]
+        if package["name"] == "swaywardlock"
+    ]
+    if locked != [version]:
+        errors.append(f"Cargo.lock: swaywardlock is {locked!r}; expected {version!r}")
+
+    spec = (root / "swaywardlock.spec.rpkg").read_text()
+    if "%global version {{{ git_dir_version }}}" not in spec:
+        errors.append(
+            "swaywardlock.spec.rpkg: version is not derived from the source tag"
+        )
+
+    expected_source = (
+        'source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/'
+        'swaywardlock-v$_tagver.tar.gz")'
+    )
+    if expected_source not in pkgbuild_path.read_text():
+        errors.append(
+            "contrib/PKGBUILD: source URL is not derived from swaywardlock-v$_tagver"
+        )
+
+    return errors
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "tag",
+        nargs="?",
+        help="release tag to verify (swaywardlock-v<Cargo.toml version>)",
+    )
+    parser.add_argument(
+        "--root",
+        type=Path,
+        default=Path(__file__).resolve().parent.parent,
+        help=argparse.SUPPRESS,
+    )
+    args = parser.parse_args()
+
+    errors = check(args.root.resolve(), args.tag)
+    for error in errors:
+        print(f"check-release-consistency: {error}", file=sys.stderr)
+    if errors:
+        print(f"{len(errors)} release consistency violation(s)", file=sys.stderr)
+        return 1
+
+    version = load_toml(args.root / "Cargo.toml")["package"]["version"]
+    print(f"release metadata agrees on {version}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

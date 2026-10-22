@@ -1065,3 +1065,67 @@ fn hyprlock_converter_reproduces_the_example() {
     let shipped = Config::parse(&path, &text).config.unwrap();
     assert_eq!(converted, shipped);
 }
+
+#[test]
+fn reload_keys_decode() {
+    let config = Config::parse_mem(
+        "background { reload-cmd \"echo x\"; reload-ms 300; crossfade-ms 500; }\n\
+         image { path \"/a.png\"; reload-ms 0; }\n",
+    )
+    .unwrap();
+    let b = background(&config);
+    assert_eq!(b.reload.cmd.as_deref(), Some("echo x"));
+    assert_eq!(b.reload.every_ms, Some(300));
+    assert_eq!(b.crossfade_ms, 500);
+    let Widget::Image(i) = &config.widgets[1] else {
+        panic!("an image")
+    };
+    assert_eq!(i.reload.every_ms, Some(0));
+    assert_eq!(i.reload.cmd, None);
+    // Off by default.
+    let plain = Config::parse_mem("background {}\nimage { path \"/a.png\"; }").unwrap();
+    assert!(!background(&plain).reload.is_set());
+    assert_eq!(background(&plain).crossfade_ms, 0);
+}
+
+#[test]
+fn reload_keys_are_checked() {
+    for bad in [
+        // crossfade belongs to the background.
+        "image { path \"/a.png\"; crossfade-ms 500; }",
+        // A shell command a hundred times a second is not a reload interval.
+        "background { reload-ms 5; }",
+        "image { path \"/a.png\"; reload-ms 99; }",
+        "background { reload-cmd \"\"; }",
+        "background { reload-ms -1; }",
+        "background { crossfade-ms \"x\"; }",
+    ] {
+        assert!(Config::parse_mem(bad).is_err(), "{bad}");
+    }
+    assert!(Config::parse_mem("background { reload-ms 100; }").is_ok());
+}
+
+/// A relative path a reload command prints resolves against the config file's directory, like
+/// `path`: the reload spec remembers that directory.
+#[test]
+fn reload_spec_remembers_the_config_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    std::fs::write(
+        dir.path().join("sub/inc.kdl"),
+        "image { path \"a.png\"; reload-cmd \"echo\"; }\n",
+    )
+    .unwrap();
+    let main = dir.path().join("config.kdl");
+    std::fs::write(
+        &main,
+        "background { reload-cmd \"echo\"; }\ninclude \"sub/inc.kdl\"\n",
+    )
+    .unwrap();
+    let config = Config::load(Some(&main)).unwrap();
+    assert_eq!(background(&config).reload.base.as_deref(), Some(dir.path()));
+    let Widget::Image(i) = &config.widgets[1] else {
+        panic!("an image")
+    };
+    assert_eq!(i.reload.base, Some(dir.path().join("sub")));
+}

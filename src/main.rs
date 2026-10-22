@@ -11,6 +11,7 @@ mod fprint;
 mod labels;
 mod preview;
 mod process;
+mod reload;
 mod render;
 mod scale;
 mod screencopy;
@@ -164,6 +165,7 @@ struct App {
     auth: Option<Authenticator>,
     state: LockState,
     labels: labels::Labels,
+    reload: reload::Reload,
     fades: fade::Fades,
     /// End of the grace period (`--grace`) on `CLOCK_BOOTTIME`, if any.
     grace_until: Option<Duration>,
@@ -484,6 +486,7 @@ fn run(
         input_clock: 0,
         gpu,
         labels: labels::Labels::new(&config, &state, &handle)?,
+        reload: reload::Reload::new(&config, &images, reload::Screens::default(), &handle)?,
         state,
         fades: fade::Fades::new(config.animations),
         grace_until: None,
@@ -522,11 +525,16 @@ fn run(
         capture_screenshots(&mut app, &mut event_loop, &globals, &qh)?;
     }
 
-    // SIGUSR2 refreshes cmd[] labels, in preview too. SIGUSR1 comes after the preview branch, so
-    // the preview has no unlock path.
+    // SIGUSR2 refreshes cmd[] labels and reloads pictures, in preview too. SIGUSR1 comes after
+    // the preview branch, so the preview has no unlock path.
     let refresh = Signals::new(&[Signal::SIGUSR2])?;
     handle
-        .insert_source(refresh, |_, _, app| app.labels.refresh(&app.state))
+        .insert_source(refresh, |_, _, app| {
+            app.labels.refresh(&app.state);
+            if app.exit.is_none() {
+                app.reload.refresh();
+            }
+        })
         .map_err(|e| e.error)?;
 
     if let Some(options) = preview {
@@ -859,6 +867,7 @@ impl App {
             let dynamic = Dynamic {
                 vars: self.labels.vars(&self.state),
                 cmd_output: &self.labels.output,
+                reload: &self.reload,
                 opacity: self.fades.opacity(),
                 clock: self.fades.clock(),
             };
@@ -890,6 +899,19 @@ impl App {
     /// Keep the redraw ticker running while an animation is, and wake once for the earliest
     /// input-field fade-out timeout, without ticking while merely waiting for it.
     fn after_draw(&mut self) {
+        // A reloaded picture is kept once it rendered; one that failed is dropped, and an output
+        // that drew it goes back to the old one on the next frame.
+        let trials: Vec<(usize, bool)> = self
+            .surfaces
+            .iter_mut()
+            .flat_map(|s| std::mem::take(&mut s.trials))
+            .collect();
+        if !trials.is_empty() {
+            if self.reload.settle(&trials) {
+                self.handle.insert_idle(|app| app.draw_all());
+            }
+            self.reload.prune(&self.config, &mut self.images);
+        }
         fade::ensure_ticking(self);
         let wake = if self.fades.unlock_when_done {
             None
@@ -943,6 +965,16 @@ impl App {
         };
         let surface = &mut self.surfaces[index];
         surface.layout(&self.config, &info);
+        // The largest output a reloaded picture must still cover, so the worker scales it down.
+        let mut screens = reload::Screens::default();
+        for s in self.surfaces.iter().filter(|s| s.configured) {
+            let b = s.buffer_size();
+            screens.buffer.0 = screens.buffer.0.max(b.w.max(0) as u32);
+            screens.buffer.1 = screens.buffer.1.max(b.h.max(0) as u32);
+            screens.scale = screens.scale.max(s.scale);
+        }
+        self.reload.set_screens(screens);
+        let surface = &mut self.surfaces[index];
         if let Err(err) = surface.ensure_egl(&self.gpu) {
             tracing::error!("cannot create a surface for an output: {err:#}");
             return;
@@ -951,6 +983,7 @@ impl App {
         let dynamic = Dynamic {
             vars: self.labels.vars(&self.state),
             cmd_output: &self.labels.output,
+            reload: &self.reload,
             opacity: self.fades.opacity(),
             clock: self.fades.clock(),
         };

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Every KDL snippet in the README and the man page must pass `swaywardlock validate`.
+"""Every KDL snippet in README, USING and the man page must pass `swaywardlock validate`.
 
 Usage: contrib/check-doc-kdl [BINARY]   (default target/debug/swaywardlock)
 
-Checks the fenced blocks of docs/swaywardlock.1.scd and README.md that hold KDL (a block whose
-first word is a top-level config node), and the one-line `node { ... }` code spans in the README.
+Checks fenced KDL blocks in docs/swaywardlock.1.scd, README.md and docs/USING.md (a block whose
+first word is a top-level config node), and one-line `node { ... }` spans in both Markdown files.
 A snippet that does not parse (a missing `;` before `}`) fails the run, as users copy these
 straight into their config.
 """
@@ -28,16 +28,18 @@ def read(name):
 
 
 snippets = []  # (where, text)
-for name in ("README.md", "docs/swaywardlock.1.scd"):
+markdown = ("README.md", "docs/USING.md")
+for name in (*markdown, "docs/swaywardlock.1.scd"):
     text = read(name)
     for i, block in enumerate(re.findall(r"^```[a-z]*\n(.*?)^```", text, re.M | re.S), 1):
         if top.match(block.lstrip()):
             snippets.append((f"{name} block {i}", block))
-# One-line spans: `auth { pam { off; }; }` (README only; the man page's italics are not checked,
-# because it shows an invalid line on purpose).
-for span in re.findall(r"`([^`\n]+)`", read("README.md")):
-    if top.match(span) and "{" in span:
-        snippets.append((f"README.md span `{span}`", span))
+# One-line spans in both Markdown files. The man page's italics are not checked,
+# because it shows an invalid line on purpose.
+for name in markdown:
+    for span in re.findall(r"`([^`\n]+)`", read(name)):
+        if top.match(span) and "{" in span:
+            snippets.append((f"{name} span `{span}`", span))
 
 if len(snippets) < 5:
     sys.exit(f"check-doc-kdl: found only {len(snippets)} snippets; is the pattern stale?")

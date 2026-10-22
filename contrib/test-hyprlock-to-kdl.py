@@ -614,18 +614,51 @@ class Convert(unittest.TestCase):
         self.assertGreater(checked, 100)
 
     # Keys with no KDL counterpart yet. Each must warn and leave a comment, and the output validates.
-    # The units that add the KDL (rotate, shadows, reload) move their keys out of this list.
+    # The units that add the KDL (shadows) move their keys out of this list.
     UNSUPPORTED = [
         ("general", "text_trim", "0"), ("general", "fractional_scaling", "1"), ("general", "screencopy_mode", "1"),
-        ("background", "reload_time", "5"), ("background", "reload_cmd", "echo hi"),
-        ("background", "crossfade_time", "1.5"),
         ("shape", "onclick", "echo hi"), ("shape", "shadow_boost", "2"),
-        ("image", "reload_time", "5"), ("image", "reload_cmd", "echo hi"),
         ("image", "onclick", "echo hi"), ("image", "shadow_boost", "2"),
         ("input-field", "shadow_boost", "2"),
         ("label", "onclick", "echo hi"),
         ("label", "frobnicate", "1"),
     ]
+
+    def test_reload_keys_become_kdl(self):
+        """reload_time (seconds) -> reload-ms, reload_cmd -> reload-cmd, crossfade_time -> crossfade-ms."""
+        r = self.ok("background {\n reload_time = 5\n reload_cmd = echo /a.png\n crossfade_time = 1.5\n}")
+        self.assertIn('reload-cmd "echo /a.png"', r.stdout)
+        self.assertIn("reload-ms 5000", r.stdout)
+        self.assertIn("crossfade-ms 1500", r.stdout)
+        self.assertNotIn("// hyprlock: reload", r.stdout)
+        self.assertTrue(any("crossfade_time" in l and "ignores" in l for l in r.stderr.splitlines()), r.stderr)
+        # 0 is "only on SIGUSR2"; -1 (the default) is off.
+        r = self.ok("background {\n reload_time = 0\n reload_cmd = echo /a.png\n}")
+        self.assertIn("reload-ms 0", r.stdout)
+        r = self.ok("background {\n reload_time = -1\n reload_cmd = echo /a.png\n}")
+        self.assertNotIn("reload-ms", r.stdout)
+        self.assertIn("reload-cmd", r.stdout)  # runs once at start, as in hyprlock
+        # Negative crossfade_time is off.
+        r = self.ok("background {\n crossfade_time = -1\n}")
+        self.assertNotIn("crossfade-ms", r.stdout)
+        # An image reloads on a timer, with or without a command.
+        r = self.ok("image {\n path = /a.png\n reload_time = 2\n reload_cmd = echo /b.png\n}")
+        self.assertIn("reload-ms 2000", r.stdout)
+        self.assertIn('reload-cmd "echo /b.png"', r.stdout)
+        r = self.ok("image {\n path = /a.png\n reload_time = 0\n}")
+        self.assertIn("reload-ms 0", r.stdout)
+        self.assertNotIn("reload-cmd", r.stdout)
+
+    def test_reload_keys_hyprlock_never_acts_on_are_left_out(self):
+        for kind, extra, text, key in [
+            # A background reloads only with a command; an image's command only runs on a timer.
+            ("background", "", "reload_time = 5", "reload_time"),
+            ("background", " path = /a.png\n", "reload_cmd = echo x", "reload_cmd"),
+            ("image", " path = /a.png\n", "reload_cmd = echo x", "reload_cmd"),
+        ]:
+            r = self.ok(f"{kind} {{\n{extra} {text}\n}}")
+            self.assertTrue(mentions(r, key), f"{kind} {key}: {r.stderr}")
+            self.assertNotIn("reload-", r.stdout, kind)
 
     def test_unsupported_keys_become_comments(self):
         for section, key, value in self.UNSUPPORTED:

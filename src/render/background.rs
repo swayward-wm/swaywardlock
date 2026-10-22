@@ -15,59 +15,144 @@ pub struct Image(cairo::ImageSurface);
 /// Formats `Image::load` decodes, by extension, for messages (content is sniffed regardless).
 pub const FORMATS: &str = "png, jpeg, webp, gif, bmp, tiff, ico, jxl";
 
-impl Image {
-    pub fn load(path: &Path) -> anyhow::Result<Self> {
-        // Idempotent: returns false once registered.
-        jxl_oxide::integration::register_image_decoding_hook();
-        let reader = image::ImageReader::open(path)
-            .with_context(|| format!("error opening {path:?}"))?
-            .with_guessed_format()?;
-        // AVIF decoding needs the system dav1d library (image's avif-native); not built in.
-        if reader.format() == Some(image::ImageFormat::Avif) {
-            anyhow::bail!("error decoding {path:?}: AVIF is not supported (supported: {FORMATS})");
-        }
-        // jxl-oxide (a hook format, so no built-in format here) already applies the codestream
-        // orientation, which JPEG XL says wins over any Exif tag.
-        let builtin = reader.format().is_some();
-        let decoded = (|| {
-            use image::ImageDecoder as _;
-            let mut decoder = reader.into_decoder()?;
-            // decode() checks the buffer against the default allocation limit; so do we.
-            image::Limits::default().reserve(decoder.total_bytes())?;
-            // Like swaylock's gdk_pixbuf_apply_embedded_orientation: a phone photo tagged
-            // "rotate 90" is shown upright. An unreadable tag is no rotation.
-            let orientation = if builtin {
-                decoder
-                    .orientation()
-                    .unwrap_or(image::metadata::Orientation::NoTransforms)
-            } else {
-                image::metadata::Orientation::NoTransforms
-            };
-            let mut img = image::DynamicImage::from_decoder(decoder)?;
-            img.apply_orientation(orientation);
-            Ok::<_, image::ImageError>(img)
-        })();
-        let img = decoded
-            .with_context(|| format!("error decoding {path:?} (supported: {FORMATS})"))?
-            .into_rgba8();
-        let (w, h) = img.dimensions();
-        let mut surface = cairo::ImageSurface::create(cairo::Format::ARgb32, w as i32, h as i32)?;
-        let stride = surface.stride() as usize;
-        {
-            let mut data = surface.data()?;
-            for (y, row) in img.rows().enumerate() {
-                for (x, px) in row.enumerate() {
-                    let [r, g, b, a] = px.0;
-                    let pre = |c: u8| ((u16::from(c) * u16::from(a) + 127) / 255) as u8;
-                    // cairo ARGB32 is a native-endian u32 0xAARRGGBB.
-                    let argb = u32::from_be_bytes([a, pre(r), pre(g), pre(b)]);
-                    let o = y * stride + x * 4;
-                    data[o..o + 4].copy_from_slice(&argb.to_ne_bytes());
-                }
+/// A decoded picture: width, height and premultiplied ARGB rows in cairo's layout
+/// (`width * 4` bytes per row, native-endian `0xAARRGGBB`). Plain data, so a worker thread can
+/// make it and the main thread can wrap it ([`Image::from_argb`]): a cairo surface is not `Send`.
+pub type Decoded = (u32, u32, Vec<u8>);
+
+/// Decode the image at `path`. Reads and decodes on the calling thread, which may be slow.
+pub fn decode(path: &Path) -> anyhow::Result<Decoded> {
+    decode_with(path, image::Limits::default(), None)
+}
+
+/// The most pixels a reload decodes. A small file can name a huge picture (a 527 KB PNG is
+/// 22000x22000); refused from its header, it never reaches the allocator. 8000x8000 passes.
+pub const MAX_RELOAD_PIXELS: u64 = 64_000_000;
+
+/// Decode a reloaded picture on a worker thread. Refuses it from its header if a side is over
+/// the GPU texture limit or it has more than [`MAX_RELOAD_PIXELS`], decodes under matching
+/// [`image::Limits`], and scales it down (never up, aspect kept) until it just covers `cover`,
+/// so the main thread only wraps a screen-sized buffer. `None` keeps the full size.
+pub fn decode_for_reload(path: &Path, cover: Option<(u32, u32)>) -> anyhow::Result<Decoded> {
+    jxl_oxide::integration::register_image_decoding_hook();
+    let (w, h) = image::ImageReader::open(path)
+        .with_context(|| format!("error opening {path:?}"))?
+        .with_guessed_format()?
+        .into_dimensions()
+        .with_context(|| format!("error decoding {path:?} (supported: {FORMATS})"))?;
+    let max = crate::render::max_texture_size().max(1) as u32;
+    anyhow::ensure!(
+        w <= max && h <= max,
+        "{path:?}: {w}x{h} px is over the GPU texture limit ({max} px)"
+    );
+    anyhow::ensure!(
+        u64::from(w) * u64::from(h) <= MAX_RELOAD_PIXELS,
+        "{path:?}: {w}x{h} px is over the {} megapixels a reload decodes",
+        MAX_RELOAD_PIXELS / 1_000_000
+    );
+    // The file may have changed since: the decoder enforces the same bounds itself.
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(max);
+    limits.max_image_height = Some(max);
+    // RGBA16 at the pixel cap is 512 MB, the image crate's default; RGBA8 is half that.
+    limits.max_alloc = Some(MAX_RELOAD_PIXELS * 8);
+    decode_with(path, limits, cover)
+}
+
+/// The size, aspect kept, at which a `w` x `h` picture just covers `cw` x `ch`; `None` when it
+/// already does not (only ever scale down).
+fn cover_size(w: u32, h: u32, cw: u32, ch: u32) -> Option<(u32, u32)> {
+    let (w64, h64, cw64, ch64) = (u64::from(w), u64::from(h), u64::from(cw), u64::from(ch));
+    let (tw, th) = if cw64 * h64 >= ch64 * w64 {
+        (cw64, (h64 * cw64).div_ceil(w64.max(1)))
+    } else {
+        ((w64 * ch64).div_ceil(h64.max(1)), ch64)
+    };
+    let (tw, th) = (tw.max(1) as u32, th.max(1) as u32);
+    (tw < w && th < h).then_some((tw, th))
+}
+
+fn decode_with(
+    path: &Path,
+    limits: image::Limits,
+    cover: Option<(u32, u32)>,
+) -> anyhow::Result<Decoded> {
+    // Idempotent: returns false once registered.
+    jxl_oxide::integration::register_image_decoding_hook();
+    let mut reader = image::ImageReader::open(path)
+        .with_context(|| format!("error opening {path:?}"))?
+        .with_guessed_format()?;
+    // AVIF decoding needs the system dav1d library (image's avif-native); not built in.
+    if reader.format() == Some(image::ImageFormat::Avif) {
+        anyhow::bail!("error decoding {path:?}: AVIF is not supported (supported: {FORMATS})");
+    }
+    reader.limits(limits.clone());
+    // jxl-oxide (a hook format, so no built-in format here) already applies the codestream
+    // orientation, which JPEG XL says wins over any Exif tag.
+    let builtin = reader.format().is_some();
+    let decoded = (|| {
+        use image::metadata::Orientation;
+        use image::ImageDecoder as _;
+        let mut decoder = reader.into_decoder()?;
+        // decode() checks the buffer against the allocation limit; so do we.
+        limits.clone().reserve(decoder.total_bytes())?;
+        // Like swaylock's gdk_pixbuf_apply_embedded_orientation: a phone photo tagged
+        // "rotate 90" is shown upright. An unreadable tag is no rotation.
+        let orientation = if builtin {
+            decoder.orientation().unwrap_or(Orientation::NoTransforms)
+        } else {
+            Orientation::NoTransforms
+        };
+        let img = image::DynamicImage::from_decoder(decoder)?;
+        // Turned a quarter, the stored picture is the shown one's height by its width.
+        let turned = matches!(
+            orientation,
+            Orientation::Rotate90
+                | Orientation::Rotate270
+                | Orientation::Rotate90FlipH
+                | Orientation::Rotate270FlipH
+        );
+        let (sw, sh) = (img.width(), img.height());
+        let target = cover.and_then(|(cw, ch)| {
+            let (w, h) = if turned { (sh, sw) } else { (sw, sh) };
+            let (tw, th) = cover_size(w, h, cw, ch)?;
+            tracing::debug!("{path:?}: {w}x{h} px, scaled to {tw}x{th}");
+            Some(if turned { (th, tw) } else { (tw, th) })
+        });
+        // Premultiplied before scaling, so transparent pixels add no colour to their neighbours.
+        let mut rgba = match target {
+            Some((tw, th)) if !img.color().has_alpha() => img.thumbnail_exact(tw, th).into_rgba8(),
+            _ => img.into_rgba8(),
+        };
+        if rgba.pixels().any(|p| p.0[3] != 255) {
+            for px in rgba.pixels_mut() {
+                let [r, g, b, a] = px.0;
+                let pre = |c: u8| ((u16::from(c) * u16::from(a) + 127) / 255) as u8;
+                px.0 = [pre(r), pre(g), pre(b), a];
             }
         }
-        surface.mark_dirty();
-        Ok(Self(surface))
+        if let Some((tw, th)) = target.filter(|&t| t != rgba.dimensions()) {
+            rgba = image::imageops::thumbnail(&rgba, tw, th);
+        }
+        let mut img = image::DynamicImage::ImageRgba8(rgba);
+        img.apply_orientation(orientation);
+        Ok::<_, image::ImageError>(img.into_rgba8())
+    })();
+    let img = decoded.with_context(|| format!("error decoding {path:?} (supported: {FORMATS})"))?;
+    let (w, h) = img.dimensions();
+    // In place, already premultiplied: cairo ARGB32 is a native-endian u32 0xAARRGGBB.
+    let mut data = img.into_raw();
+    for px in data.chunks_exact_mut(4) {
+        let [r, g, b, a] = [px[0], px[1], px[2], px[3]];
+        px.copy_from_slice(&u32::from_be_bytes([a, r, g, b]).to_ne_bytes());
+    }
+    Ok((w, h, data))
+}
+
+impl Image {
+    pub fn load(path: &Path) -> anyhow::Result<Self> {
+        let (w, h, data) = decode(path)?;
+        Self::from_argb(w, h, &data)
     }
 }
 
@@ -199,6 +284,26 @@ impl Image {
             }
         }
         surface.mark_dirty();
+        Ok(Self(surface))
+    }
+
+    /// Wrap a decoded picture without copying it: [`Decoded`] rows are cairo's ARGB32 layout.
+    pub fn from_decoded((width, height, data): Decoded) -> anyhow::Result<Self> {
+        let stride = cairo::Format::ARgb32.stride_for_width(width)?;
+        // cairo wants rows of its own stride, 4-byte aligned.
+        let fits = stride as usize == width as usize * 4
+            && data.len() == width as usize * height as usize * 4
+            && data.as_ptr().align_offset(4) == 0;
+        if !fits {
+            return Self::from_argb(width, height, &data);
+        }
+        let surface = cairo::ImageSurface::create_for_data(
+            data,
+            cairo::Format::ARgb32,
+            width as i32,
+            height as i32,
+            stride,
+        )?;
         Ok(Self(surface))
     }
 
@@ -408,6 +513,64 @@ mod tests {
                 assert!(near, "{name} ({x}, {y}): {got:?}, want {want:?}");
             }
         }
+    }
+
+    /// A BMP header for a `w` x `h` 24-bit picture with no pixel data: enough for the decoder to
+    /// report its size, nothing to decode.
+    fn bmp_header(dir: &Path, w: u32, h: u32) -> std::path::PathBuf {
+        let path = dir.join(format!("{w}x{h}.bmp"));
+        let row = (w * 3).div_ceil(4) * 4;
+        let mut b = Vec::new();
+        b.extend_from_slice(b"BM");
+        b.extend_from_slice(&(54 + row * h).to_le_bytes());
+        b.extend_from_slice(&[0; 4]);
+        b.extend_from_slice(&54u32.to_le_bytes());
+        b.extend_from_slice(&40u32.to_le_bytes());
+        b.extend_from_slice(&w.to_le_bytes());
+        b.extend_from_slice(&h.to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b.extend_from_slice(&24u16.to_le_bytes());
+        b.extend_from_slice(&[0; 24]);
+        std::fs::write(&path, b).unwrap();
+        path
+    }
+
+    /// A reload refuses a picture from its header, before any pixel buffer exists: over the
+    /// pixel cap, or over the GPU texture limit on a side (32767 when no renderer has run).
+    #[test]
+    fn reload_refuses_huge_pictures_from_the_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = decode_for_reload(&bmp_header(dir.path(), 12000, 12000), None).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("12000x12000 px is over the 64 megapixels"),
+            "{err:#}"
+        );
+        let err = decode_for_reload(&bmp_header(dir.path(), 40000, 10), None).unwrap_err();
+        assert!(format!("{err:#}").contains("40000x10"), "{err:#}");
+        assert!(format!("{err:#}").contains("texture limit"), "{err:#}");
+    }
+
+    /// A reload scales the picture down, keeping its aspect ratio, until it just covers the
+    /// size asked for; it never scales up.
+    #[test]
+    fn reload_scales_down_to_cover() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.png");
+        image::RgbaImage::from_pixel(200, 100, image::Rgba([0, 255, 0, 255]))
+            .save(&path)
+            .unwrap();
+        let (w, h, data) = decode_for_reload(&path, Some((32, 24))).unwrap();
+        assert_eq!((w, h), (48, 24));
+        assert_eq!(data.len(), 48 * 24 * 4);
+        let img = Image::from_argb(w, h, &data).unwrap();
+        assert_eq!(pixel(&mut { img.0 }, 20, 10), [0, 255, 0, 255]);
+        let (w, h, _) = decode_for_reload(&path, Some((400, 10))).unwrap();
+        assert_eq!((w, h), (200, 100), "never scaled up");
+        let (w, h, _) = decode_for_reload(&path, None).unwrap();
+        assert_eq!((w, h), (200, 100));
+        // The Exif orientation counts: 16x8 stored, 8x16 shown, so covering 4x4 gives 4x8.
+        let (w, h, _) = decode_for_reload(&testdata("exif6.png"), Some((4, 4))).unwrap();
+        assert_eq!((w, h), (4, 8));
     }
 
     #[test]

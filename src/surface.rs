@@ -16,7 +16,8 @@ use wayland_client::protocol::wl_output::WlOutput;
 use wayland_client::protocol::wl_surface::WlSurface;
 
 use crate::config::{
-    Background, Color, Config, HAlign, InputField, RingIndicator, RingStyle, VAlign, Widget,
+    Background, Color, Config, HAlign, ImageWidget, InputField, RingIndicator, RingStyle, VAlign,
+    Widget,
 };
 pub use crate::render::background::Image;
 use crate::render::blur::Blur;
@@ -44,6 +45,11 @@ type RingTexture = (TextureBuffer<GlesTexture>, (f64, f64));
 enum Cached {
     Background {
         tex: Option<TextureBuffer<GlesTexture>>,
+        /// The reload generation `tex` was rendered at.
+        generation: u64,
+        /// The picture a reload replaced, drawn under `tex` while it fades in, and when that
+        /// began (animation clock time).
+        fading_from: Option<(TextureBuffer<GlesTexture>, std::time::Duration)>,
     },
     Ring(Box<RingCache>),
     /// The border box (border and shadow) and the fill box inside it, and with `rotate` both
@@ -62,6 +68,10 @@ enum Cached {
     },
     Image {
         tex: Option<TextureBuffer<GlesTexture>>,
+        /// The reload generation `tex` was rendered at.
+        generation: u64,
+        /// The pixel size of the picture `tex` was rendered from.
+        drawn: (i32, i32),
         frame: Box<RoundedBox>,
         /// With `rotate`: picture, border and shadow in one texture, keyed by the frame.
         rotated: Option<Rotated<(shape::Params, bool)>>,
@@ -107,6 +117,8 @@ pub struct FieldCache {
 pub struct Dynamic<'a> {
     pub vars: crate::textvars::Vars<'a>,
     pub cmd_output: &'a [Option<String>],
+    /// Which picture each `background` and `image` shows now (reload-ms, reload-cmd).
+    pub reload: &'a crate::reload::Reload,
     /// Whole-screen opacity for fade-in/out, 0..1. Drawn as a black overlay at `1 - opacity`.
     pub opacity: f32,
     /// The animation clock, already advanced to this frame.
@@ -144,12 +156,15 @@ pub struct Surface {
     /// Indices into `config.widgets` that apply to this output, in draw order.
     widgets: Vec<usize>,
     cache: Vec<Cached>,
-    /// Set by `draw`: an input-field animation is running (needs frames at the redraw rate).
+    /// Set by `draw`: an input-field animation or a background crossfade is running (needs
+    /// frames at the redraw rate).
     pub field_animating: bool,
     /// Set by `draw`: when the earliest input-field fade-out timer fires (animation clock time).
     pub field_wake: Option<std::time::Duration>,
     /// Set by `draw`: a swayward-style ring animation is running.
     pub ring_animating: bool,
+    /// Set by `draw`: each widget whose new (reloaded) picture it tried, and whether it rendered.
+    pub trials: Vec<(usize, bool)>,
     fallback: SolidColorBuffer,
     fade: SolidColorBuffer,
     /// Screenshot of this output taken before locking, for `background { screenshot }`.
@@ -174,6 +189,7 @@ impl Surface {
             field_animating: false,
             field_wake: None,
             ring_animating: false,
+            trials: Vec::new(),
             fallback: SolidColorBuffer::default(),
             fade: SolidColorBuffer::default(),
             screenshot: None,
@@ -181,7 +197,7 @@ impl Surface {
         }
     }
 
-    fn buffer_size(&self) -> Size<i32, Physical> {
+    pub fn buffer_size(&self) -> Size<i32, Physical> {
         buffer_size(self.size, self.scale)
     }
 
@@ -242,7 +258,11 @@ impl Surface {
         self.cache = chosen
             .iter()
             .map(|&i| match &config.widgets[i] {
-                Widget::Background(_) => Cached::Background { tex: None },
+                Widget::Background(_) => Cached::Background {
+                    tex: None,
+                    generation: 0,
+                    fading_from: None,
+                },
                 Widget::Shape(_) => {
                     Cached::Shape(Box::new([RoundedBox::new(), RoundedBox::new()]), None)
                 }
@@ -265,6 +285,8 @@ impl Surface {
                 })),
                 Widget::Image(_) => Cached::Image {
                     tex: None,
+                    generation: 0,
+                    drawn: (0, 0),
                     frame: Box::new(RoundedBox::new()),
                     rotated: None,
                 },
@@ -352,6 +374,7 @@ impl Surface {
         dynamic: &Dynamic<'_>,
     ) -> anyhow::Result<bool> {
         let buffer = self.buffer_size();
+        self.trials.clear();
         let (Some(egl), Some(damage)) = (self.egl.as_mut(), self.damage.as_mut()) else {
             return Ok(false);
         };
@@ -364,26 +387,80 @@ impl Surface {
         let mut elements: Vec<LockElement> = Vec::new();
         for (slot, &i) in self.cache.iter_mut().zip(&self.widgets) {
             match (&config.widgets[i], slot) {
-                (Widget::Background(bg), Cached::Background { tex }) => {
-                    if tex.is_none() {
+                (
+                    Widget::Background(bg),
+                    Cached::Background {
+                        tex,
+                        generation,
+                        fading_from,
+                    },
+                ) => {
+                    let wanted = dynamic.reload.generation(i);
+                    let reloaded = *generation != wanted;
+                    if tex.is_none() || reloaded {
+                        *generation = wanted;
+                        let scale = self.scale;
+                        let mut paint = |image: Option<&Image>| {
+                            render_background(renderer, bg, image, buffer, scale)
+                                .map_err(|err| tracing::warn!("background: {err:#}"))
+                                .ok()
+                        };
                         // A widget that fails to render is skipped, never the whole frame: the
                         // fallback colour and the other widgets still reach the screen.
-                        let image = if bg.screenshot {
-                            self.screenshot.as_ref()
+                        if bg.screenshot {
+                            *tex = paint(self.screenshot.as_ref()).or(tex.take());
                         } else {
-                            bg.path.as_ref().and_then(|p| images.0.get(p))
-                        };
-                        match render_background(renderer, bg, image, buffer, self.scale) {
-                            Ok(t) => *tex = Some(t),
-                            Err(err) => tracing::warn!("background: {err:#}"),
+                            let configured = bg.path.as_ref().and_then(|p| images.get(p));
+                            let trial = dynamic.reload.on_trial(i);
+                            let painted = paint(dynamic.reload.newest(i).or(configured));
+                            if trial {
+                                self.trials.push((i, painted.is_some()));
+                            }
+                            match painted {
+                                Some(t) => {
+                                    let old = tex.replace(t);
+                                    *fading_from = old
+                                        .filter(|_| {
+                                            trial && bg.crossfade_ms > 0 && !config.animations.off
+                                        })
+                                        .map(|old| (old, dynamic.clock.now()));
+                                }
+                                // A new picture that fails to render leaves the old one up
+                                // (rendered again if a relayout dropped it).
+                                None if trial && tex.is_none() => {
+                                    *tex = paint(dynamic.reload.shown(i).or(configured));
+                                }
+                                None => {}
+                            }
                         }
                     }
                     let Some(buf) = tex.clone() else { continue };
+                    let mut alpha = 1.;
+                    if let Some((old, start)) = fading_from.as_ref() {
+                        let elapsed = dynamic.clock.now().saturating_sub(*start);
+                        match crossfade_alpha(elapsed, bg.crossfade_ms) {
+                            Some(p) => {
+                                alpha = p;
+                                self.field_animating = true;
+                                elements.push(LockElement::Texture(
+                                    TextureRenderElement::from_texture_buffer(
+                                        old.clone(),
+                                        (0., 0.),
+                                        1.,
+                                        None,
+                                        Some(size),
+                                        Kind::Unspecified,
+                                    ),
+                                ));
+                            }
+                            None => *fading_from = None,
+                        }
+                    }
                     elements.push(LockElement::Texture(
                         TextureRenderElement::from_texture_buffer(
                             buf,
                             (0., 0.),
-                            1.,
+                            alpha,
                             None,
                             Some(size),
                             Kind::Unspecified,
@@ -649,17 +726,45 @@ impl Surface {
                     Widget::Image(im),
                     Cached::Image {
                         tex,
+                        generation,
+                        drawn,
                         frame,
                         rotated,
                     },
                 ) => {
-                    let Some(img) = images.0.get(&im.path) else {
-                        continue;
+                    let wanted = dynamic.reload.generation(i);
+                    let reloaded = *generation != wanted;
+                    *generation = wanted;
+                    let configured = images.get(&im.path);
+                    let newest = dynamic.reload.newest(i).or(configured);
+                    if tex.is_none() || reloaded {
+                        let fresh = newest.and_then(|img| {
+                            Some((render_image(renderer, im, img, scale)?, img.size()))
+                        });
+                        let trial = dynamic.reload.on_trial(i);
+                        if trial {
+                            self.trials.push((i, fresh.is_some()));
+                        }
+                        if let Some((t, from)) = fresh {
+                            *tex = Some(t);
+                            *drawn = from;
+                            *rotated = None;
+                        } else if trial && tex.is_none() {
+                            // A new picture that fails to render leaves the old one up (rendered
+                            // again if a relayout dropped it).
+                            if let Some(img) = dynamic.reload.shown(i).or(configured) {
+                                *tex = render_image(renderer, im, img, scale);
+                                *drawn = img.size();
+                            }
+                        }
+                    }
+                    // The size of the picture `tex` shows, which a failed reload keeps.
+                    let (iw, ih) = match (tex.is_some(), newest) {
+                        (true, _) => *drawn,
+                        (false, Some(img)) => img.size(),
+                        (false, None) => continue,
                     };
-                    let (iw, ih) = img.size();
-                    // hyprlock: scale so the shorter side is `size`, keeping the aspect ratio.
-                    let k = im.size / f64::from(iw.min(ih));
-                    let inner = Size::<f64, Logical>::from((f64::from(iw) * k, f64::from(ih) * k));
+                    let inner = image_inner(im, (iw, ih));
                     let bw = im.border.map_or(0., |b| b.width);
                     let outer = inner + Size::from((2. * bw, 2. * bw));
                     let angle = im.rotate.to_radians();
@@ -674,18 +779,6 @@ impl Surface {
                         im.corner_radius.map(|r| r.expanded_by(bw as f32)),
                         outer,
                     );
-                    let inner_radius = shape::resolve_radius(im.corner_radius, inner);
-                    if tex.is_none() {
-                        let phys = inner.to_physical_precise_round(scale);
-                        let r = <[f32; 4]>::from(inner_radius).map(|v| f64::from(v) * scale);
-                        *tex = crate::render::check_texture_size(phys.w, phys.h)
-                            .and_then(|()| {
-                                crate::render::background::render_clipped(img, phys.w, phys.h, r)
-                            })
-                            .and_then(|s| upload(renderer, s, scale))
-                            .map_err(|err| tracing::warn!("image: {err:#}"))
-                            .ok();
-                    }
                     // Shadow and border behind/around the picture, via the shape renderer.
                     let params = shape::Params {
                         size: outer,
@@ -970,11 +1063,49 @@ fn draw_rotated<K: PartialEq>(
     )))
 }
 
+/// An `image` widget's picture area: hyprlock scales so the shorter side is `size`, keeping the
+/// aspect ratio of a `w` x `h` picture.
+fn image_inner(im: &ImageWidget, (w, h): (i32, i32)) -> Size<f64, Logical> {
+    let k = im.size / f64::from(w.min(h).max(1));
+    Size::from((f64::from(w) * k, f64::from(h) * k))
+}
+
+/// An `image` widget's picture, clipped to its corner radius, as a texture; `None` (logged) when
+/// it cannot be drawn, such as over the GPU texture limit.
+fn render_image(
+    renderer: &mut GlesRenderer,
+    im: &ImageWidget,
+    img: &Image,
+    scale: f64,
+) -> Option<TextureBuffer<GlesTexture>> {
+    let inner = image_inner(im, img.size());
+    let phys = inner.to_physical_precise_round(scale);
+    let radius = shape::resolve_radius(im.corner_radius, inner);
+    let r = <[f32; 4]>::from(radius).map(|v| f64::from(v) * scale);
+    crate::render::check_texture_size(phys.w, phys.h)
+        .and_then(|()| background::render_clipped(img, phys.w, phys.h, r))
+        .and_then(|s| upload(renderer, s, scale))
+        .map_err(|err| tracing::warn!("image: {err:#}"))
+        .ok()
+}
+
 /// Decoded images, keyed by path, shared by all outputs.
 #[derive(Default)]
 pub struct Images(std::collections::HashMap<std::path::PathBuf, Image>);
 
 impl Images {
+    pub fn get(&self, path: &std::path::Path) -> Option<&Image> {
+        self.0.get(path)
+    }
+
+    pub fn contains(&self, path: &std::path::Path) -> bool {
+        self.0.contains_key(path)
+    }
+
+    pub fn remove(&mut self, path: &std::path::Path) {
+        self.0.remove(path);
+    }
+
     pub fn load_all(config: &Config) -> Self {
         let mut images = std::collections::HashMap::new();
         for w in &config.widgets {
@@ -998,6 +1129,14 @@ impl Images {
         }
         Self(images)
     }
+}
+
+/// The new picture's opacity `elapsed` into a crossfade of `duration_ms`, linear; `None` once it
+/// is over (or there is none), when the old picture is dropped. Drawing the old picture opaque
+/// and the new one at this alpha is `mix(old, new, p)` for opaque pictures.
+fn crossfade_alpha(elapsed: std::time::Duration, duration_ms: u32) -> Option<f32> {
+    let duration = std::time::Duration::from_millis(duration_ms.into());
+    (elapsed < duration).then(|| elapsed.as_secs_f32() / duration.as_secs_f32())
 }
 
 fn render_background(
@@ -1351,8 +1490,23 @@ fn render_ring(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use crate::config::{Common, HAlign, Length, VAlign};
+
+    #[test]
+    fn crossfade_is_linear_and_ends() {
+        let at = |ms| crossfade_alpha(Duration::from_millis(ms), 2000);
+        assert_eq!(at(0), Some(0.));
+        assert_eq!(at(500), Some(0.25));
+        assert_eq!(at(1000), Some(0.5));
+        assert_eq!(at(1999).map(|p| p > 0.99), Some(true));
+        assert_eq!(at(2000), None);
+        assert_eq!(at(9000), None);
+        // No duration: nothing to fade.
+        assert_eq!(crossfade_alpha(Duration::ZERO, 0), None);
+    }
 
     fn common(halign: HAlign, valign: VAlign, x: f64, y: f64) -> Common {
         Common {

@@ -957,6 +957,9 @@ mod tests {
     /// the same Pango layout).
     #[test]
     fn layout_box_geometry_and_colours() {
+        if !crate::render::text::fonts_available("layout_box_geometry_and_colours") {
+            return;
+        }
         let mut state = LockState::new(&General::default());
         state.layout_names = vec!["English (US)".into()];
         let bg = Color::from_rgba8_unpremul(10, 20, 30, 255);
@@ -993,9 +996,16 @@ mod tests {
             // box on the side: nothing.
             assert_eq!(pixel(&mut surface, x + bw / 2., y + bh / 2.), rgba(bg));
             assert_eq!(pixel(&mut surface, x, y + bh / 2.), rgba(border));
-            assert_eq!(pixel(&mut surface, x + bw - 1., y + bh / 2.), rgba(border));
+            // The right edge is at x + bw, which is half a pixel off the grid when the text width
+            // is odd; the pixel it floors to is covered by the stroke either way (x + bw - 1
+            // would be half covered, so the colour would depend on the font's metrics).
+            assert_eq!(pixel(&mut surface, x + bw, y + bh / 2.), rgba(border));
             assert_eq!(pixel(&mut surface, x + bw / 2., y + bh - 1.), rgba(border));
-            assert_eq!(pixel(&mut surface, x - 3., y + bh / 2.)[3], 0);
+            // A text wider than the ring (a wide font) makes the buffer as wide as the box, so
+            // there is no side outside the box to look at.
+            if x >= 3. {
+                assert_eq!(pixel(&mut surface, x - 3., y + bh / 2.)[3], 0);
+            }
 
             // The text: where the padding puts it.
             let want = with_text(
