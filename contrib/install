@@ -1,0 +1,378 @@
+#!/usr/bin/env python3
+"""User-local source installer. Only explicitly trusted artifacts may be executed."""
+import argparse
+import contextlib
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import shlex
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+
+REPO = Path(__file__).resolve().parent.parent
+MANIFEST = "share/swaywardlock/install-manifest.json"
+PAM_PATHS = (Path("/etc/pam.d/swaywardlock"), Path("/usr/lib/pam.d/swaywardlock"))
+
+
+def safe_path(path, directory=False):
+    """lstat, including dangling links; never resolve a destination through a link."""
+    path = Path(os.path.abspath(path))
+    # Fedora Atomic's root-owned system alias is not a user-controlled ancestor.
+    if path == Path("/home") or Path("/home") in path.parents:
+        home = Path("/home")
+        info = home.lstat()
+        if stat.S_ISLNK(info.st_mode) and info.st_uid == 0 and os.readlink(home) in ("var/home", "/var/home"):
+            for system in (Path("/"), Path("/var"), Path("/var/home")):
+                info = system.lstat()
+                if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0:
+                    raise ValueError(f"unsafe system home alias: {system}")
+            path = Path("/var/home") / path.relative_to("/home")
+    for ancestor in reversed((path, *path.parents)):
+        try:
+            mode = ancestor.lstat().st_mode
+        except FileNotFoundError:
+            continue
+        is_dir = ancestor != path or directory
+        if stat.S_ISLNK(mode) or not (stat.S_ISDIR(mode) if is_dir else stat.S_ISREG(mode)):
+            raise ValueError(f"unsafe {'directory' if is_dir else 'file'}: {ancestor}")
+    return path
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def read_manifest(prefix):
+    path = safe_path(prefix / MANIFEST)
+    if not path.exists():
+        return {}
+    value = json.loads(path.read_text())
+    if not isinstance(value, dict) or value.get("version") != 1 or not isinstance(value.get("files"), dict):
+        raise ValueError("invalid install manifest")
+    files = value["files"]
+    for name, checksum in files.items():
+        if not isinstance(name, str):
+            raise ValueError("invalid manifest path")
+        parts = PurePosixPath(name)
+        if (not name or parts.is_absolute() or ".." in parts.parts or "." in name.split("/")
+                or str(parts) != name or name == MANIFEST):
+            raise ValueError(f"unsafe manifest path: {name}")
+        if not isinstance(checksum, str) or not re.fullmatch(r"[0-9a-f]{64}", checksum):
+            raise ValueError("invalid manifest hash")
+        safe_path(prefix / name)
+    return files
+
+
+def manifest_bytes(files):
+    return (json.dumps({"version": 1, "files": files}, indent=2, sort_keys=True) + "\n").encode()
+
+
+def atomic_write(path, data, mode):
+    path = safe_path(path)
+    safe_path(path.parent, directory=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix=".swaywardlock-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as out:
+            out.write(data)
+            out.flush()
+            os.fsync(out.fileno())
+            os.fchmod(out.fileno(), mode)
+        safe_path(path)
+        os.replace(name, path)
+    finally:
+        if os.path.lexists(name):
+            os.unlink(name)
+
+
+@contextlib.contextmanager
+def lock(name):
+    path = Path(tempfile.gettempdir()) / f"swaywardlock-install-{os.geteuid()}-{digest(str(name).encode())}.lock"
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+            raise ValueError(f"unsafe install lock: {path}")
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield
+    finally:
+        os.close(fd)
+    # Keep the lock inode: unlinking it could let a second process lock another inode.
+
+
+def run(args, **kwargs):
+    result = subprocess.run([str(a) for a in args], stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, timeout=60, **kwargs)
+    if result.stderr:
+        sys.stderr.buffer.write(result.stderr) if hasattr(sys.stderr, "buffer") else sys.stderr.write(result.stderr.decode(errors="replace"))
+    if result.returncode:
+        raise ValueError(f"command failed ({result.returncode}): {shlex.join(map(str, args))}")
+    return result.stdout
+
+
+def in_container():
+    return bool(os.environ.get("CONTAINER_ID")) or Path("/run/.containerenv").exists()
+
+
+def config_root():
+    value = os.environ.get("XDG_CONFIG_HOME", "")
+    return Path(value) if value and Path(value).is_absolute() else Path.home() / ".config"
+
+
+def on_host(args):
+    # Do not call distrobox-host-exec: it can prompt to download host-spawn/run sudo.
+    if not shutil.which("host-spawn"):
+        raise ValueError("run installer on the host: container requires existing host-spawn")
+    command = ["host-spawn", "--no-pty", "env", "-u", "CONTAINER_ID", f"HOME={Path.home()}",
+               f"XDG_CONFIG_HOME={config_root()}", "python3", str(REPO / "contrib/install"),
+               "--prefix", os.path.abspath(os.path.expanduser(args.prefix))]
+    for option in ("binary", "config_file"):
+        value = getattr(args, option)
+        if value:
+            command += ["--" + option.replace("_", "-"), os.path.abspath(os.path.expanduser(value))]
+    if args.no_build:
+        command.append("--no-build")
+    if args.uninstall:
+        command.append("--uninstall")
+    if args.config:
+        command += ["--config", args.config]
+    return subprocess.run(command, check=False, timeout=960).returncode
+
+
+def build():
+    target = safe_path(REPO / "target/install", directory=True)
+    with lock(target):
+        binary = safe_path(target / "release/swaywardlock")
+        target.mkdir(parents=True, exist_ok=True)
+        build_lock = safe_path(target / ".install-build.lock")
+        # The inner flock survives a killed distrobox client; remove stale output under it.
+        cache = safe_path(target / "cargo-home", directory=True)
+        cargo = ["env", "-u", "RUSTFLAGS", "-u", "CARGO_ENCODED_RUSTFLAGS",
+                 f"CARGO_HOME={cache}", f"CARGO_TARGET_DIR={target}", "cargo", "build", "--release", "--locked", "--jobs", "2"]
+        if not shutil.which("distrobox"):
+            raise ValueError("distrobox required to enter existing swayward-dev")
+        listing = run(["distrobox", "list", "--no-color"]).decode()
+        if not any(len(columns := line.split("|")) > 1 and columns[1].strip() == "swayward-dev"
+                   for line in listing.splitlines()):
+            raise ValueError("existing swayward-dev container is missing; refusing creation")
+        # A declined enter can return 0 without running anything. Only this invocation's
+        # inner build may create its receipt, and the returned bytes must match it.
+        with tempfile.TemporaryDirectory(prefix=".build-receipt-", dir=target) as temp:
+            receipt = Path(temp) / "completed.json"
+            writer = ("import hashlib,json,os,pathlib,sys; "
+                      "binary,receipt=sys.argv[1:]; "
+                      "data=pathlib.Path(binary).read_bytes(); "
+                      "fd=os.open(receipt,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600); "
+                      "out=os.fdopen(fd,'w'); "
+                      "json.dump({'invocation':receipt,'sha256':hashlib.sha256(data).hexdigest()},out); "
+                      "out.close()")
+            proof = ["python3", "-c", writer, str(binary), str(receipt)]
+            command = ["flock", "-n", str(build_lock), "timeout", "900", "sh", "-c",
+                       f"rm -f {shlex.quote(str(binary))} && {shlex.join(cargo)} && {shlex.join(proof)}"]
+            args = ["distrobox", "enter", "swayward-dev", "--", "sh", "-c",
+                    f"cd {shlex.quote(str(REPO))} && {shlex.join(command)}"]
+            # Refuse creation even if the checked container disappears before enter.
+            environment = dict(os.environ, DBX_NON_INTERACTIVE="0")
+            subprocess.run(args, cwd=REPO, check=True, timeout=930, input=b"n\n", env=environment)
+            fd = os.open(receipt, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(fd) as source:
+                if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                    raise ValueError("invalid build completion receipt")
+                value = json.load(source)
+            if (not isinstance(value, dict) or value.get("invocation") != str(receipt)
+                    or not isinstance(value.get("sha256"), str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", value["sha256"])):
+                raise ValueError("invalid build completion receipt")
+            data = binary.read_bytes()
+            if digest(data) != value["sha256"]:
+                raise ValueError("build artifact does not match completion receipt")
+            return data
+
+
+def stage(args, directory):
+    # Copy exact bytes, scan BEFORE ldd or execution. A scan is NOT provenance verification.
+    data = Path(args.binary).read_bytes() if args.no_build else build()
+    if any(needle in data for needle in (b"swaywardlock-test", b"SWAYWARDLOCK_TEST_")):
+        raise ValueError("refusing artifact containing test-auth password or test hooks")
+    binary = directory / "swaywardlock"
+    binary.write_bytes(data)
+    binary.chmod(0o700)
+    for tool in ("ldd", "scdoc"):
+        if not shutil.which(tool):
+            raise ValueError(f"host {tool} is required")
+    loader = subprocess.run(["ldd", str(binary)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+    linkage = (loader.stdout + loader.stderr).decode(errors="replace")
+    if loader.returncode:
+        raise ValueError(f"host ldd failed ({loader.returncode}):\n{linkage}")
+    if re.search(r"not found|error|cannot|undefined symbol|not a dynamic executable|not a regular file", linkage, re.I):
+        raise ValueError(f"host loader check failed:\n{linkage}")
+    files = {"bin/swaywardlock": (data, 0o755)}
+    for format in ("swaylock", "hyprlock"):
+        files[f"bin/swaywardlock-{format}-to-kdl"] = ((REPO / f"contrib/{format}-to-kdl").read_bytes(), 0o755)
+    files["share/man/man1/swaywardlock.1"] = (run(["scdoc"], input=(REPO / "docs/swaywardlock.1.scd").read_bytes()), 0o644)
+    for shell, dest in (("bash", "bash-completion/completions/swaywardlock"),
+                        ("fish", "fish/vendor_completions.d/swaywardlock.fish"),
+                        ("zsh", "zsh/site-functions/_swaywardlock")):
+        completion = run([binary, "completions", shell])
+        if not completion:
+            raise ValueError(f"empty {shell} completion")
+        files[f"share/{dest}"] = (completion, 0o644)
+    sources = [REPO / "README.md", REPO / "LICENSE"]
+    sources += sorted((REPO / "examples").rglob("*"))
+    sources += sorted((REPO / "docs").rglob("*"))
+    for source in sources:
+        if source.is_file():
+            relative = source.relative_to(REPO).as_posix()
+            files[f"share/doc/swaywardlock/{relative}"] = (source.read_bytes(), 0o644)
+            # The man page uses specs/; README and USING use docs/specs/.
+            if relative.startswith("docs/specs/"):
+                files[f"share/doc/swaywardlock/{relative[5:]}"] = (source.read_bytes(), 0o644)
+    config = None
+    if args.config:
+        root = config_root()
+        source = Path(args.config_file) if args.config_file else root / (
+            "swaylock/config" if args.config == "swaylock" else "hypr/hyprlock.conf")
+        converted = run([sys.executable, REPO / f"contrib/{args.config}-to-kdl", source])
+        private = directory / "config.kdl"
+        private.write_bytes(converted)
+        private.chmod(0o600)
+        run([binary, "validate", "-c", private])
+        config = (safe_path(root / "swaywardlock/config.kdl"), converted)
+    return files, config
+
+
+def check_collisions(prefix, old, files):
+    for name in old.keys() | files.keys():
+        path = safe_path(prefix / name)
+        if path.exists():
+            if name not in old:
+                # Do not silently adopt even byte-identical unrecorded files.
+                raise ValueError(f"unrecorded collision (not adopted): {path}")
+            if digest(path.read_bytes()) != old[name]:
+                raise ValueError(f"modified owned file: {path}")
+
+
+def backup_config(path):
+    if not path.exists():
+        return
+    data = path.read_bytes()
+    fd, name = tempfile.mkstemp(prefix=path.name + ".bak.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as out:
+            out.write(data)
+            out.flush()
+            os.fsync(out.fileno())
+    except BaseException:
+        os.unlink(name)
+        raise
+    print(f"config backup: {name}")
+
+
+def pam_instructions():
+    if any(os.path.lexists(path) for path in PAM_PATHS):
+        print("Existing PAM service left alone.")
+        return
+    # Output only. Noclobber protects against a new file (including a dangling link).
+    source = shlex.quote(str(REPO / "pam/swaywardlock"))
+    script = ("test ! -e /etc/pam.d/swaywardlock && test ! -L /etc/pam.d/swaywardlock "
+              "&& test ! -e /usr/lib/pam.d/swaywardlock && test ! -L /usr/lib/pam.d/swaywardlock "
+              f"&& (umask 022; set -C; cat {source} > /etc/pam.d/swaywardlock)")
+    print("PAM service absent. Review pam/swaywardlock and ensure the login PAM service exists")
+    print("(util-linux on Fedora/Arch; login on Ubuntu). As root, run manually:")
+    print("  sh -c " + shlex.quote(script))
+
+
+def install(args, prefix):
+    old = read_manifest(prefix)
+    with tempfile.TemporaryDirectory(prefix="swaywardlock-stage-") as temp:
+        files, config = stage(args, Path(temp))
+        check_collisions(prefix, old, files)
+        if config:
+            path, data = config
+            safe_path(path)
+            backup_config(path)  # A failed backup must stop before replacements.
+        # All generation, conversion, validation and collision checks precede replacements.
+        for name, (data, mode) in files.items():
+            atomic_write(prefix / name, data, mode)
+        for name in old.keys() - files.keys():
+            path = safe_path(prefix / name)
+            if path.exists():
+                path.unlink()
+        atomic_write(prefix / MANIFEST, manifest_bytes({name: digest(data) for name, (data, _) in files.items()}), 0o600)
+        if config:
+            atomic_write(config[0], config[1], 0o600)
+    print(f"Installed under {prefix}. Add {prefix / 'bin'} to PATH if needed.")
+    print("Host ldd checked linked libraries only; dlopen EGL drivers and PAM are not certified.")
+    pam_instructions()
+
+
+def uninstall(prefix):
+    files = read_manifest(prefix)
+    remaining = {}
+    for name, checksum in files.items():
+        path = safe_path(prefix / name)
+        if not path.exists():
+            continue
+        if digest(path.read_bytes()) == checksum:
+            path.unlink()
+        else:
+            remaining[name] = checksum
+            print(f"Preserved modified file: {path}")
+    manifest = safe_path(prefix / MANIFEST)
+    if remaining:
+        atomic_write(manifest, manifest_bytes(remaining), 0o600)
+    elif manifest.exists():
+        manifest.unlink()
+    print("Uninstall left config, backups, unrecorded files, directories and PAM alone.")
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__, epilog="--binary must be trusted: ldd can execute untrusted code; string scans do not guarantee provenance.")
+    parser.add_argument("--prefix", default=str(Path.home() / ".local"))
+    parser.add_argument("--no-build", action="store_true")
+    parser.add_argument("--binary", metavar="FILE", help="explicitly trusted artifact; requires --no-build")
+    parser.add_argument("--config", choices=("swaylock", "hyprlock"))
+    parser.add_argument("--config-file", metavar="FILE")
+    parser.add_argument("--uninstall", action="store_true")
+    try:
+        args = parser.parse_args(argv)
+        if args.uninstall and (args.no_build or args.binary or args.config or args.config_file):
+            parser.error("--uninstall rejects build and config options")
+        if not args.uninstall and args.no_build != bool(args.binary):
+            parser.error("--no-build requires --binary FILE; --binary is forbidden with a build")
+        if args.config_file and not args.config:
+            parser.error("--config-file requires --config swaylock|hyprlock")
+        if os.geteuid() == 0:
+            raise ValueError("root install/uninstall is forbidden; run as your user")
+        if in_container():
+            return on_host(args)
+        prefix = safe_path(Path(args.prefix).expanduser(), directory=True)
+        with lock(prefix):
+            uninstall(prefix) if args.uninstall else install(args, prefix)
+        return 0
+    except SystemExit as error:
+        return error.code
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        print(f"install: {error}", file=sys.stderr)
+        return 1
+
+
+def interrupted(number, _frame):
+    # A second signal must not interrupt finally blocks cleaning private staging files.
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, signal.SIG_IGN)
+    raise SystemExit(128 + number)
+
+
+if __name__ == "__main__":
+    os.umask(0o077)
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, interrupted)
+    sys.exit(main())

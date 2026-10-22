@@ -61,6 +61,7 @@ if [ "$mode" != --slow ]; then
     step doc-kdl python3 contrib/check-doc-kdl "$bin"
     # The release metadata (version, tag, PKGBUILD, spec) must agree.
     step release-metadata contrib/test-release-consistency
+    step installer timeout 120 python3 contrib/test-install.py
     step completions-bash completions bash
     step completions-zsh completions zsh
 fi

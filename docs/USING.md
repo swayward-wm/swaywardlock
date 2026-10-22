@@ -105,11 +105,80 @@ the design document in `/usr/share/doc/swaywardlock/specs`. `swaywardlock comple
 bash|zsh|fish|elvish|powershell` prints a completion script. (The tarball has no completions and
 no design document; see its `RUNTIME.txt`.)
 
-From source, swaywardlock authenticates through PAM with the service `swaywardlock`, so install
-the shipped PAM file yourself (as root):
+### User-local source install
 
+From a checkout, run as your normal user on the host (requires Python 3, host `ldd` and
+`scdoc`, and the existing `swayward-dev` distrobox with build dependencies):
+
+```sh
+contrib/install
+contrib/install --config swaylock
+contrib/install --config hyprlock --config-file /path/to/hyprlock.conf
+contrib/install --uninstall
 ```
-install -Dm644 pam/swaywardlock /etc/pam.d/swaywardlock
+
+The default prefix is `$HOME/.local` (`--prefix DIR` selects another prefix). Put its `bin`
+on `PATH`; binaries, converters, man page, completions, examples and linked documentation
+are installed there. Builds use only the existing `swayward-dev`, even from another container;
+an invocation inside a container delegates installation to the host using an already installed
+`host-spawn` (otherwise it fails and asks you to run on the host). `ldd` and `scdoc` therefore
+always run on the host, while Cargo runs inside the named build container.
+The default-feature release uses private
+`target/install/release`, two jobs, an exclusive build lock and a 900-second in-container timeout.
+The build container also needs `flock`, `timeout`, `sh`, `rm`, `env` and Python 3.
+After Cargo succeeds under the lock, the inner build writes a unique invocation receipt with
+an artifact hash. The installer requires that receipt and matching bytes, not just exit status 0:
+a declined container entry, failed or timed-out build never falls back to an old binary. The installer neither creates
+containers nor installs dependencies, changes sessions or runs sudo. Install/uninstall reject root.
+
+To skip building, supply an **explicitly trusted** binary:
+
+```sh
+contrib/install --no-build --binary /path/to/trusted/release/swaywardlock
+```
+
+`--no-build` requires `--binary`; `--binary` is forbidden when building. Exact staged bytes
+are scanned for test-auth strings before any execution. That scan is **not a provenance
+guarantee**: `ldd` can execute untrusted code. Never feed an untrusted download to this option.
+Host `ldd` errors and missing libraries stop installation; the check does not certify dlopened
+EGL drivers, the compositor or PAM. Completion generation and conversion validation execute
+only the staged binary, never launch the locker.
+
+Without `--config` no config is written. Explicit conversion respects `XDG_CONFIG_HOME`
+(default `$HOME/.config`), reads `swaylock/config` or `hypr/hyprlock.conf` unless `--config-file`
+is provided, and prints converter warnings. A private converted file must pass `validate -c`
+before any installed file is replaced. Existing regular configs get a unique private
+`config.kdl.bak.*` backup before atomic replacement; conversion, validation or backup failure
+leaves the old config alone. `--config-file` alone is an error.
+
+`share/swaywardlock/install-manifest.json` records relative paths and SHA-256 hashes. Repeat
+installs replace only unchanged owned files; unrecorded collisions are refused, even if
+byte-identical (no implicit adoption). Modified owned files, symlink destinations and linked
+ancestors, including dangling links, are refused. The sole system alias exception is Fedora
+Atomic's root-owned `/home` → `/var/home`; it is canonicalized after checking its root-owned
+real-directory target and parents. Files are individually atomically renamed,
+not a whole-prefix transaction: filesystem failure or interruption during replacement can leave
+a partial install. Keep the manifest intact. After interruption, rerun; if it refuses, compare
+the named files with your checkout and trusted artifact. Save any user edits, then manually
+remove only confirmed installer-written partial files and rerun. Uninstall can first remove
+unchanged recorded files, but will not clear changed or unrecorded partial files for you.
+Uninstall removes only hash-matching recorded files;
+modified/unrecorded files, config, backups, directories and PAM are preserved. It never recursively
+removes a shared directory. `--uninstall` rejects build/config options.
+
+### Manual PAM setup
+
+From source, swaywardlock authenticates through PAM with the service `swaywardlock`. The
+installer leaves an existing `/etc/pam.d/swaywardlock` or `/usr/lib/pam.d/swaywardlock` alone.
+If absent, it prints a shell-quoted command to run manually as root, guarded against overwriting
+a service that appears later. It **never writes PAM or executes sudo**. Review `pam/swaywardlock`
+and ensure the included `login` service exists before running that command. For manual setup
+without the installer, as root (noclobber also rejects a dangling destination link):
+
+```sh
+test ! -e /etc/pam.d/swaywardlock && test ! -L /etc/pam.d/swaywardlock &&
+  test ! -e /usr/lib/pam.d/swaywardlock && test ! -L /usr/lib/pam.d/swaywardlock &&
+  (umask 022; set -C; cat pam/swaywardlock > /etc/pam.d/swaywardlock)
 ```
 
 Without it, PAM would fall back to `/etc/pam.d/other`, which refuses every password; swaywardlock
@@ -160,7 +229,8 @@ contrib/gate         # both, preserving the full check inventory
 
 Fast runs nightly fmt, clippy with default features and with `test-auth`, default-feature
 unit tests, a debug test-auth build, both converters, man-page and documentation KDL checks,
-release-metadata consistency checks, and bash/zsh completions with a broken config. Slow runs
+release-metadata consistency checks, isolated stdlib installer tests, and bash/zsh completions
+with a broken config. Slow runs
 real PAM, its own debug test-auth build, try-lock, the complete pytest headless-sway suite,
 and a default-feature release build with all eight test-hook scans. CI uses these same modes.
 Each harness retains a five-minute timeout; CI also has a 45-minute job timeout.
