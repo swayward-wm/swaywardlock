@@ -27,6 +27,8 @@ FILES=(
     src/render/texture.rs:src/render_helpers/texture.rs:trimmed
     src/render/solid_color.rs:src/render_helpers/solid_color.rs:verbatim
     src/render/blur.rs:src/render_helpers/blur.rs:trimmed
+    flake.nix:flake.nix:trimmed
+    flake.lock:flake.lock:verbatim
     contrib/package-version:contrib/package-version:verbatim
     contrib/check-release-consistency:contrib/check-release-consistency:trimmed
     contrib/test-release-consistency:contrib/test-release-consistency:trimmed

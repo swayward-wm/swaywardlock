@@ -1,0 +1,35 @@
+name: Nix
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - flake.nix
+      - flake.lock
+      - Cargo.toml
+      - Cargo.lock
+      - src/**
+      - contrib/**
+      - docs/**
+      - examples/**
+      - pam/**
+      - README.md
+      - LICENSE
+      - .github/workflows/nix.yml
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  nix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - name: Build and check real-PAM release and debug packages
+        run: nix flake check --print-build-logs --max-jobs 2 --cores 2
+      - name: Check formatting
+        run: nix fmt -- --check flake.nix

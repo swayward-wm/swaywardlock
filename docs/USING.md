@@ -105,6 +105,63 @@ the design document in `/usr/share/doc/swaywardlock/specs`. `swaywardlock comple
 bash|zsh|fish|elvish|powershell` prints a completion script. (The tarball has no completions and
 no design document; see its `RUNTIME.txt`.)
 
+### Nix
+
+The community-maintained `flake.nix` follows swayward's release/default, debug, checks,
+dev shell, formatter and overlay structure. `flake.lock` pins the same nixpkgs revision
+as swayward. Package versions come from Cargo (`26.10.0-beta.1`), not the checkout revision.
+Both packages use real PAM; **neither enables `test-auth`**.
+
+```sh
+nix build .                         # release package, ./result
+nix build .#swaywardlock-debug       # unstripped default-auth debug package
+nix flake check                     # default-auth tests and installation checks, both profiles
+nix develop                         # Rust, pkg-config and native dependencies
+nix fmt                             # format the flake
+# From another directory (choose a trusted revision):
+nix profile add github:swayward-wm/swaywardlock#swaywardlock
+```
+
+The flake exposes Linux systems supported by nixpkgs; evaluation is not proof that every
+architecture builds. It installs the converters (with store-pinned Python shebangs), bash/fish/zsh
+completions, man page, examples and linked documentation under
+`result/share/doc/swaywardlock/`. The full `docs/` directory includes screenshots and test-health
+reports. The distributed `pam/swaywardlock` is reference material, **not an installed PAM service**.
+No NixOS module is supplied; the overlay is `overlays.default`.
+
+On NixOS, add the package to your system configuration and let NixOS generate the PAM stack:
+
+```nix
+{ inputs, pkgs, ... }: {
+  environment.systemPackages = [ inputs.swaywardlock.packages.${pkgs.stdenv.hostPlatform.system}.default ];
+  security.pam.services.swaywardlock = {};
+}
+```
+
+Here `inputs.swaywardlock` is your flake input. Rebuild your NixOS configuration as usual.
+With the locked nixpkgs, the empty service uses the normal generated auth rules, including
+`pam_unix` with an absolute store module path, and NixOS provides the privileged
+`/run/wrappers/bin/unix_chkpwd` helper. Review local PAM customisations and test authentication
+in a disposable nested session before relying on the locker. **Do not copy the distro
+`auth include login` file into the Nix store as a substitute for the live NixOS service.**
+A package build or container PAM probe does not verify real NixOS user authentication.
+
+On other Linux distributions, `nix profile add` does not configure system authentication.
+Use the [manual PAM setup](#manual-pam-setup) below with your distribution's live PAM policy;
+check that `login` exists before including it. Nixpkgs' PAM expects its NixOS helper path for
+`pam_unix`; a profile install alone does not provide that privileged helper. Do not assume
+that successful package installation means password authentication works, and do not create
+a setuid helper casually. Use a distro-native package if you cannot arrange and verify a
+compatible PAM stack. The host compositor must also have working EGL/OpenGL ES drivers;
+the software-rendered checks are not a hardware/driver certification.
+
+The package tests provide C tooling, `id`, stock PAM modules, fonts/fontconfig and Mesa
+software EGL. Test output includes conditional skips; a skipped installed-service or real-user
+auth check is not privileged coverage. `nix flake check` is a packaging gate, not a replacement
+for the [full repository gate](#gates) or a real desktop authentication test. In `nix develop`,
+append flags with `RUSTFLAGS="$RUSTFLAGS -C your-flags"`: replacing `RUSTFLAGS` removes the forced
+EGL/Wayland links needed for `dlopen()` discovery.
+
 ### User-local source install
 
 From a checkout, run as your normal user on the host (requires Python 3, host `ldd` and
