@@ -6,33 +6,35 @@
 
 ![A large glowing ring and clock over a blurred wallpaper, rendered by swaywardlock](docs/screenshots/ring.png)
 
-swaywardlock draws a modern lock screen: blurred screenshots with vibrancy, labels and clocks,
-an input field, images, shapes, gradients, shadows, rotation, animations, a ring that glows and
-sweeps, and fingerprint unlock. It preserves swaylock's `-f`, `--ready-fd` and SIGUSR1 conventions,
-so it drops into the swayidle line you already have. See the man page for exit statuses, including status 3 for
-post-lock errors. It runs on compositors supporting `ext-session-lock-v1`, with working
-EGL/OpenGL ES.
+swaywardlock is a modern lock screen that keeps swaylock's contract. It runs on any compositor
+that offers `ext-session-lock-v1` and has working EGL/OpenGL ES, and it follows swaylock's `-f`,
+`--ready-fd` and SIGUSR1 conventions, so it drops into the swayidle line you already have. The
+man page lists the exit statuses, including status 3 for post-lock errors.
 
-The migration aids `swaywardlock-swaylock-to-kdl` and `swaywardlock-hyprlock-to-kdl`
-convert your current config to swaywardlock's and report omissions.
+It draws blurred screenshots with vibrancy, labels and clocks, an input field, images, shapes,
+gradients, shadows, rotation, animations, a ring that glows and sweeps, and fingerprint unlock.
+The widgets follow hyprlock's model, though not every hyprlock option: click actions
+(`onclick`) are out of scope, AVIF images are not supported, and a few options such as
+`shadow_boost` and `text_trim` have no equivalent. The converters
+`swaywardlock-swaylock-to-kdl` and `swaywardlock-hyprlock-to-kdl` turn your current config into
+swaywardlock's and name every option they cannot carry over.
 
-**Status: beta.** The maintainer now uses swaywardlock on a real swayward desktop, with the
-ring glow-up layout and working PAM authentication. That is one installation, not a hardware
-survey. The widgets and swaylock-style process conventions are tested headless too; this is
-not a claim of complete hyprlock parity. The maintainer is still mostly busy writing tests.
+**Status: beta.** swaywardlock runs on the maintainer's swayward desktop with the ring glow-up
+layout and PAM authentication. The widgets and the swaylock-style process conventions are also
+tested against headless sway on every CI run.
 
 ## Why it exists
 
 swaylock is the dependable default: a colour or an image, and a ring. hyprlock showed what a
 lock screen can look like, with its own config language and its home on Hyprland. The shells
-(Noctalia, DankMaterialShell, the Quickshell setups) ship polished lock screens as part of the
-whole desktop.
+(Noctalia, DankMaterialShell, the Quickshell setups) ship lock screens as part of the whole
+desktop.
 
-swaywardlock is for the space between: people who pick their pieces one at a time, already have
-an idle setup built around swaylock, and want the lock screen to look like this decade without
-rebuilding that setup. It belongs to the [swayward](https://github.com/swayward-wm/swayward)
-family and shares its KDL syntax for colours, gradients, blur, shadows and animations, but it is
-a standalone locker and does not need swayward.
+swaywardlock is for people who pick their pieces one at a time, already have an idle setup built
+around swaylock, and want a lock screen that looks like this decade without rebuilding that
+setup. It belongs to the [swayward](https://github.com/swayward-wm/swayward) family and shares
+its KDL syntax for colours, gradients, blur, shadows and animations, but it is a standalone
+locker and does not need swayward.
 
 ## A modern stack
 
@@ -43,13 +45,13 @@ your desktop. It talks to the compositor through the Wayland protocols it needs 
 more: `ext-session-lock-v1` to lock, fractional scale and viewporter for sharp HiDPI, and
 `ext-image-copy-capture` or wlr-screencopy for the screenshot behind the blur.
 
-The parts that touch your password are kept small and careful. The password lives in a
-fixed-size buffer that attempts `mlock` and is zeroed when cleared or dropped. Failure to lock
-memory warns but does not stop locking. PAM response copies are outside this protection, and
-abort or fatal signals do not run the buffer's destructor. PAM runs on its own thread so a slow
-PAM stack does not block the UI thread. Fingerprints go through fprintd over D-Bus, and only messages from the real fprintd are trusted. The shaders
-and the KDL vocabulary are shared with swayward, so a colour, gradient or animation means the
-same thing in your compositor config and your lock screen.
+The password lives in a fixed-size buffer that attempts `mlock` and is zeroed when cleared or
+dropped. Failure to lock memory warns but does not stop locking. PAM response copies are outside
+this protection, and abort or fatal signals do not run the buffer's destructor. PAM runs on its
+own thread so a slow PAM stack does not block the UI thread. Fingerprints go through fprintd over
+D-Bus, and only messages from the real fprintd are trusted. The shaders and the KDL vocabulary
+are shared with swayward, so a colour, gradient or animation means the same thing in your
+compositor config and your lock screen.
 
 ## Security: what we tested
 
@@ -68,25 +70,26 @@ and slow workers. A crash can still leave a locked session requiring recovery.
 - **Real PAM in the test gate.** The tests drive the real libpam with throwaway services: stock
   modules, faillock lockouts, one-time-code stacks, fingerprint stand-ins and `pam_permit` stacks
   that must still need an Enter. The slow gate checks the installed service with real PAM when
-  root or passwordless sudo is available; the fast gate excludes that privileged check. CI runs
-  both modes. A skipped privileged check is not real-PAM coverage, and test-auth e2e is not PAM.
-  An optional real-user password check must be requested separately.
+  root or passwordless sudo is available and reports a skip otherwise; the fast gate leaves that
+  privileged check out. CI runs both gates. The end-to-end suite uses a test-auth build, so real
+  PAM coverage comes from these checks. An optional check against a real user's password runs on
+  request.
 - **Hostile conditions.** Monitors turned off (DPMS) or unplugged while locked, the compositor
   sending protocol errors, broken log pipes, exhausted process limits, slow or noisy `cmd[]`
   labels, huge images and absurd config values are covered by fault-injection and regression
   tests.
 - **Tests that bite.** Rust unit tests and shell and pytest suites against a real headless sway
-  run locally and in CI. Mutation testing exposed coverage gaps; surviving medium-severity
-  mutants from round two were subsequently caught. The final-feature mutation round remains
-  required. [The gates](docs/USING.md#gates) spell out the scope and what a pass means.
-- **Audited in rounds.** Repeated AI-assisted reviews and fault-injection runs found bugs that
-  were fixed and regression-tested. Reviews covered PAM bypass attempts, protocol traces,
+  run locally and in CI. Mutation testing found coverage gaps, and the tests now catch the
+  medium-severity mutants that survived round two. A mutation round over the most recent
+  additions is next. [The gates](docs/USING.md#gates) list every check and what a pass covers.
+- **Audited in rounds.** Repeated AI-assisted reviews and fault-injection runs found bugs, each
+  fixed and covered by a regression test. Reviews covered PAM bypass attempts, protocol traces,
   fuzzing, concurrency and claims in the docs.
 
 ## Which locker is for you
 
 - **swaylock**, if a colour and a ring are all you want. It is small, mature and widely
-  packaged. swaywardlock has a swaylock-style default, in a much bigger program that needs
+  packaged. swaywardlock has a swaylock-style default too, but it is a larger program and needs
   working EGL/OpenGL ES.
 - **hyprlock**, if you are on Hyprland and at home in hyprlang. swaywardlock follows its widget
   model closely; its converter helps migrate to KDL and reports what it cannot carry over.
