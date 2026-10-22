@@ -277,10 +277,11 @@ ring-indicator {
     show-failed-attempts
     show-keyboard-layout "auto"    // auto | always | never
     show-caps-lock-text true
-    line-uses "none"               // none | inside | ring
+    show-caps-lock-indicator       // swaylock's --indicator-caps-lock
+    line-uses "line"               // line | inside | ring
     colors {
-        state "idle"      inside="#000000c0" ring="#337d00ff" line="#000000ff" text="#e5a445ff"
-        state "clear"     inside="#e5a445ff" ring="#e5a445ff" text="#000000ff"
+        state "input"     inside="#000000c0" ring="#337d00ff" line="#000000ff" text="#e5a445ff"
+        state "clear"     inside="#e5a445c0" ring="#e5a445ff" text="#000000ff"
         state "verifying" inside="#0072ffc0" ring="#3300faff" text="#000000ff"
         state "wrong"     inside="#fa0000c0" ring="#7d3300ff" text="#000000ff"
         state "caps-lock" inside="#000000c0" ring="#e5a445ff" text="#e5a445ff"
@@ -439,27 +440,19 @@ enum AuthEvent { Prompt(Source, String), Success(Source), Failure(Source, String
 
 ## Copying from swayward
 
-All of it comes from swayward at one pinned sha, recorded in
-`COPIED.md`.
+`COPIED.md` in the repository root is the authoritative list: each copied file, its source in
+swayward, the source sha and how far it was trimmed. `contrib/copied-diff <swayward> [sha]` checks
+that verbatim copies still match their source and lists upstream changes since the sha. It is
+run by hand, not in CI.
 
-| Destination | Source | Treatment |
-|---|---|---|
-| `src/config/copied/color.rs` | `swayward-config/src/appearance/color.rs` | trimmed: drop `GradientRelativeTo` |
-| `src/config/copied/effects.rs` | `appearance/effects.rs` | verbatim |
-| `src/config/copied/shadow.rs` | `appearance/border.rs` (Shadow only) | trimmed |
-| `src/config/copied/animations/` | `swayward-config/src/animations/` | trimmed: swayward's named animation list replaced with ours |
-| `src/config/copied/utils.rs` | `swayward-config/src/utils.rs`, `utils/merge_with.rs` | trimmed: drop `RegexEq` |
-| `src/config/copied/error.rs` | `swayward-config/src/error.rs` | verbatim |
-| `src/config/copied/include.rs` | `swayward-config/src/decode.rs` (include handling) | trimmed |
-| `src/animation/` | `src/animation/` | verbatim, except `get_monotonic_time` inlined |
-| `src/render/shaders/*.{frag,vert}` | `src/render_helpers/shaders/` | verbatim: border, shadow, blur_*, texture.vert, postprocess, rounding_alpha |
-| `src/render/*.rs` | `src/render_helpers/{shader_element,border,shadow,blur,solid_color,texture,memory,resources,renderer}.rs`, `shaders/mod.rs` | trimmed: every `TtyRenderer`/`TtyFrame` impl deleted; `NiriRenderer` reduced to `GlesRenderer` |
-| `src/render/text.rs` | Pango pattern from `src/ui/*.rs` | rewritten helper |
+Planned copies for Phase 2, not yet taken: swayward's border and shadow shader elements
+(`render_helpers/{border,shadow,shader_element}.rs` with their shaders) for `shape` and
+`input-field`, and the animation runtime (`src/animation/`) and animation KDL
+(`swayward-config/src/animations/`) for fades. Their `TtyRenderer` impls get removed, and
+`NiriRenderer` becomes plain `GlesRenderer`.
 
-`contrib/copied-diff <swayward-sha>` diffs each verbatim and trimmed file
-against swayward at that sha. It is run by hand, not in CI. Keep the
-niri/swayward copyright and the GPL-3.0-or-later header lines. No per-file AI
-markers, following swayward's AGENTS.md.
+Keep the niri/swayward copyright and GPL-3.0-or-later lines. No per-file AI markers, following
+swayward's AGENTS.md.
 
 ## Converters
 
@@ -543,3 +536,56 @@ None block Phase 0. Answer before Phase 2:
 1. Should `$TIME` accept a strftime format (`$TIME[%H:%M:%S]`) on top of
    hyprlock's two forms? `cmd[update:1000] date +...` covers it already, so
    the default is no.
+
+## Phase 0 findings (2026-10-19)
+
+Recorded after the spike; the sections above are unchanged.
+
+- The smithay renderer works on a client lock surface: `EGLDisplay` from our
+  `EGLNativeDisplay` for `wl_display` (`src/egl.rs`, ~30 lines), smithay's
+  `WlEglSurface` support, `GlesRenderer::bind(EGLSurface)`, clear, swap.
+  Verified on llvmpipe (Mesa 26.2.3) against headless sway 1.11 and
+  swayward 339f99e8.
+- `--daemonize` cannot fork after locking, as swaylock does: Mesa and the
+  auth thread exist by then and `fork` keeps only the calling thread.
+  swaywardlock forks first, and the parent waits on a pipe until the child
+  reports `locked` (exit 0) or an error code. Seen from outside, the contract
+  is unchanged.
+- SIGUSR1 must be blocked in every thread before any thread starts.
+  Otherwise the kernel can deliver it to a Mesa thread, where the default
+  action kills the process. The e2e test caught this (exit 138).
+- PAM library: `pam-client2` 0.5.5 (MPL-2.0). Checked against real
+  `pam_deny`/`pam_permit` services. It cannot sit beside `nonstick` because
+  both link `pam`. (Phase 1 replaced it with raw `pam-sys2`; see below.)
+- Headless sway has no keyboard until a virtual one exists. Each `wtype` run
+  creates and destroys its own, so tests leave a delay (`wtype -s`) before
+  typing.
+
+## Phase 1 findings (2026-10-19)
+
+- The ring is drawn with cairo and Pango into a texture and composited with smithay's
+  `TextureRenderElement`. It is a port of swaylock's `render_frame`, rather than being built from
+  copied swayward shader elements. Those elements (border, shadow) are still worth copying for
+  Phase 2's `shape` and `input-field`, where gradients and shadows matter.
+- The ring's state name is `input`, not `idle`. swaylock calls the colour set `input` and it
+  covers typing as well as idle. The `line-uses` default is `line`, swaylock's own default.
+- EGL window surfaces are y-up. The damage tracker needs `Transform::Flipped180`, as in smithay's
+  winit examples. The symmetric Phase 0 solid colour hid this; the e2e image test caught it.
+- Buffer age is fixed at 0 (full redraw). The real age needs the surface current, and that only
+  holds inside `bind`, while the target borrows the surface. Lock screens redraw rarely; revisit
+  if a profile says otherwise.
+- `swaylock-to-kdl` maps swaylock's pixel `--indicator-x/y-position` (the ring centre from the
+  top-left) to `halign "left"`, `valign "top"` and an offset of radius+thickness. swaylock also
+  nudges the indicator right by `2 / scale` logical pixels; swaywardlock matches it. The e2e test
+  checks one row against coordinates measured from swaylock 1.8.6 on the same headless sway, and
+  fails on a 2 px error.
+- A widget that fails to render is skipped rather than failing the frame, so the fallback colour
+  and the other widgets still draw. An unlock (auth success or SIGUSR1) that arrives before
+  `locked` is deferred until `locked`, not dropped. Both have e2e tests that fail on the old code.
+- PAM is called through `pam-sys2` directly, replacing `pam-client2`. pam-client2 needs the
+  response as a `CString`, which left an unzeroed copy of the password in freed heap memory.
+  Our conversation function copies the locked buffer straight into the response libpam frees.
+- `clear-input-after-ms` must be at least 1000. Smaller values clear the buffer while the user
+  is typing, which leaves no way to unlock by password.
+- A pending wrong-password timer is cancelled on submit. swaylock has this bug: a check that
+  outlasts the 3 s fail timer flips back to idle and accepts input while PAM is still running.

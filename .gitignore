@@ -1,4 +1,4 @@
-/target
 *.pending-snap
-*.snap.new
 __pycache__/
+*.snap.new
+/target

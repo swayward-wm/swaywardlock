@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# The local and CI gate. Run inside the dev container (needs sway, wtype, grim, pam-devel).
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+cargo +nightly fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --features test-auth -- -D warnings
+cargo test
+cargo build --features test-auth
+SWAYWARDLOCK=target/debug/swaywardlock python3 contrib/test-swaylock-to-kdl.py
+contrib/e2e-sway target/debug/swaywardlock
+
+# A release build must never contain the test-auth backdoor.
+cargo build --release
+if grep -q swaywardlock-test target/release/swaywardlock; then
+    echo "FAIL release build contains the test-auth password" >&2
+    exit 1
+fi
+echo "gate: ok"

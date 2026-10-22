@@ -1,0 +1,358 @@
+#!/usr/bin/env python3
+"""Translate a swaylock config file or command line to swaywardlock KDL.
+
+    swaylock-to-kdl [CONFIG]                 read a swaylock config (default: swaylock's search path)
+    swaylock-to-kdl --args 'swaylock -f ...' translate a command line
+
+Prints KDL on stdout. On stderr it prints the swaywardlock command line to use (process flags
+such as -f and --ready-fd carry over; styling flags become KDL) and a warning for every option it
+could not translate. It never drops an option silently.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shlex
+import sys
+from pathlib import Path
+
+# swaylock defaults the ring position depends on (main.c).
+DEFAULT_RADIUS = 50
+DEFAULT_THICKNESS = 10
+
+# --<set>-<state>-color: (set, state) for the ring's per-state colours.
+SETS = ("inside", "ring", "line", "text")
+STATES = {"": "input", "clear": "clear", "caps-lock": "caps-lock", "ver": "verifying", "wrong": "wrong"}
+
+# Single-colour ring options.
+RING_COLORS = {
+    "key-hl-color": "key-highlight",
+    "bs-hl-color": "bs-highlight",
+    "caps-lock-key-hl-color": "caps-lock-key-highlight",
+    "caps-lock-bs-hl-color": "caps-lock-bs-highlight",
+    "separator-color": "separator",
+}
+LAYOUT_COLORS = {"layout-bg-color": "bg", "layout-border-color": "border", "layout-text-color": "text"}
+
+# swaylock scaling mode -> swaywardlock fit.
+FITS = {"fill": "cover", "fit": "contain", "stretch": "fill", "center": "center", "tile": "tile"}
+
+# Short options and whether they take a value (swaylock's getopt string).
+SHORT = {
+    "c": ("color", True), "C": ("config", True), "d": ("debug", False),
+    "e": ("ignore-empty-password", False), "f": ("daemonize", False), "R": ("ready-fd", True),
+    "h": ("help", False), "i": ("image", True), "L": ("disable-caps-lock-text", False),
+    "l": ("indicator-caps-lock", False), "n": ("line-uses-inside", False),
+    "r": ("line-uses-ring", False), "s": ("scaling", True), "t": ("tiling", False),
+    "u": ("no-unlock-indicator", False), "k": ("show-keyboard-layout", False),
+    "K": ("hide-keyboard-layout", False), "F": ("show-failed-attempts", False),
+    "v": ("version", False),
+}
+STATE_COLOR_OPTIONS = {
+    f"{s}-{st}-color" if st else f"{s}-color" for s in SETS for st in STATES
+}
+TAKES_VALUE = (
+    {name for name, takes in SHORT.values() if takes}
+    | STATE_COLOR_OPTIONS
+    | set(RING_COLORS)
+    | set(LAYOUT_COLORS)
+    | {"font", "font-size", "indicator-radius", "indicator-thickness",
+       "indicator-x-position", "indicator-y-position"}
+)
+
+
+def c_atoi(s: str) -> int:
+    """C atoi: leading decimal digits, 0 if none (swaylock uses it for font size and position)."""
+    m = re.match(r"\s*([+-]?\d+)", s)
+    return int(m.group(1)) if m else 0
+
+
+def c_strtol(s: str) -> int:
+    """C strtol with base 0: 0x hex, leading-0 octal, else decimal (swaylock's radius/thickness)."""
+    m = re.match(r"\s*([+-]?)(0[xX][0-9a-fA-F]+|0[0-7]*|[1-9]\d*)", s)
+    if not m:
+        return 0
+    sign, digits = m.groups()
+    if digits[:2].lower() == "0x":
+        n = int(digits, 16)
+    elif digits.startswith("0"):
+        n = int(digits, 8) if len(digits) > 1 else 0
+    else:
+        n = int(digits)
+    return -n if sign == "-" else n
+
+
+def kdl_str(s: str) -> str:
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def color(value: str) -> str:
+    """swaylock colours are rrggbb or rrggbbaa, with an optional '#'."""
+    v = value.lstrip("#")
+    if len(v) == 6:
+        v += "ff"
+    if len(v) != 8 or any(c not in "0123456789abcdefABCDEF" for c in v):
+        raise ValueError(f"invalid colour {value!r}")
+    return kdl_str("#" + v.lower())
+
+
+class Translator:
+    def __init__(self) -> None:
+        self.bg_color: str | None = None
+        self.images: dict[str, str] = {}  # output ("" = all) -> path
+        self.fit: str | None = None
+        self.solid = False
+        self.ring = True
+        self.ring_props: dict[str, str] = {}
+        self.state_colors: dict[str, dict[str, str]] = {}
+        self.ring_colors: dict[str, str] = {}
+        self.layout_colors: dict[str, str] = {}
+        self.radius = DEFAULT_RADIUS
+        self.thickness = DEFAULT_THICKNESS
+        self.x: int | None = None
+        self.y: int | None = None
+        self.general: list[str] = []
+        self.command: list[str] = ["swaywardlock"]
+        self.warnings: list[str] = []
+
+    def option(self, name: str, value: str | None) -> None:
+        try:
+            self._option(name, value)
+        except ValueError as err:
+            self.warnings.append(f"--{name}: {err}")
+
+    def _option(self, name: str, value: str | None) -> None:
+        if name in TAKES_VALUE and not value:
+            raise ValueError("missing value; skipped")
+        # Process flags carry over to the command line.
+        if name == "daemonize":
+            self.command.append("-f")
+        elif name == "ready-fd":
+            self.command += ["--ready-fd", value]
+        elif name == "debug":
+            self.command.append("-v")
+        elif name in ("config", "help", "version"):
+            self.warnings.append(f"--{name}: ignored")
+        # Background.
+        elif name == "color":
+            self.bg_color = color(value)
+        elif name == "image":
+            output, path = "", value
+            head, sep, tail = value.partition(":")
+            if sep and "/" not in head:
+                output, path = head, tail
+            # swaylock runs wordexp on the path. swaywardlock expands only a leading '~', so
+            # expand variables here, and warn about anything still left for a shell.
+            path = os.path.expandvars(path)
+            if any(c in path for c in "$`*?["):
+                self.warnings.append(f"--image: {path!r} needs shell expansion; check the path")
+            self.images[output] = path
+        elif name == "scaling":
+            if value == "solid_color":
+                self.solid = True
+            elif value in FITS:
+                self.solid = False
+                self.fit = FITS[value]
+            else:
+                raise ValueError(f"unknown scaling mode {value!r}")
+        elif name == "tiling":
+            self.solid = False
+            self.fit = "tile"
+        # General.
+        elif name == "ignore-empty-password":
+            self.general.append("ignore-empty-input")
+        # Ring behaviour.
+        elif name == "no-unlock-indicator":
+            self.ring = False
+        elif name == "indicator-idle-visible":
+            self.ring_props["idle-visible"] = ""
+        elif name == "show-failed-attempts":
+            self.ring_props["show-failed-attempts"] = ""
+        elif name == "show-keyboard-layout":
+            # swaylock lets --hide-keyboard-layout win whatever the order.
+            if self.ring_props.get("show-keyboard-layout") != kdl_str("never"):
+                self.ring_props["show-keyboard-layout"] = kdl_str("always")
+        elif name == "hide-keyboard-layout":
+            self.ring_props["show-keyboard-layout"] = kdl_str("never")
+        elif name == "disable-caps-lock-text":
+            self.ring_props["show-caps-lock-text"] = "false"
+        elif name == "indicator-caps-lock":
+            self.ring_props["show-caps-lock-indicator"] = ""
+        elif name == "line-uses-inside":
+            self.ring_props["line-uses"] = kdl_str("inside")
+        elif name == "line-uses-ring":
+            self.ring_props["line-uses"] = kdl_str("ring")
+        elif name == "font":
+            self.ring_props["font"] = kdl_str(value)
+        elif name == "font-size":
+            self.ring_props["font-size"] = str(c_atoi(value))
+        elif name == "indicator-radius":
+            self.radius = c_strtol(value)
+        elif name == "indicator-thickness":
+            self.thickness = c_strtol(value)
+        elif name == "indicator-x-position":
+            self.x = c_atoi(value)
+        elif name == "indicator-y-position":
+            self.y = c_atoi(value)
+        # Ring colours.
+        elif name in RING_COLORS:
+            self.ring_colors[RING_COLORS[name]] = color(value)
+        elif name in LAYOUT_COLORS:
+            self.layout_colors[LAYOUT_COLORS[name]] = color(value)
+        elif name.endswith("-color") and self._state_color(name, value):
+            pass
+        else:
+            self.warnings.append(f"--{name}: not a swaylock option; skipped")
+
+    def _state_color(self, name: str, value: str) -> bool:
+        stem = name[: -len("-color")]
+        for s in SETS:
+            if stem == s or stem.startswith(s + "-"):
+                state = stem[len(s) + 1 :]
+                if state in STATES:
+                    self.state_colors.setdefault(STATES[state], {})[s] = color(value)
+                    return True
+        return False
+
+    def emit(self) -> str:
+        out = ["// Translated from swaylock by contrib/swaylock-to-kdl.", ""]
+        if self.general:
+            out += ["general {"] + [f"    {g}" for g in self.general] + ["}", ""]
+
+        images = {} if self.solid else self.images
+        # An all-outputs background always comes first, so outputs without their own image
+        # still get swaylock's colour; per-output backgrounds follow and win (last match).
+        outputs = [""] + sorted(o for o in images if o)
+        for output in outputs:
+            head = "background" + (f" output={kdl_str(output)}" if output else "") + " {"
+            body = []
+            if self.bg_color:
+                body.append(f"color {self.bg_color}")
+            if output in images:
+                body.append(f"path {kdl_str(images[output])}")
+                if self.fit:
+                    body.append(f"fit {kdl_str(self.fit)}")
+            out += [head] + [f"    {b}" for b in body] + ["}", ""]
+
+        if self.ring:
+            body = []
+            if self.radius != DEFAULT_RADIUS:
+                body.append(f"radius {self.radius}")
+            if self.thickness != DEFAULT_THICKNESS:
+                body.append(f"thickness {self.thickness}")
+            # swaylock positions the ring centre in pixels from the top-left. With left/top
+            # alignment our anchor sits radius+thickness in from that corner.
+            edge = self.radius + self.thickness
+            if self.x is not None:
+                body.append('halign "left"')
+            if self.y is not None:
+                body.append('valign "top"')
+            if self.x is not None or self.y is not None:
+                px = self.x - edge if self.x is not None else 0
+                # Positive y moves up.
+                py = edge - self.y if self.y is not None else 0
+                body.append(f"position {px} {py}")
+            for key, val in self.ring_props.items():
+                body.append(f"{key} {val}".rstrip())
+            colors = []
+            for state in STATES.values():
+                if state in self.state_colors:
+                    props = " ".join(f"{s}={c}" for s, c in self.state_colors[state].items())
+                    colors.append(f"state {kdl_str(state)} {props}")
+            colors += [f"{k} {v}" for k, v in self.ring_colors.items()]
+            if self.layout_colors:
+                colors.append("layout " + " ".join(f"{k}={v}" for k, v in self.layout_colors.items()))
+            if colors:
+                body += ["colors {"] + [f"    {c}" for c in colors] + ["}"]
+            out += ["ring-indicator {"] + [f"    {b}" for b in body] + ["}"]
+        return "\n".join(out).rstrip() + "\n"
+
+
+def parse_args(t: Translator, argv: list[str]) -> None:
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        i += 1
+        if arg.startswith("--"):
+            name, eq, value = arg[2:].partition("=")
+            if not eq and name in TAKES_VALUE:
+                if i >= len(argv):
+                    t.warnings.append(f"--{name}: missing value")
+                    continue
+                value = argv[i]
+                i += 1
+            t.option(name, value if (eq or name in TAKES_VALUE) else None)
+        elif arg.startswith("-") and len(arg) > 1:
+            # Bundled short flags, e.g. -fF or -c000000.
+            j = 1
+            while j < len(arg):
+                ch = arg[j]
+                j += 1
+                if ch not in SHORT:
+                    t.warnings.append(f"-{ch}: not a swaylock option; skipped")
+                    continue
+                name, takes = SHORT[ch]
+                if takes:
+                    value = arg[j:] if j < len(arg) else (argv[i] if i < len(argv) else None)
+                    if j >= len(arg):
+                        i += 1
+                    j = len(arg)
+                    if value is None:
+                        t.warnings.append(f"-{ch}: missing value")
+                        continue
+                    t.option(name, value)
+                else:
+                    t.option(name, None)
+        else:
+            t.warnings.append(f"{arg!r}: unexpected argument; skipped")
+
+
+def parse_config(t: Translator, text: str) -> None:
+    # swaylock prefixes each non-comment line with "--" and parses it as one argument.
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        name, eq, value = line.partition("=")
+        t.option(name.strip(), value.strip() if eq else None)
+
+
+def default_config() -> Path | None:
+    home = Path.home()
+    xdg = os.environ.get("XDG_CONFIG_HOME") or str(home / ".config")
+    for p in (home / ".swaylock/config", Path(xdg) / "swaylock/config", Path("/etc/swaylock/config")):
+        if p.exists():
+            return p
+    return None
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("config", nargs="?", type=Path, help="swaylock config file")
+    ap.add_argument("--args", help="a swaylock command line to translate instead")
+    opts = ap.parse_args()
+
+    t = Translator()
+    if opts.args is not None:
+        argv = shlex.split(opts.args)
+        if argv and Path(argv[0]).name == "swaylock":
+            argv = argv[1:]
+        parse_args(t, argv)
+    else:
+        path = opts.config or default_config()
+        if path is None:
+            print("no swaylock config found; pass a path or --args", file=sys.stderr)
+            return 1
+        parse_config(t, path.read_text())
+
+    sys.stdout.write(t.emit())
+    print("command: " + shlex.join(t.command), file=sys.stderr)
+    for w in t.warnings:
+        print("warning: " + w, file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

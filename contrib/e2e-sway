@@ -1,0 +1,273 @@
+#!/usr/bin/env bash
+# End-to-end checks against headless sway: the process contract and what reaches the screen.
+#
+# Needs: sway, wtype, grim, python3, and a `--features test-auth` debug build. Runs on llvmpipe;
+# no GPU or seat is needed. Usage: contrib/e2e-sway [path/to/swaywardlock]
+# Run one test: TESTS=password contrib/e2e-sway
+
+set -uo pipefail
+
+BIN=${1:-target/debug/swaywardlock}
+T="timeout 10"
+PASSWORD=swaywardlock-test
+FAILED=0
+HERE=$(cd "$(dirname "$0")" && pwd)
+
+pass() { printf 'ok   %s\n' "$1"; }
+fail() { printf 'FAIL %s\n' "$1"; FAILED=1; }
+check() { if [ "$2" = "$3" ]; then pass "$1"; else fail "$1 (got '$2', want '$3')"; fi; }
+
+start_sway() {
+    export XDG_RUNTIME_DIR
+    XDG_RUNTIME_DIR=$(mktemp -d)
+    local conf="$XDG_RUNTIME_DIR/sway.conf"
+    echo 'output HEADLESS-1 resolution 320x240' >"$conf"
+    WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 WLR_RENDERER=pixman \
+        sway -c "$conf" >"$XDG_RUNTIME_DIR/sway.log" 2>&1 &
+    SWAY_PID=$!
+    for _ in $(seq 50); do
+        WAYLAND_DISPLAY=$(ls "$XDG_RUNTIME_DIR" 2>/dev/null | grep -m1 '^wayland-[0-9]*$')
+        [ -n "$WAYLAND_DISPLAY" ] && break
+        sleep 0.1
+    done
+    export WAYLAND_DISPLAY
+    if [ -z "$WAYLAND_DISPLAY" ]; then
+        echo "sway did not start:" >&2
+        cat "$XDG_RUNTIME_DIR/sway.log" >&2
+        exit 1
+    fi
+    # Keep the user's own config out of tests that rely on defaults.
+    export XDG_CONFIG_HOME="$XDG_RUNTIME_DIR/config-home"
+}
+
+stop_sway() {
+    kill "$SWAY_PID" 2>/dev/null
+    wait "$SWAY_PID" 2>/dev/null
+    rm -rf "$XDG_RUNTIME_DIR"
+}
+
+# Wait until the log says the session is locked.
+wait_locked() {
+    for _ in $(seq 50); do
+        grep -q 'session locked' "$1" 2>/dev/null && return 0
+        sleep 0.1
+    done
+    return 1
+}
+
+# Pixel at (x, y) of the output as "r g b"; default the centre.
+pixel() {
+    $T grim -t ppm - | python3 "$HERE/ppm-pixel" "$@"
+}
+
+# Wait up to 5 s for a process to exit and return its status; 124 if it does not.
+wait_exit() {
+    for _ in $(seq 50); do
+        kill -0 "$1" 2>/dev/null || { wait "$1"; return; }
+        sleep 0.1
+    done
+    kill "$1"; wait "$1" 2>/dev/null; return 124
+}
+
+# Poll a pixel until it matches (up to 3 s). sway may send `locked` before our first frame is on
+# screen, so a single sample can still show the compositor's own lock colour.
+# Usage: check_colour NAME WANT [X Y]
+check_colour() {
+    local name=$1 want=$2 got
+    shift 2
+    for _ in $(seq 30); do
+        got=$(pixel "$@")
+        [ "$got" = "$want" ] && break
+        sleep 0.1
+    done
+    check "$name" "$got" "$want"
+}
+
+run_test() {
+    local name=$1
+    shift
+    start_sway
+    LOG="${KEEP_LOGS:-$XDG_RUNTIME_DIR}/lock-$name.log"
+    "$@"
+    stop_sway
+}
+
+# Points on a default ring-indicator (radius 50, thickness 10) centred on the 320x240 output.
+RING=(210 120)
+
+t_password() {
+    printf '%s\n' 'background { color "#204060"; }' 'ring-indicator { idle-visible; }' \
+        >"$XDG_RUNTIME_DIR/lock.kdl"
+    RUST_LOG=swaywardlock=debug "$BIN" -c "$XDG_RUNTIME_DIR/lock.kdl" >"$LOG" 2>&1 &
+    local pid=$!
+    wait_locked "$LOG" || { fail "password: never locked"; cat "$LOG"; kill "$pid"; return; }
+    check_colour "password: background colour" "32 64 96" 5 5
+    # swaylock's default input ring colour, 337d00.
+    check_colour "password: idle ring" "51 125 0" "${RING[@]}"
+    $T wtype -s 300 wrong -k Return
+    sleep 0.5
+    kill -0 "$pid" 2>/dev/null && pass "password: wrong password keeps the lock" \
+        || fail "password: exited on a wrong password"
+    # swaylock's wrong ring colour, 7d3300.
+    check_colour "password: wrong ring" "125 51 0" "${RING[@]}"
+    # Each wtype run creates a fresh virtual keyboard; give the locker time to bind it.
+    $T wtype -s 300 "$PASSWORD" -k Return
+    wait_exit "$pid"
+    check "password: exit code after unlock" "$?" 0
+}
+
+t_defaults() {
+    # No config file: swaylock's grey a3a3a3, ring hidden while idle.
+    "$BIN" >"$LOG" 2>&1 &
+    local pid=$!
+    wait_locked "$LOG" || { fail "defaults: never locked"; cat "$LOG"; kill "$pid"; return; }
+    check_colour "defaults: swaylock grey" "163 163 163"
+    check_colour "defaults: ring hidden when idle" "163 163 163" "${RING[@]}"
+    kill -USR1 "$pid"
+    wait_exit "$pid"
+}
+
+t_image() {
+    # A 64x64 PNG, top half red, bottom half blue, stretched over the output.
+    python3 "$HERE/ppm-pixel" --write-test-png "$XDG_RUNTIME_DIR/bg.png"
+    echo "background { path \"$XDG_RUNTIME_DIR/bg.png\"; fit \"fill\"; }" \
+        >"$XDG_RUNTIME_DIR/lock.kdl"
+    "$BIN" -c "$XDG_RUNTIME_DIR/lock.kdl" >"$LOG" 2>&1 &
+    local pid=$!
+    wait_locked "$LOG" || { fail "image: never locked"; cat "$LOG"; kill "$pid"; return; }
+    check_colour "image: top is red" "255 0 0" 160 10
+    check_colour "image: bottom is blue" "0 0 255" 160 230
+    kill -USR1 "$pid"
+    wait_exit "$pid"
+}
+
+t_converted() {
+    # A swaylock command line through swaylock-to-kdl: ring centred at swaylock's (80, 70).
+    "$HERE/swaylock-to-kdl" --args \
+        "swaylock -c 000000 --indicator-idle-visible --indicator-x-position 80 \
+         --indicator-y-position 70 --inside-color ff0000" \
+        >"$XDG_RUNTIME_DIR/lock.kdl" 2>"$XDG_RUNTIME_DIR/convert.log"
+    "$BIN" -c "$XDG_RUNTIME_DIR/lock.kdl" >"$LOG" 2>&1 &
+    local pid=$!
+    wait_locked "$LOG" || { fail "converted: never locked"; cat "$LOG"; kill "$pid"; return; }
+    # Reference row 70, measured on swaylock 1.8.6 with these flags on the same headless sway:
+    # ring 29..134 (its 2 px nudge included), red inside 39..124, right band 128..134.
+    check_colour "converted: inside starts where swaylock's does" "255 0 0" 39 70
+    check_colour "converted: inside ends where swaylock's does" "255 0 0" 124 70
+    check_colour "converted: ring starts where swaylock's does" "51 125 0" 29 70
+    check_colour "converted: ring ends where swaylock's does" "51 125 0" 134 70
+    check_colour "converted: background" "0 0 0" 300 220
+    kill -USR1 "$pid"
+    wait_exit "$pid"
+}
+
+t_broken_image() {
+    # A corrupt image must not blank the output: the colour and the ring still draw.
+    echo "not a png" >"$XDG_RUNTIME_DIR/broken.png"
+    printf '%s\n' "background { color \"#204060\"; path \"$XDG_RUNTIME_DIR/broken.png\"; }" \
+        'ring-indicator { idle-visible; }' >"$XDG_RUNTIME_DIR/lock.kdl"
+    "$BIN" -c "$XDG_RUNTIME_DIR/lock.kdl" >"$LOG" 2>&1 &
+    local pid=$!
+    wait_locked "$LOG" || { fail "broken image: never locked"; cat "$LOG"; kill "$pid"; return; }
+    check_colour "broken image: colour still drawn" "32 64 96" 5 5
+    check_colour "broken image: ring still drawn" "51 125 0" "${RING[@]}"
+    kill -USR1 "$pid"
+    wait_exit "$pid"
+}
+
+t_failing_widget() {
+    # A widget that fails to render is skipped; the rest of the frame still draws.
+    printf '%s\n' 'background { color "#204060"; }' 'ring-indicator { idle-visible; }' \
+        >"$XDG_RUNTIME_DIR/lock.kdl"
+    SWAYWARDLOCK_TEST_FAIL_BACKGROUND=1 "$BIN" -c "$XDG_RUNTIME_DIR/lock.kdl" >"$LOG" 2>&1 &
+    local pid=$!
+    wait_locked "$LOG" || { fail "failing widget: never locked"; cat "$LOG"; kill "$pid"; return; }
+    # The black fallback replaces the failed background...
+    check_colour "failing widget: fallback colour" "0 0 0" 5 5
+    # ...and the ring still draws.
+    check_colour "failing widget: ring still drawn" "51 125 0" "${RING[@]}"
+    kill -USR1 "$pid"
+    wait_exit "$pid"
+}
+
+t_validate() {
+    echo 'ring-indicator { radius 0; }' >"$XDG_RUNTIME_DIR/bad.kdl"
+    $T "$BIN" validate -c "$XDG_RUNTIME_DIR/bad.kdl" >"$LOG" 2>&1
+    check "validate: bad config exit code" "$?" 1
+    grep -q 'radius\|between' "$LOG" && pass "validate: error explains the value" \
+        || { fail "validate: error does not explain the value"; cat "$LOG"; }
+    echo 'ring-indicator { radius 20; }' >"$XDG_RUNTIME_DIR/good.kdl"
+    $T "$BIN" validate -c "$XDG_RUNTIME_DIR/good.kdl" >"$LOG" 2>&1
+    check "validate: good config exit code" "$?" 0
+    # A bad config must stop the locker before it locks.
+    $T "$BIN" -c "$XDG_RUNTIME_DIR/bad.kdl" >"$LOG" 2>&1
+    check "validate: locker refuses a bad config" "$?" 1
+    grep -q 'session locked' "$LOG" && fail "validate: locked despite a bad config" \
+        || pass "validate: never locked with a bad config"
+}
+
+t_sigusr1() {
+    RUST_LOG=swaywardlock=debug "$BIN" >"$LOG" 2>&1 &
+    local pid=$!
+    wait_locked "$LOG" || fail "sigusr1: never locked"
+    kill -USR1 "$pid"
+    wait_exit "$pid"
+    check "sigusr1: exit code" "$?" 0
+}
+
+t_early_unlock() {
+    # An unlock that arrives before `locked` must happen once `locked` does, not be dropped.
+    SWAYWARDLOCK_TEST_EARLY_UNLOCK=1 "$BIN" >"$LOG" 2>&1 &
+    local pid=$!
+    wait_exit "$pid"
+    check "early unlock: exit code" "$?" 0
+    grep -q 'session locked' "$LOG" && pass "early unlock: locked first" \
+        || fail "early unlock: exited without locking"
+}
+
+t_ready_fd() {
+    local ready="$XDG_RUNTIME_DIR/ready"
+    "$BIN" --ready-fd 9 9>"$ready" >"$LOG" 2>&1 &
+    local pid=$!
+    wait_locked "$LOG" || fail "ready-fd: never locked"
+    check "ready-fd: newline written" "$(od -An -c "$ready" | tr -d ' ')" '\n'
+    kill -USR1 "$pid"
+    wait_exit "$pid"
+}
+
+t_daemonize() {
+    # The parent must exit 0 only once the session is locked.
+    $T "$BIN" -f >"$LOG" 2>&1
+    check "daemonize: parent exit code" "$?" 0
+    grep -q 'session locked' "$LOG" && pass "daemonize: locked before the parent exited" \
+        || fail "daemonize: parent exited before the lock"
+    local child
+    child=$(pgrep -nf "^$BIN -f")
+    [ -n "$child" ] && pass "daemonize: child keeps running" || fail "daemonize: no child"
+    kill -USR1 "$child" 2>/dev/null
+    sleep 0.5
+}
+
+t_second_locker() {
+    RUST_LOG=swaywardlock=debug "$BIN" >"$LOG" 2>&1 &
+    local pid=$!
+    wait_locked "$LOG" || fail "second locker: first never locked"
+    $T "$BIN" >"$XDG_RUNTIME_DIR/second.log" 2>&1
+    check "second locker: exit code" "$?" 2
+    kill -0 "$pid" 2>/dev/null && pass "second locker: first stays locked" \
+        || fail "second locker: first exited"
+    kill -USR1 "$pid"
+    wait_exit "$pid"
+}
+
+t_no_display() {
+    WAYLAND_DISPLAY=does-not-exist $T "$BIN" >"$LOG" 2>&1
+    check "no display: exit code" "$?" 1
+}
+
+TESTS=${TESTS:-password defaults image converted broken-image failing-widget validate sigusr1 early-unlock ready-fd daemonize second-locker no-display}
+for t in $TESTS; do
+    run_test "$t" "t_${t//-/_}"
+done
+
+exit "$FAILED"

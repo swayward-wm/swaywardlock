@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Compare swaywardlock's copies with swayward. See COPIED.md.
+#
+#   contrib/copied-diff [swayward checkout] [sha]
+#
+# Reports two things for every copied file:
+#   - local: whether our copy still matches swayward at the recorded base sha. A "verbatim" file
+#     must be identical; any difference there is a mistake.
+#   - upstream: whether swayward changed the source between the base sha and `sha` (default HEAD).
+set -uo pipefail
+cd "$(dirname "$0")/.."
+
+SW=${1:-../swayward}
+SHA=${2:-HEAD}
+BASE=$(sed -n 's/^Source: .* at `\([0-9a-f]*\)`.*/\1/p' COPIED.md)
+
+# destination:source:treatment, from COPIED.md's table.
+FILES=(
+    src/config/copied/macros.rs:swayward-config/src/macros.rs:verbatim
+    src/config/copied/merge_with.rs:swayward-config/src/utils/merge_with.rs:verbatim
+    src/config/copied/error.rs:swayward-config/src/error.rs:verbatim
+    src/config/copied/utils.rs:swayward-config/src/utils.rs:trimmed
+    src/config/copied/color.rs:swayward-config/src/appearance/color.rs:trimmed
+    src/config/copied/effects.rs:swayward-config/src/appearance/effects.rs:trimmed
+    src/config/decode.rs:swayward-config/src/decode.rs:trimmed
+    src/render/memory.rs:src/render_helpers/memory.rs:verbatim
+    src/render/texture.rs:src/render_helpers/texture.rs:trimmed
+    src/render/solid_color.rs:src/render_helpers/solid_color.rs:verbatim
+    src/render/blur.rs:src/render_helpers/blur.rs:trimmed
+    src/render/shaders/blur.vert:src/render_helpers/shaders/blur.vert:verbatim
+    src/render/shaders/blur_down.frag:src/render_helpers/shaders/blur_down.frag:verbatim
+    src/render/shaders/blur_up.frag:src/render_helpers/shaders/blur_up.frag:verbatim
+)
+
+status=0
+printf "%-36s %-9s %-22s %s\n" "copy" "kind" "local vs ${BASE:0:8}" "upstream ${BASE:0:8}..$SHA"
+for entry in "${FILES[@]}"; do
+    IFS=: read -r dst src kind <<<"$entry"
+    base=$(git -C "$SW" show "$BASE:$src" 2>/dev/null) || { echo "missing in swayward: $src"; status=1; continue; }
+    if [ "$base" = "$(cat "$dst")" ]; then
+        local_state="identical"
+    else
+        local_state="+$(diff <(echo "$base") "$dst" | grep -c '^[<>]') lines differ"
+        [ "$kind" = verbatim ] && { local_state="$local_state (!)"; status=1; }
+    fi
+    if git -C "$SW" diff --quiet "$BASE" "$SHA" -- "$src"; then
+        upstream="unchanged"
+    else
+        upstream="CHANGED: git -C $SW diff $BASE $SHA -- $src"
+    fi
+    printf '%-36s %-9s %-22s %s\n' "$dst" "$kind" "$local_state" "$upstream"
+done
+[ "$status" = 0 ] || echo "(!) a verbatim copy differs from its source"
+exit "$status"

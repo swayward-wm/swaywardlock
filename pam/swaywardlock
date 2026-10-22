@@ -1,0 +1,2 @@
+# PAM configuration for swaywardlock; see /etc/pam.d/login
+auth include login

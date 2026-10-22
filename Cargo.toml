@@ -1,0 +1,52 @@
+[package]
+name = "swaywardlock"
+version = "0.1.0"
+description = "Screen locker for the swayward-wm family"
+authors = ["Martin Trojer"]
+license = "GPL-3.0-or-later"
+edition = "2021"
+repository = "https://github.com/swayward-wm/swaywardlock"
+rust-version = "1.87"
+
+[dependencies]
+anyhow = "1.0"
+calloop = { version = "0.14", features = ["signals"] }
+clap = { version = "4.6", features = ["derive", "env"] }
+csscolorparser = "0.9"
+fastrand = "2"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp"] }
+knuffel = "3.2.0"
+libc = "0.2"
+miette = { version = "5.10.0", features = ["fancy-no-backtrace"] }
+pango = { version = "0.21.5", features = ["v1_44"] }
+pangocairo = "0.21.5"
+pam-sys2 = "1.0.2"
+smithay-client-toolkit = { version = "0.21.1", default-features = false, features = ["calloop", "xkbcommon"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+wayland-backend = { version = "0.3", features = ["client_system"] }
+wayland-client = "0.31"
+wayland-egl = "0.32"
+xkbcommon = { version = "0.9", default-features = false }
+zeroize = "1.8"
+
+[dependencies.smithay]
+# Same rev as swayward's workspace pin, so code copied from swayward builds unchanged.
+git = "https://github.com/Smithay/smithay.git"
+rev = "0c05927e154463a9973ad3741bef793489c92b3f"
+default-features = false
+features = ["backend_winit", "renderer_gl"]
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+# Replaces PAM with a fixed test password. Never enabled in release builds.
+test-auth = []
+
+[profile.release]
+panic = "abort"
+lto = "thin"
+
+[profile.dev]
+panic = "abort"
