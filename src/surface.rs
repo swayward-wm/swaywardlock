@@ -373,8 +373,27 @@ impl Surface {
         state: &LockState,
         dynamic: &Dynamic<'_>,
     ) -> anyhow::Result<bool> {
-        let buffer = self.buffer_size();
         self.trials.clear();
+        let result = self.draw_inner(renderer, config, images, state, dynamic);
+        if result.is_err() {
+            // Texture construction is provisional until the complete frame binds, renders
+            // and swaps. Both draw_all and reconfigure collect these outcomes.
+            for (_, ok) in &mut self.trials {
+                *ok = false;
+            }
+        }
+        result
+    }
+
+    fn draw_inner(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        config: &Config,
+        images: &Images,
+        state: &LockState,
+        dynamic: &Dynamic<'_>,
+    ) -> anyhow::Result<bool> {
+        let buffer = self.buffer_size();
         let (Some(egl), Some(damage)) = (self.egl.as_mut(), self.damage.as_mut()) else {
             return Ok(false);
         };
@@ -738,99 +757,67 @@ impl Surface {
                     let configured = images.get(&im.path);
                     let newest = dynamic.reload.newest(i).or(configured);
                     if tex.is_none() || reloaded {
-                        let fresh = newest.and_then(|img| {
-                            Some((render_image(renderer, im, img, scale)?, img.size()))
-                        });
                         let trial = dynamic.reload.on_trial(i);
                         if trial {
-                            self.trials.push((i, fresh.is_some()));
-                        }
-                        if let Some((t, from)) = fresh {
+                            // Upload is only the first step: the encompassing rotated texture
+                            // can still fail. Keep all picture state provisional until it draws.
+                            let mut candidate_rotated = None;
+                            let candidate = newest.and_then(|img| {
+                                let t = render_image(renderer, im, img, scale)?;
+                                let parts = draw_image(
+                                    renderer,
+                                    im,
+                                    Some(&t),
+                                    img.size(),
+                                    frame,
+                                    &mut candidate_rotated,
+                                    size,
+                                    scale,
+                                )?;
+                                Some((t, img.size(), parts))
+                            });
+                            self.trials.push((i, candidate.is_some()));
+                            if let Some((t, from, parts)) = candidate {
+                                *tex = Some(t);
+                                *drawn = from;
+                                *rotated = candidate_rotated;
+                                elements.extend(parts);
+                                continue;
+                            }
+                            if tex.is_none() {
+                                // Relayout dropped the old cache: rebuild the shown picture,
+                                // never the candidate whose final render just failed.
+                                if let Some(img) = dynamic.reload.shown(i).or(configured) {
+                                    *tex = render_image(renderer, im, img, scale);
+                                    *drawn = img.size();
+                                    *rotated = None;
+                                }
+                            }
+                        } else if let Some((t, from)) = newest.and_then(|img| {
+                            Some((render_image(renderer, im, img, scale)?, img.size()))
+                        }) {
                             *tex = Some(t);
                             *drawn = from;
                             *rotated = None;
-                        } else if trial && tex.is_none() {
-                            // A new picture that fails to render leaves the old one up (rendered
-                            // again if a relayout dropped it).
-                            if let Some(img) = dynamic.reload.shown(i).or(configured) {
-                                *tex = render_image(renderer, im, img, scale);
-                                *drawn = img.size();
-                            }
                         }
                     }
-                    // The size of the picture `tex` shows, which a failed reload keeps.
-                    let (iw, ih) = match (tex.is_some(), newest) {
+                    // The size of the picture tex shows, which a failed reload keeps.
+                    let from = match (tex.is_some(), newest) {
                         (true, _) => *drawn,
                         (false, Some(img)) => img.size(),
                         (false, None) => continue,
                     };
-                    let inner = image_inner(im, (iw, ih));
-                    let bw = im.border.map_or(0., |b| b.width);
-                    let outer = inner + Size::from((2. * bw, 2. * bw));
-                    let angle = im.rotate.to_radians();
-                    let loc = if angle != 0. {
-                        place_rotated_padded(&im.common, outer, angle, size, scale)
-                    } else {
-                        place(&im.common, outer, size)
-                    };
-                    // hyprlock: the picture keeps `corner-radius`, the border around it gets the
-                    // radius plus its width (roundingForBorderBox).
-                    let outer_radius = shape::resolve_radius(
-                        im.corner_radius.map(|r| r.expanded_by(bw as f32)),
-                        outer,
-                    );
-                    // Shadow and border behind/around the picture, via the shape renderer.
-                    let params = shape::Params {
-                        size: outer,
-                        fill: None,
-                        border: im.border,
-                        radius: Some(outer_radius),
-                        shadow: im.shadow,
+                    if let Some(parts) = draw_image(
+                        renderer,
+                        im,
+                        tex.as_ref(),
+                        from,
+                        frame,
+                        rotated,
+                        size,
                         scale,
-                        alpha: 1.,
-                    };
-                    if angle != 0. {
-                        let picture = tex.clone();
-                        let key = (params, picture.is_some());
-                        let build = |r: &mut GlesRenderer, out: &mut Vec<LockElement>| {
-                            frame.render(r, params, Point::default(), &mut |e| out.push(e.into()));
-                            if let Some(buf) = picture {
-                                out.push(LockElement::Texture(
-                                    TextureRenderElement::from_texture_buffer(
-                                        buf,
-                                        (bw, bw),
-                                        1.,
-                                        None,
-                                        Some(inner),
-                                        Kind::Unspecified,
-                                    ),
-                                ));
-                            }
-                        };
-                        let centre = Point::from((loc.x + outer.w / 2., loc.y + outer.h / 2.));
-                        elements.extend(draw_rotated(
-                            rotated,
-                            key,
-                            renderer,
-                            scale,
-                            "image",
-                            build,
-                            (loc, centre, angle),
-                        ));
-                        continue;
-                    }
-                    frame.render(renderer, params, loc, &mut |e| elements.push(e.into()));
-                    if let Some(buf) = tex.clone() {
-                        elements.push(LockElement::Texture(
-                            TextureRenderElement::from_texture_buffer(
-                                buf,
-                                (loc.x + bw, loc.y + bw),
-                                1.,
-                                None,
-                                Some(inner),
-                                Kind::Unspecified,
-                            ),
-                        ));
+                    ) {
+                        elements.extend(parts);
                     }
                 }
                 (Widget::InputField(f), Cached::InputField(c)) => {
@@ -1061,6 +1048,90 @@ fn draw_rotated<K: PartialEq>(
         scale,
         1.,
     )))
+}
+
+/// Build the complete image widget before a reload replaces its cached picture.
+/// A failed rotated offscreen render leaves the previous picture and cache untouched.
+#[allow(clippy::too_many_arguments)]
+fn draw_image(
+    renderer: &mut GlesRenderer,
+    im: &ImageWidget,
+    tex: Option<&TextureBuffer<GlesTexture>>,
+    drawn: (i32, i32),
+    frame: &mut RoundedBox,
+    rotated: &mut Option<Rotated<(shape::Params, bool)>>,
+    size: Size<f64, Logical>,
+    scale: f64,
+) -> Option<Vec<LockElement>> {
+    let mut elements = Vec::new();
+    let (iw, ih) = drawn;
+    let inner = image_inner(im, (iw, ih));
+    let bw = im.border.map_or(0., |b| b.width);
+    let outer = inner + Size::from((2. * bw, 2. * bw));
+    let angle = im.rotate.to_radians();
+    let loc = if angle != 0. {
+        place_rotated_padded(&im.common, outer, angle, size, scale)
+    } else {
+        place(&im.common, outer, size)
+    };
+    // hyprlock: the picture keeps `corner-radius`, the border around it gets the
+    // radius plus its width (roundingForBorderBox).
+    let outer_radius =
+        shape::resolve_radius(im.corner_radius.map(|r| r.expanded_by(bw as f32)), outer);
+    // Shadow and border behind/around the picture, via the shape renderer.
+    let params = shape::Params {
+        size: outer,
+        fill: None,
+        border: im.border,
+        radius: Some(outer_radius),
+        shadow: im.shadow,
+        scale,
+        alpha: 1.,
+    };
+    if angle != 0. {
+        let picture = tex.cloned();
+        let key = (params, picture.is_some());
+        let build = |r: &mut GlesRenderer, out: &mut Vec<LockElement>| {
+            frame.render(r, params, Point::default(), &mut |e| out.push(e.into()));
+            if let Some(buf) = picture {
+                out.push(LockElement::Texture(
+                    TextureRenderElement::from_texture_buffer(
+                        buf,
+                        (bw, bw),
+                        1.,
+                        None,
+                        Some(inner),
+                        Kind::Unspecified,
+                    ),
+                ));
+            }
+        };
+        let centre = Point::from((loc.x + outer.w / 2., loc.y + outer.h / 2.));
+        elements.push(draw_rotated(
+            rotated,
+            key,
+            renderer,
+            scale,
+            "image",
+            build,
+            (loc, centre, angle),
+        )?);
+        return Some(elements);
+    }
+    frame.render(renderer, params, loc, &mut |e| elements.push(e.into()));
+    if let Some(buf) = tex.cloned() {
+        elements.push(LockElement::Texture(
+            TextureRenderElement::from_texture_buffer(
+                buf,
+                (loc.x + bw, loc.y + bw),
+                1.,
+                None,
+                Some(inner),
+                Kind::Unspecified,
+            ),
+        ));
+    }
+    Some(elements)
 }
 
 /// An `image` widget's picture area: hyprlock scales so the shorter side is `size`, keeping the

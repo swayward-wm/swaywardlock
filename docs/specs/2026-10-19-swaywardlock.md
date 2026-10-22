@@ -292,7 +292,7 @@ nothing and the locker logs a warning.
   space dropped, a `file://` prefix dropped, `~` expanded, a relative path taken against the
   directory of the config file) is the path to show. An empty output, or a command that fails,
   keeps the picture. A `background` with a command and no `path` runs it once at startup for
-  its first picture.
+  its first picture. An empty command or one containing NUL is a config error.
 - `reload-ms <ms>`: run the command (or, without one, look at the widget's own `path`) every
   that many ms; at least 100. `0` means only on SIGUSR2. Without it nothing reloads on a timer.
   SIGUSR2 reloads every widget that has either key at once.
@@ -300,7 +300,8 @@ nothing and the locker logs a warning.
   looked at, and skips a round while the previous decode is still running. Writing a new file
   and renaming it over the old one avoids a half-written read.
 - `crossfade-ms <ms>` (`background` only): the new picture fades in over the old one, linearly,
-  in that time; absent or `0` swaps at once, and so does `animations { off; }`. A picture that
+  in that time (0..3000 ms, the same three-second cap as other animations); absent or `0`
+  swaps at once, and so does `animations { off; }`. A picture that
   arrives while a crossfade runs waits for it to end (as in hyprlock, which skips reloads until
   then), then fades in.
 - The command and the decode run off the main thread, so a slow command or a huge file never
@@ -313,10 +314,17 @@ nothing and the locker logs a warning.
 - A failed reload (a missing, corrupt or refused file, a command that cannot start, a picture
   that cannot be drawn, such as an `image` whose texture would be over the GPU limit) keeps the
   old picture and logs one warning; the file is not tried again until it changes. A new picture
-  replaces the old one only once every output has rendered it. Nothing in a reload affects the
-  lock or can unlock the session. Commands run like `cmd[]` ones (own process group, output capped at 64
+  replaces the old one after the drawing batch reports success for its participating outputs.
+  Configure-triggered frames settle independently: later or not-yet-ready outputs do not prevent
+  commitment. If a committed image cannot render on a later output, that widget can be missing
+  there. This is a cosmetic limitation, not a session-lock change. Nothing in a reload affects
+  the lock or can unlock the session. Commands run like `cmd[]` ones (own process group, output capped at 64
   KiB) and are killed on unlock and on SIGTERM, SIGINT and SIGHUP.
-- `reload-*` on a `background { screenshot; }` is ignored with a warning (as in hyprlock).
+- `reload-ms`, `reload-cmd` and `crossfade-ms` on a `background { screenshot; }` are
+  unsupported and ignored. Config decoding (including `validate`) warns even for explicit
+  zero values. The screenshot is kept; it is never replaced by a reload command. This is a
+  deliberate difference from hyprlock, which can replace a screenshot with a command's
+  picture. `hyprlock-to-kdl` leaves these keys as comments with warnings, not active keys.
 
 Deliberate differences from hyprlock: the keys are in ms (`reload_time` is seconds, and
 `hyprlock-to-kdl` multiplies by 1000); a `background` without a command also follows its file's
@@ -391,9 +399,12 @@ The blur is the background's dual-Kawase blur (`size` is its offset, as hyprlock
 is its blur radius), so the shadow is hyprlock's model (mask, blurred, boosted, tinted) at an
 approximation: the exact falloff differs from hyprlock's shader, and hyprlock's prepare pass
 (contrast and brightness, 0 for shadows) changes only colour, which the tint replaces. The
-shadow is rendered when the text changes, padded by `2 * size * 2^passes + 2` px on each side
-(the blur reaches 11 px past a 16 px block at size 3 and one pass, 24 at two, 44 at three, 79 at
-four); a failure draws the label without its shadow.
+shadow is rendered when the text changes. Its texture is padded on each side by
+`ceil(2 * offset * 2^passes + 2^(passes+1) + 2)` px, where `offset` starts as `size` times the
+render scale. The plan reduces resolution and passes (then offset at one pass) to fit at most
+2^19 pixels; config bounds are 4 passes and size 20. The blur reaches 11 px past a 16 px block
+at size 3 and one pass, 24 at two, 44 at three, 79 at four. A failure draws the label without
+its shadow.
 
 **`image`**
 
@@ -734,10 +745,14 @@ fprintd has its own channel and event type (`fprint::FprintEvent`, only `Matched
   any seat while locked is picked up. Ctrl is tracked per keyboard.
 - Caps/Num lock state and the active layout are kept per keyboard, from that keyboard's xkb
   state after each of its `modifiers` events. `$LAYOUT`, the ring's layout box and the Caps
-  Lock text and indicator show the keyboard that last sent a key or modifiers among those still
-  present; when it goes away they fall back to a remaining keyboard, or empty. A new keymap redraws too: the first frame is usually drawn before the
-  keymap arrives, and with layout 0 active no `modifiers` event follows, so `$LAYOUT` and the
-  ring's layout box would stay empty until the first key.
+  Lock text and indicator show the keyboard that last sent a key or a subsequent modifiers
+  event among those still present. The first modifiers snapshot after each enter (including
+  refocus) caches state without changing which keyboard is shown. Keymap arrival is also
+  quiet, but can redraw the fallback before any keyboard has spoken. When the shown keyboard
+  goes away, a remaining keyboard's cached state is shown, or empty if none remain.
+  Limitation: a modifiers event without a preceding enter still counts as input. wlroots can
+  send this when a seat gains its first keyboard; runtime reachability in sway 1.11 was not
+  reproduced by the audit (UNVERIFIED), so no broader quiet-keyboard guarantee is claimed.
 - Grace period: until it ends, any key press, pointer button or motion calls
   `request_unlock()`. Touch is not handled.
 - `hide-cursor`: set a null cursor on pointer enter. Otherwise no cursor is
@@ -865,17 +880,19 @@ stdout/stderr split and the same clamping of values the decoder rejects.
 | Input/auth | key handling (Escape, control characters, modifiers, Ctrl shortcuts, ignore-empty-input), timers, grace (`state.rs`) | unit tests; there is no `FakeAuth`, the `test-auth` build feature swaps PAM for a fixed password |
 | Real PAM | `src/auth.rs` against libpam: wrong and right password, auth phase only, follow-up questions, faillock text, setcred | unit tests with throwaway service files through `pam_start_confdir` and the probe module `contrib/test-pam-probe.c`; `contrib/test-real-pam` (in the gate) installs a throwaway `/etc/pam.d/swl-test-<pid>` (`pam_exec` script, then `account required pam_deny.so`) so the shipped `pam_start` lookup runs too; it needs root or passwordless sudo and says SKIP otherwise. `SWAYWARDLOCK_TEST_REAL_PASSWORD=<pw> contrib/test-real-pam` also checks a real password through `auth include login` (opt-in: it needs a user with a throwaway password) |
 | Process | ready-fd ordering, daemonize, SIGUSR1, exit 2 on `finished` | integration |
-| End to end | lock, wrong password, right password, screenshots, widgets by pixel sampling (`contrib/e2e-sway`, moving to the pytest suite `tests/e2e`). Every unlock path checks that the compositor unlocked (a `swaybg` desktop is visible again), not only the exit code. Also: `pam { off; }` with Enter, an unlock before `locked` (a proxy holds `locked` back), outputs plugged and unplugged while locked, scale changes, fade direction, blur and brightness, the fprintd call order and retry delay, pointer grace and hide-cursor, the daemon's session and stdio | headless sway (`WLR_BACKENDS=headless`, `WLR_RENDERER=pixman` or llvmpipe), `wtype` for keys (`contrib/vkbd` for a chosen seat or a multi-layout keymap, which wtype cannot do), `contrib/vptr` for a pointer, the `test-auth` build feature |
-| Visual | the ring against swaylock's pixels | one e2e check (`converted`) compares a row measured on swaylock 1.8.6; there are no reference PNGs and no offscreen render tests |
+| End to end | lock, wrong password, right password, screenshots, widgets by pixel sampling in the pytest suite `tests/e2e`. Named unlock checks verify that the compositor unlocked (a `swaybg` desktop is visible again); other cases check exit codes or deadlines, which alone do not prove compositor unlock. Also: `pam { off; }` with Enter, an unlock before `locked` (a proxy holds `locked` back), outputs plugged and unplugged while locked, scale changes, fade direction, blur and brightness, the fprintd call order and retry delay, pointer grace and hide-cursor, the daemon's session and stdio | headless sway (`WLR_BACKENDS=headless`, `WLR_RENDERER=pixman` or llvmpipe), `wtype` for keys (`contrib/vkbd` for a chosen seat or a multi-layout keymap, which wtype cannot do), `contrib/vptr` for a pointer, the `test-auth` build feature |
+| Visual | the ring against swaylock's pixels | the converted-config pytest check compares a row measured on swaylock 1.8.6; unit tests also render offscreen with surfaceless EGL (postprocess, text shadows and widgets). There are no reference PNGs |
 
 The test password exists only behind the cargo feature `test-auth`, which release builds don't
 enable. The gate checks that a release build does not contain it. Not done: tests on swayward
-itself, and snapshot or offscreen-render tests.
+itself, and reference-PNG snapshot tests.
 
-Gate: `contrib/gate` runs nightly fmt, clippy, `cargo test`, `contrib/test-real-pam`, the
-converter corpus and the headless-sway end-to-end runs: `contrib/e2e-sway`, then the pytest
-suite in `tests/e2e` (`pytest tests/e2e -n auto`; one area: `pytest tests/e2e -k password`),
-which the bash tests move to area by area (`2026-10-21-e2e-pytest.md`).
+Gate: `contrib/gate --fast` runs iteration checks; `contrib/gate --slow` runs real PAM,
+try-lock, the complete headless-sway pytest suite in `tests/e2e`, and the release build with
+test-hook scans. `contrib/gate` runs both. The bash harness has been retired; the migration
+plan is historical (`2026-10-21-e2e-pytest.md`). See [Gates in USING.md](../USING.md#gates)
+for the full inventory, container and private-target rules, targeted commands and evidence
+requirements.
 
 ## Phases
 

@@ -327,6 +327,40 @@ mod tests {
         );
     }
 
+    /// Exercise config decoding and uniform upload together, not just hand-built options.
+    #[test]
+    fn postprocess_uses_config_darkness_and_passes() {
+        let Some(mut r) = renderer() else { return };
+        let p = PostProcessProgram::compile(&mut r).unwrap();
+        // Independent FRAGBLUR1 reference values from the capture review. One byte permits
+        // final framebuffer quantisation; default darkness 0.05 differs by dozens of bytes.
+        for (darkness, vibrancy, passes, input, want) in [
+            (0.5, 1., 1, [200, 60, 60, 255], [255, 5, 5]),
+            (0., 0.1686, 3, [230, 120, 40, 255], [242, 118, 28]),
+            // The original orange references cannot distinguish forced passes 1/3 within
+            // one byte. Independent FRAGBLUR1 evaluation of this less saturated green
+            // separates them by 22 bytes; both directions guard hard-coded pass counts.
+            (0.5, 0.7, 1, [120, 150, 100, 255], [110, 200, 50]),
+            (0.5, 0.7, 3, [120, 150, 100, 255], [106, 221, 29]),
+        ] {
+            let config = crate::config::Config::parse_mem(&format!(
+                "background {{ vibrancy {vibrancy}; vibrancy-darkness {darkness}; \
+                 blur {{ passes {passes}; saturation 1; noise 0; }}; }}"
+            ))
+            .unwrap();
+            let crate::config::Widget::Background(bg) = &config.widgets[0] else {
+                panic!("expected parsed background");
+            };
+            for px in run(&mut r, &p, input, PostProcess::from_config(bg)) {
+                assert!(
+                    near(px, want, 1),
+                    "config darkness {darkness}, passes {passes}: {px:?}, want {want:?}"
+                );
+                assert_eq!(px[3], 255);
+            }
+        }
+    }
+
     /// The result is not flipped or mirrored.
     #[test]
     fn postprocess_keeps_orientation() {

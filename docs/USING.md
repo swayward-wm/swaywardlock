@@ -74,9 +74,9 @@ Prebuilt x86_64 packages are on the [release page](https://github.com/swayward-w
 | `swaywardlock-VERSION-ubuntu24.04-x86_64.tar.gz` | prebuilt binaries, with a `.sha256` |
 | `swaywardlock-VERSION-vendored-dependencies.tar.xz` | the Rust dependencies, for building offline |
 
-The release workflow installs and executes every package in a clean container before it drafts
-the release: `swaywardlock --version`, `swaywardlock validate` on every shipped example, the PAM
-file compared with `pam/swaywardlock` and checked to be marked as a config file, the converters
+The release workflow installs and executes the Ubuntu package on a fresh Ubuntu 24.04 GitHub
+runner and the Fedora and Arch packages in clean containers before it drafts the release:
+`swaywardlock --version`, `swaywardlock validate` on every shipped example, the PAM file compared with `pam/swaywardlock` and checked to be marked as a config file, the converters
 and `--help`, and a search of the installed binary for the test-auth password and test hooks
 (there are none). The tarball is an Ubuntu 24.04 build, not a generic Linux build; it needs
 glibc 2.39 and the libraries listed in its `RUNTIME.txt`.
@@ -123,7 +123,9 @@ Like swaylock, swaywardlock starts PAM when you press Enter, so a stack with `pa
 (Fedora's authselect `with-fingerprint`) reads the finger after Enter; `auth { fingerprint { }; }`
 unlocks on a touch at any time. Each question PAM asks after the first (a one-time code) is
 shown and answered with the next Enter. If your stack has two modules that both ask for the
-password, `auth { pam { reuse-password; }; }` answers the second from the first.
+password with exactly the same prompt text, `auth { pam { reuse-password; }; }` permits one
+reuse of the preceding answer for the immediately repeated prompt. Reuse consumes that cached
+answer: a third identical prompt needs another Enter with a fresh answer.
 
 ## Working on a layout
 
@@ -136,6 +138,12 @@ draws the lock screen in an ordinary window instead of locking, and redraws when
 last good frame. Typing drives the indicator; Enter shows the checking and wrong-password states
 but never checks a password. `--preview-output DP-1` makes the window match `output="DP-1"`
 widgets. Close the window to quit.
+
+Known limitation: editing the config when the preview has nearly exhausted its file-descriptor
+limit can abort it instead of keeping the last good frame. Preview reload creates fresh calloop
+channels, whose constructors panic if they cannot allocate a descriptor. This happens only in
+preview replacement; locked mode creates these channels at startup. Restart the preview after
+restoring descriptor capacity.
 
 `swaywardlock validate` checks a config without drawing anything.
 
@@ -154,7 +162,7 @@ Fast runs nightly fmt, clippy with default features and with `test-auth`, defaul
 unit tests, a debug test-auth build, both converters, man-page and documentation KDL checks,
 release-metadata consistency checks, and bash/zsh completions with a broken config. Slow runs
 real PAM, its own debug test-auth build, try-lock, the complete pytest headless-sway suite,
-and a default-feature release build with all three test-hook scans. CI uses these same modes.
+and a default-feature release build with all eight test-hook scans. CI uses these same modes.
 Each harness retains a five-minute timeout; CI also has a 45-minute job timeout.
 
 The **slow-gate budget is five minutes**, including builds. This is a target for test upkeep,
@@ -179,6 +187,11 @@ equivalent execution conditions. Workers use fast while iterating and targeted s
 for their area; reviewers reuse matching records; the merge owner runs full slow once per
 merge batch. Queue test upkeep if slow exceeds the budget. The cold-build five-minute budget
 remains unresolved.
+
+Before tearing down an upkeep pass, commit a new dated report under `docs/test-health/`
+with conditions, BEFORE/AFTER measurements, findings and evidence, rejected/refuted proposals
+and their reasons, and the remaining bottleneck. Do not edit older reports. The next pass
+reads the latest report first and re-measures; see [the 2026-10-22 report](https://github.com/swayward-wm/swaywardlock/blob/main/docs/test-health/2026-10-22.md).
 
 Builds stay private to this checkout: the gate overrides inherited `CARGO_TARGET_DIR`, using
 `target/gate-normal` for default-auth tests, `target/debug` for test-auth consumers, and

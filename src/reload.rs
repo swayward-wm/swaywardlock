@@ -7,9 +7,10 @@
 //! command runs on [`crate::commands::Runner`]'s worker threads and the decode on a thread of its
 //! own, so a slow command or a huge file never stalls input or the unlock. The worker refuses a
 //! picture too big to decode safely and scales the rest down to what the outputs need, so the
-//! main thread only wraps a screen-sized buffer. A new picture is a trial until every output has
-//! drawn it ([`Reload::settle`]); a reload that fails to decode or to render changes nothing: the
-//! old picture stays and a warning is logged. A picture that arrives while a crossfade runs waits
+//! main thread only wraps a screen-sized buffer. A new picture is a trial until the current
+//! drawing batch reports its outcomes ([`Reload::settle`]); configure-triggered frames settle
+//! independently, without waiting for later or unready outputs. A failed trial keeps the
+//! old picture and logs a warning. A picture that arrives while a crossfade runs waits
 //! for it to end. Nothing here can unlock the session, and every callback stands down once
 //! `App::exit` is set.
 
@@ -75,6 +76,7 @@ pub struct Decode {
     path: PathBuf,
     mtime: Option<SystemTime>,
     outcome: Outcome,
+    target: Option<(u32, u32)>,
 }
 
 /// One widget that reloads.
@@ -101,6 +103,11 @@ pub struct Reload {
     /// per widget, as in hyprlock).
     pending: Vec<bool>,
     seen: Vec<Seen>,
+    /// Resize work survives a pending decode or held crossfade, even with reload-ms 0.
+    resize_retry: Vec<bool>,
+    committed_targets: Vec<Option<(u32, u32)>>,
+    trial_targets: Vec<Option<(u32, u32)>>,
+    held_targets: Vec<Option<(u32, u32)>>,
     /// Per widget index, the reloaded picture on screen; `None` means the configured one.
     committed: Vec<Option<Image>>,
     /// A new picture not yet drawn, and its file: committed by [`Reload::settle`] once it renders.
@@ -123,14 +130,8 @@ fn plan(config: &Config) -> (Vec<Item>, Vec<String>) {
     let mut warnings = Vec::new();
     for (index, w) in config.widgets.iter().enumerate() {
         let (spec, path, what) = match w {
-            Widget::Background(b) if b.screenshot => {
-                if b.reload.is_set() {
-                    warnings.push(
-                        "background: reload-ms and reload-cmd are ignored with `screenshot`".into(),
-                    );
-                }
-                continue;
-            }
+            // The decoder warns about ignored screenshot keys, also during `validate`.
+            Widget::Background(b) if b.screenshot => continue,
             Widget::Background(b) => (&b.reload, b.path.clone(), "background"),
             Widget::Image(i) => (&i.reload, Some(i.path.clone()), "image"),
             _ => continue,
@@ -224,6 +225,10 @@ impl Reload {
             items,
             pending: vec![false; n],
             seen,
+            resize_retry: vec![false; n],
+            committed_targets: vec![None; n],
+            trial_targets: vec![None; n],
+            held_targets: vec![None; n],
             committed: (0..n).map(|_| None).collect(),
             trial: (0..n).map(|_| None).collect(),
             held: (0..n).map(|_| None).collect(),
@@ -258,8 +263,8 @@ impl Reload {
         self.screens
     }
 
-    /// The outputs changed. The first sizes start the first look; larger ones make the next look
-    /// decode again, so a picture scaled for a smaller output is not stretched.
+    /// The outputs changed. The first sizes start the first look; larger ones request another
+    /// decode once pending/trial/held work clears, so a smaller picture is only temporary.
     pub fn set_screens(&mut self, screens: Screens) {
         let old = self.screens;
         if screens == old {
@@ -268,14 +273,13 @@ impl Reload {
         self.screens = screens;
         if old.target(Cover::Screen).is_none() {
             self.refresh();
-        } else if screens.buffer.0 > old.buffer.0
-            || screens.buffer.1 > old.buffer.1
-            || screens.scale > old.scale
-        {
-            for item in &self.items {
-                if self.committed[item.index].is_some() {
-                    self.seen[item.index] = None;
-                }
+        }
+        for k in 0..self.items.len() {
+            let id = self.items[k].index;
+            if self.picture_needs_growth(k) {
+                self.seen[id] = None;
+                self.resize_retry[id] = true;
+                self.retry_resize(k);
             }
         }
     }
@@ -354,6 +358,7 @@ impl Reload {
         if self.pending[item.index] || self.screens.target(Cover::Screen).is_none() {
             return;
         }
+        self.resize_retry[item.index] = false;
         match &item.spec.cmd {
             Some(cmd) => self.runner.run(item.index, cmd.clone()),
             None => {
@@ -404,6 +409,7 @@ impl Reload {
                     path,
                     mtime,
                     outcome,
+                    target,
                 });
             });
         if let Err(err) = spawned {
@@ -423,13 +429,30 @@ impl Reload {
             path,
             mtime,
             outcome,
+            target,
         } = done;
         self.pending[id] = false;
-        self.seen[id] = Some((path.clone(), mtime));
+        let k = self.items.iter().position(|i| i.index == id).unwrap();
+        let stale = target_needs_growth(target, self.screens.target(self.items[k].cover))
+            && (matches!(&outcome, Outcome::Loaded(_)) || self.picture_needs_growth(k));
+        // An adequate completion satisfies growth requested while an older picture was shown.
+        if !stale && matches!(&outcome, Outcome::Loaded(_) | Outcome::Failed(_)) {
+            self.resize_retry[id] = false;
+        }
+        if stale || self.resize_retry[id] {
+            self.seen[id] = None;
+            self.resize_retry[id] = true;
+        } else {
+            self.seen[id] = Some((path.clone(), mtime));
+        }
         let decoded = match outcome {
-            Outcome::Unchanged => return false,
+            Outcome::Unchanged => {
+                self.retry_resize(k);
+                return false;
+            }
             Outcome::Failed(err) => {
                 tracing::warn!("reload: {err}; keeping the picture");
+                self.retry_resize(k);
                 return false;
             }
             Outcome::Loaded(decoded) => decoded,
@@ -438,6 +461,7 @@ impl Reload {
             Ok(image) => image,
             Err(err) => {
                 tracing::warn!("reload: {path:?}: {err:#}; keeping the picture");
+                self.retry_resize(k);
                 return false;
             }
         };
@@ -457,12 +481,13 @@ impl Reload {
                     // Still pending: no other reload starts for this widget meanwhile.
                     self.pending[id] = true;
                     self.held[id] = Some((image, path, token));
+                    self.held_targets[id] = target;
                     return false;
                 }
                 Err(err) => tracing::warn!("reload: crossfade timer: {}", err.error),
             }
         }
-        self.try_picture(id, image, path);
+        self.try_picture(id, image, path, target);
         true
     }
 
@@ -471,15 +496,16 @@ impl Reload {
         self.pending[id] = false;
         match self.held[id].take() {
             Some((image, path, _)) => {
-                self.try_picture(id, image, path);
+                self.try_picture(id, image, path, self.held_targets[id]);
                 true
             }
             None => false,
         }
     }
 
-    fn try_picture(&mut self, id: usize, image: Image, path: PathBuf) {
+    fn try_picture(&mut self, id: usize, image: Image, path: PathBuf, target: Option<(u32, u32)>) {
         self.trial[id] = Some((image, path));
+        self.trial_targets[id] = target;
         self.generations[id] += 1;
     }
 
@@ -501,13 +527,13 @@ impl Reload {
             };
             if mine().any(|ok| !ok) {
                 tracing::warn!("reload: {path:?} cannot be drawn; keeping the picture");
-                if mine().any(|ok| ok) {
-                    self.generations[id] += 1;
-                    redraw = true;
-                }
+                // A failed final frame can already have cached the candidate texture.
+                self.generations[id] += 1;
+                redraw = true;
                 continue;
             }
             self.committed[id] = Some(image);
+            self.committed_targets[id] = self.trial_targets[id];
             let crossfade = self
                 .items
                 .iter()
@@ -515,8 +541,38 @@ impl Reload {
                 .map_or(Duration::ZERO, |i| i.crossfade);
             self.fade_until[id] = (!crossfade.is_zero()).then(|| Instant::now() + crossfade);
         }
+        for k in 0..self.items.len() {
+            self.retry_resize(k);
+        }
         redraw
     }
+
+    fn picture_needs_growth(&self, k: usize) -> bool {
+        let id = self.items[k].index;
+        let target = self.screens.target(self.items[k].cover);
+        [
+            (self.committed[id].is_some(), self.committed_targets[id]),
+            (self.trial[id].is_some(), self.trial_targets[id]),
+            (self.held[id].is_some(), self.held_targets[id]),
+        ]
+        .into_iter()
+        .any(|(exists, from)| exists && target_needs_growth(from, target))
+    }
+
+    fn retry_resize(&mut self, k: usize) {
+        let id = self.items[k].index;
+        // Automatic growth waits for a frame outcome. Normal looks must still replace an
+        // undrawn trial when no configured output selects this widget.
+        if self.resize_retry[id] && self.trial[id].is_none() {
+            self.tick(k);
+        }
+    }
+}
+
+/// None means full resolution, not a zero-sized decode. Shrinking and regrowing within the
+/// captured dimensions must not replace an already adequate picture.
+fn target_needs_growth(from: Option<(u32, u32)>, to: Option<(u32, u32)>) -> bool {
+    matches!((from, to), (Some((w, h)), Some((nw, nh))) if nw > w || nh > h)
 }
 
 fn mtime(path: &Path) -> Option<SystemTime> {
@@ -550,6 +606,734 @@ fn parse_reload_output(text: &str, base: Option<&Path>, home: Option<&Path>) -> 
     match base {
         Some(base) if path.is_relative() => Some(base.join(path)),
         _ => Some(path),
+    }
+}
+
+#[cfg(test)]
+mod discrimination_tests {
+    use super::*;
+    fn fixture(text: &str) -> (Config, calloop::EventLoop<'static, App>, Reload) {
+        let config = Config::parse_mem(text).unwrap();
+        let event_loop = calloop::EventLoop::try_new().unwrap();
+        let r = Reload::new(
+            &config,
+            &Images::default(),
+            Screens::default(),
+            &event_loop.handle(),
+        )
+        .unwrap();
+        (config, event_loop, r)
+    }
+    fn loaded() -> Decode {
+        Decode {
+            target: None,
+            id: 0,
+            path: "/new.png".into(),
+            mtime: None,
+            outcome: Outcome::Loaded((1, 1, vec![0; 4])),
+        }
+    }
+    #[test]
+    fn failed_decode_preserves_committed_after_trial_settles() {
+        let (_, event_loop, mut r) = fixture("background { reload-cmd \"echo\"; reload-ms 0; }");
+        assert!(r.on_decoded(loaded()));
+        r.settle(&[(0, true)]);
+        let old = r.shown(0).unwrap() as *const Image;
+        let generation = r.generation(0);
+        assert!(!r.on_decoded(Decode {
+            target: None,
+            id: 0,
+            path: "/bad.png".into(),
+            mtime: None,
+            outcome: Outcome::Failed("bad".into())
+        }));
+        assert_eq!(r.shown(0).map(|i| i as *const Image), Some(old));
+        assert_eq!(r.generation(0), generation);
+        assert!(!r.on_trial(0));
+        r.stop(&event_loop.handle());
+    }
+    fn receive(rx: &calloop::channel::Channel<Decode>) -> Decode {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Ok(done) = rx.try_recv() {
+                return done;
+            }
+            assert!(Instant::now() < deadline, "reload did not finish");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    // Seed an in-flight adequate decode: this checks delivery state, not worker scheduling.
+    #[test]
+    fn adequate_completion_clears_retry_raised_while_pending() {
+        for failed in [false, true] {
+            let (_, event_loop, mut r) =
+                fixture("background { reload-cmd \"echo\"; reload-ms 0; }");
+            r.screens = Screens {
+                buffer: (128, 96),
+                scale: 1.,
+            };
+            let mut old = loaded();
+            old.target = Some((32, 24));
+            old.outcome = Outcome::Loaded((32, 24, vec![0; 32 * 24 * 4]));
+            assert!(r.on_decoded(old));
+            r.settle(&[(0, true)]);
+            let old_image = r.shown(0).unwrap() as *const Image;
+            let generation = r.generation(0);
+            r.pending[0] = true;
+            r.set_screens(Screens {
+                buffer: (32, 24),
+                scale: 1.,
+            });
+            r.set_screens(Screens {
+                buffer: (128, 96),
+                scale: 1.,
+            });
+            assert!(r.pending[0] && r.resize_retry[0]);
+            let stamp = SystemTime::UNIX_EPOCH + Duration::from_secs(5);
+            let path = PathBuf::from("/adequate.png");
+            assert_eq!(
+                r.on_decoded(Decode {
+                    id: 0,
+                    target: Some((128, 96)),
+                    path: path.clone(),
+                    mtime: Some(stamp),
+                    outcome: if failed {
+                        Outcome::Failed("bad".into())
+                    } else {
+                        Outcome::Loaded((128, 96, vec![0; 128 * 96 * 4]))
+                    },
+                }),
+                !failed
+            );
+            // A later tick can clear the retry and mask omission of the delivery-time reset.
+            assert!(
+                !r.resize_retry[0],
+                "adequate completion must clear retry: failed={failed}"
+            );
+            assert_eq!(r.seen[0], Some((path, Some(stamp))));
+            assert_eq!(r.on_trial(0), !failed);
+            if failed {
+                assert_eq!(r.shown(0).map(|i| i as *const Image), Some(old_image));
+                assert_eq!(r.generation(0), generation);
+            }
+            r.settle(&[(0, true)]);
+            assert!(!r.pending[0] && !r.resize_retry[0]);
+            assert_eq!(
+                r.shown(0).unwrap().size(),
+                if failed { (32, 24) } else { (128, 96) }
+            );
+            r.stop(&event_loop.handle());
+        }
+    }
+
+    // Release while small: growing before release would independently leave retry raised.
+    #[test]
+    fn held_small_target_survives_release_before_regrowth() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("picture.png");
+        image::RgbaImage::new(400, 300).save(&path).unwrap();
+        let (_, event_loop, mut r) = fixture(&format!(
+            "background {{ path \"{}\"; reload-ms 0; crossfade-ms 3000; }}",
+            path.display()
+        ));
+        let (tx, rx) = calloop::channel::channel();
+        r.decode_tx = tx;
+        r.screens = Screens {
+            buffer: (128, 96),
+            scale: 1.,
+        };
+        let mut old = loaded();
+        old.target = Some((128, 96));
+        old.outcome = Outcome::Loaded((128, 96, vec![0; 128 * 96 * 4]));
+        assert!(r.on_decoded(old));
+        r.settle(&[(0, true)]);
+        r.set_screens(Screens {
+            buffer: (32, 24),
+            scale: 1.,
+        });
+        let mut small = loaded();
+        small.target = Some((32, 24));
+        small.path = path;
+        small.outcome = Outcome::Loaded((32, 24, vec![0; 32 * 24 * 4]));
+        assert!(!r.on_decoded(small));
+        assert!(r.held[0].is_some() && r.pending[0]);
+        assert!(!r.resize_retry[0]);
+        let (_, _, token) = r.held[0].as_ref().unwrap();
+        event_loop.handle().remove(*token);
+        assert!(r.release(0));
+        assert_eq!(r.trial_targets[0], Some((32, 24)));
+        r.settle(&[(0, true)]);
+        assert_eq!(r.committed_targets[0], Some((32, 24)));
+        assert!(!r.pending[0] && !r.resize_retry[0]);
+        r.set_screens(Screens {
+            buffer: (128, 96),
+            scale: 1.,
+        });
+        assert!(
+            r.pending[0],
+            "regrowth must start work for the released small picture"
+        );
+        let done = receive(&rx);
+        assert_eq!(done.target, Some((128, 96)));
+        assert!(matches!(done.outcome, Outcome::Loaded(_)));
+        r.stop(&event_loop.handle());
+    }
+
+    #[test]
+    fn stale_command_picture_invalidates_previously_seen_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.png");
+        let b = dir.path().join("b.png");
+        image::RgbaImage::new(400, 300).save(&a).unwrap();
+        image::RgbaImage::new(400, 300).save(&b).unwrap();
+        let (_, event_loop, mut r) = fixture("background { reload-cmd \"echo\"; reload-ms 0; }");
+        let (tx, rx) = calloop::channel::channel();
+        r.decode_tx = tx;
+        // Completed command delivery is the seam; file decoding uses the real worker.
+        r.screens = Screens {
+            buffer: (128, 96),
+            scale: 1.,
+        };
+        r.on_output(CmdOutput {
+            id: 0,
+            text: a.display().to_string(),
+        });
+        let first = receive(&rx);
+        let stamp = first.mtime;
+        assert!(matches!(&first.outcome, Outcome::Loaded(_)));
+        assert!(r.on_decoded(first));
+        r.settle(&[(0, true)]);
+        assert_eq!(r.seen[0], Some((a.clone(), stamp)));
+        r.set_screens(Screens {
+            buffer: (32, 24),
+            scale: 1.,
+        });
+        r.on_output(CmdOutput {
+            id: 0,
+            text: b.display().to_string(),
+        });
+        let small = receive(&rx); // Hold delivery, not a worker timing race.
+        assert_eq!(small.target, Some((32, 24)));
+        assert!(matches!(&small.outcome, Outcome::Loaded(_)));
+        r.set_screens(Screens {
+            buffer: (128, 96),
+            scale: 1.,
+        });
+        assert_eq!(r.seen[0], Some((a.clone(), stamp)));
+        assert!(!r.resize_retry[0]); // The still-committed A is adequate.
+        assert!(r.on_decoded(small));
+        assert!(r.seen[0].is_none() && r.resize_retry[0]);
+        r.settle(&[(0, true)]);
+        // Inject the retry command's result; subprocess execution is not credited here.
+        r.on_output(CmdOutput {
+            id: 0,
+            text: a.display().to_string(),
+        });
+        let retry = receive(&rx);
+        assert_eq!(retry.path, a);
+        assert_eq!(retry.mtime, stamp);
+        assert_eq!(retry.target, Some((128, 96)));
+        assert!(
+            matches!(&retry.outcome, Outcome::Loaded(_)),
+            "previously seen A must be decoded again"
+        );
+        assert!(r.on_decoded(retry));
+        r.settle(&[(0, true)]);
+        assert_eq!(r.committed_targets[0], Some((128, 96)));
+        assert!(!r.pending[0] && !r.resize_retry[0]);
+        r.stop(&event_loop.handle());
+    }
+
+    #[test]
+    fn single_axis_growth_starts_automatic_decode() {
+        for target in [(128, 24), (32, 96)] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("picture.png");
+            image::RgbaImage::new(400, 300).save(&path).unwrap();
+            let (_, event_loop, mut r) = fixture(&format!(
+                "background {{ path \"{}\"; reload-ms 0; }}",
+                path.display()
+            ));
+            let (tx, rx) = calloop::channel::channel();
+            r.decode_tx = tx;
+            r.screens = Screens {
+                buffer: (32, 24),
+                scale: 1.,
+            };
+            let mut small = loaded();
+            small.target = Some((32, 24));
+            small.outcome = Outcome::Loaded((32, 24, vec![0; 32 * 24 * 4]));
+            assert!(r.on_decoded(small));
+            r.settle(&[(0, true)]);
+            assert!(!r.pending[0] && !r.resize_retry[0]);
+            r.set_screens(Screens {
+                buffer: target,
+                scale: 1.,
+            });
+            assert!(r.pending[0], "one-axis growth must start work: {target:?}");
+            assert!(target_needs_growth(Some((32, 24)), Some(target)));
+            let done = receive(&rx);
+            assert_eq!(done.target, Some(target));
+            assert!(matches!(&done.outcome, Outcome::Loaded(_)));
+            assert!(r.on_decoded(done));
+            r.settle(&[(0, true)]);
+            assert_eq!(r.committed_targets[0], Some(target));
+            assert!(!r.pending[0] && !r.resize_retry[0]);
+            r.stop(&event_loop.handle());
+        }
+    }
+
+    #[test]
+    fn growth_during_unchanged_startup_look_keeps_full_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("startup.png");
+        image::RgbaImage::new(400, 300).save(&path).unwrap();
+        let config = Config::parse_mem(&format!(
+            "background {{ path \"{}\"; reload-ms 0; }}",
+            path.display()
+        ))
+        .unwrap();
+        let event_loop = calloop::EventLoop::try_new().unwrap();
+        let mut images = Images::load_all(&config);
+        let mut r =
+            Reload::new(&config, &images, Screens::default(), &event_loop.handle()).unwrap();
+        let (tx, rx) = calloop::channel::channel();
+        r.decode_tx = tx;
+        r.set_screens(Screens {
+            buffer: (32, 24),
+            scale: 1.,
+        });
+        let done = receive(&rx);
+        assert!(matches!(&done.outcome, Outcome::Unchanged));
+        r.set_screens(Screens {
+            buffer: (128, 96),
+            scale: 1.,
+        });
+        assert!(!r.on_decoded(done));
+        assert!(!r.on_trial(0));
+        r.prune(&config, &mut images);
+        assert!(images.contains(&path));
+        assert!(!r.pending[0] && !r.resize_retry[0]);
+        r.refresh();
+        assert!(matches!(receive(&rx).outcome, Outcome::Unchanged));
+        r.stop(&event_loop.handle());
+    }
+
+    #[test]
+    fn growth_waits_for_held_picture_then_retries_and_regrowth_skips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("picture.png");
+        image::RgbaImage::new(400, 300).save(&path).unwrap();
+        let (_, event_loop, mut r) = fixture(&format!(
+            "background {{ path \"{}\"; reload-ms 0; crossfade-ms 3000; }}",
+            path.display()
+        ));
+        let (tx, rx) = calloop::channel::channel();
+        r.decode_tx = tx;
+        r.set_screens(Screens {
+            buffer: (32, 24),
+            scale: 1.,
+        });
+        assert!(r.on_decoded(receive(&rx)));
+        r.settle(&[(0, true)]);
+        // Another actual decode waits for that crossfade. Growth must survive its release.
+        r.seen[0] = None;
+        r.refresh();
+        assert!(!r.on_decoded(receive(&rx)));
+        assert!(r.held[0].is_some());
+        r.set_screens(Screens {
+            buffer: (128, 96),
+            scale: 1.,
+        });
+        assert!(r.pending[0] && r.resize_retry[0]);
+        no_decode(&rx);
+        let (_, _, token) = r.held[0].as_ref().unwrap();
+        event_loop.handle().remove(*token);
+        assert!(r.release(0));
+        r.settle(&[(0, true)]);
+        assert!(!r.on_decoded(receive(&rx))); // Larger picture waits for the new fade.
+        let (_, _, token) = r.held[0].as_ref().unwrap();
+        event_loop.handle().remove(*token);
+        r.release(0);
+        r.settle(&[(0, true)]);
+        assert_eq!(r.shown(0).unwrap().size(), (128, 96));
+        r.set_screens(Screens {
+            buffer: (32, 24),
+            scale: 1.,
+        });
+        r.set_screens(Screens {
+            buffer: (128, 96),
+            scale: 1.,
+        });
+        assert!(!r.pending[0]);
+        r.refresh();
+        assert!(matches!(receive(&rx).outcome, Outcome::Unchanged));
+        r.stop(&event_loop.handle());
+    }
+
+    // Hold delivery, not a large-image timing race: the real worker has captured the small
+    // target before the larger configure. Unconditional seen assignment loses this resize.
+    #[test]
+    fn larger_output_during_decode_retries_without_a_file_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stripes.png");
+        image::RgbaImage::from_fn(400, 300, |x, _| {
+            let c = if x % 8 < 4 { 0 } else { 255 };
+            image::Rgba([c, c, c, 255])
+        })
+        .save(&path)
+        .unwrap();
+        let text = format!("background {{ path \"{}\"; reload-ms 0; }}", path.display());
+        let (_, event_loop, mut r) = fixture(&text);
+        let (tx, rx) = calloop::channel::channel();
+        r.decode_tx = tx;
+        r.set_screens(Screens {
+            buffer: (32, 24),
+            scale: 1.,
+        });
+        let small = receive(&rx);
+        assert!(matches!(&small.outcome, Outcome::Loaded((32, 24, _))));
+        let stamp = small.mtime;
+        r.set_screens(Screens {
+            buffer: (128, 96),
+            scale: 1.,
+        });
+        assert!(r.on_decoded(small));
+        r.settle(&[(0, true), (0, true)]);
+        let large = receive(&rx);
+        assert_eq!(large.mtime, stamp);
+        assert!(matches!(&large.outcome, Outcome::Loaded((128, 96, _))));
+        assert!(r.on_decoded(large));
+        r.settle(&[(0, true), (0, true)]);
+        r.refresh(); // SIGUSR2 on the same path must now skip, not decode again.
+        assert!(matches!(receive(&rx).outcome, Outcome::Unchanged));
+        r.stop(&event_loop.handle());
+    }
+
+    #[test]
+    fn every_failed_frame_discards_candidate_caches() {
+        let (_, event_loop, mut r) = fixture("background { reload-cmd \"echo\"; reload-ms 0; }");
+        assert!(r.on_decoded(loaded()));
+        r.settle(&[(0, true), (0, true)]);
+        let old = r.shown(0).unwrap() as *const Image;
+        assert!(r.on_decoded(loaded()));
+        let generation = r.generation(0);
+        assert!(
+            r.settle(&[(0, false), (0, false)]),
+            "failed frames can already cache the candidate"
+        );
+        assert!(r.generation(0) > generation);
+        assert_eq!(r.shown(0).map(|i| i as *const Image), Some(old));
+        r.stop(&event_loop.handle());
+    }
+
+    // No matching output means settle has no outcomes for this widget. Normal looks must
+    // still replace that trial; only automatic resize work waits for it to be drawn.
+    #[test]
+    fn refresh_replaces_undrawn_trial() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("picture.png");
+        image::RgbaImage::new(400, 300).save(&path).unwrap();
+        let (_, event_loop, mut r) = fixture(&format!(
+            "background output=\"DP-9\" {{ path \"{}\"; reload-ms 0; }}",
+            path.display()
+        ));
+        let (tx, rx) = calloop::channel::channel();
+        r.decode_tx = tx;
+        r.set_screens(Screens {
+            buffer: (32, 24),
+            scale: 1.,
+        });
+        assert!(r.on_decoded(receive(&rx)));
+        assert!(!r.settle(&[]));
+        assert!(r.on_trial(0) && !r.pending[0]);
+        image::RgbaImage::new(200, 100).save(&path).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(100))
+            .unwrap();
+        let generation = r.generation(0);
+        r.refresh();
+        let done = receive(&rx);
+        assert!(matches!(&done.outcome, Outcome::Loaded((48, 24, _))));
+        assert!(r.on_decoded(done));
+        assert!(r.generation(0) > generation);
+        r.settle(&[(0, true)]);
+        assert_eq!(r.shown(0).unwrap().size(), (48, 24));
+        r.stop(&event_loop.handle());
+    }
+
+    #[test]
+    fn command_output_replaces_undrawn_trial() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.png");
+        let b = dir.path().join("b.png");
+        image::RgbaImage::new(400, 300).save(&a).unwrap();
+        image::RgbaImage::new(200, 100).save(&b).unwrap();
+        let (_, event_loop, mut r) =
+            fixture("background output=\"DP-9\" { reload-cmd \"echo\"; reload-ms 0; }");
+        let (tx, rx) = calloop::channel::channel();
+        r.decode_tx = tx;
+        // Command delivery is the seam; the real file worker captures the screen target.
+        r.screens = Screens {
+            buffer: (32, 24),
+            scale: 1.,
+        };
+        r.on_output(CmdOutput {
+            id: 0,
+            text: a.display().to_string(),
+        });
+        assert!(r.on_decoded(receive(&rx)));
+        assert!(!r.settle(&[]));
+        assert!(r.on_trial(0) && !r.pending[0]);
+        r.on_output(CmdOutput {
+            id: 0,
+            text: b.display().to_string(),
+        });
+        let done = receive(&rx);
+        assert_eq!(done.path, b);
+        assert!(matches!(&done.outcome, Outcome::Loaded((48, 24, _))));
+        assert!(r.on_decoded(done));
+        r.settle(&[(0, true)]);
+        assert_eq!(r.shown(0).unwrap().size(), (48, 24));
+        r.stop(&event_loop.handle());
+    }
+
+    #[test]
+    fn unchanged_completion_after_growth_retries_same_file_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("picture.png");
+        image::RgbaImage::new(400, 300).save(&path).unwrap();
+        let (_, event_loop, mut r) = fixture(&format!(
+            "background {{ path \"{}\"; reload-ms 0; }}",
+            path.display()
+        ));
+        let (tx, rx) = calloop::channel::channel();
+        r.decode_tx = tx;
+        r.set_screens(Screens {
+            buffer: (32, 24),
+            scale: 1.,
+        });
+        assert!(r.on_decoded(receive(&rx)));
+        r.settle(&[(0, true)]);
+        r.refresh();
+        let unchanged = receive(&rx);
+        assert!(matches!(&unchanged.outcome, Outcome::Unchanged));
+        r.set_screens(Screens {
+            buffer: (128, 96),
+            scale: 1.,
+        });
+        no_decode(&rx);
+        assert!(!r.on_decoded(unchanged));
+        let large = receive(&rx);
+        assert!(matches!(&large.outcome, Outcome::Loaded((128, 96, _))));
+        assert!(r.on_decoded(large));
+        r.settle(&[(0, true)]);
+        assert_eq!(r.shown(0).unwrap().size(), (128, 96));
+        no_decode(&rx);
+        r.refresh();
+        assert!(matches!(receive(&rx).outcome, Outcome::Unchanged));
+        r.stop(&event_loop.handle());
+    }
+
+    // Both actual worker errors must terminate automatic growth while keeping the old picture.
+    fn failed_growth_stops(missing: bool, stale: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("picture.png");
+        image::RgbaImage::new(400, 300).save(&path).unwrap();
+        let (_, event_loop, mut r) = fixture(&format!(
+            "background {{ path \"{}\"; reload-ms 0; }}",
+            path.display()
+        ));
+        let (tx, rx) = calloop::channel::channel();
+        r.decode_tx = tx;
+        r.set_screens(Screens {
+            buffer: (32, 24),
+            scale: 1.,
+        });
+        assert!(r.on_decoded(receive(&rx)));
+        r.settle(&[(0, true)]);
+        if missing {
+            std::fs::remove_file(&path).unwrap();
+        } else {
+            std::fs::write(&path, b"not an image").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(100))
+                .unwrap();
+        }
+        if stale {
+            r.refresh();
+        } else {
+            r.set_screens(Screens {
+                buffer: (128, 96),
+                scale: 1.,
+            });
+        }
+        let failed = receive(&rx);
+        assert!(matches!(&failed.outcome, Outcome::Failed(_)));
+        assert_eq!(
+            failed.target,
+            Some(if stale { (32, 24) } else { (128, 96) })
+        );
+        if stale {
+            r.set_screens(Screens {
+                buffer: (128, 96),
+                scale: 1.,
+            });
+            no_decode(&rx);
+        }
+        assert!(!r.on_decoded(failed));
+        if stale {
+            let retry = receive(&rx);
+            assert_eq!(retry.target, Some((128, 96)));
+            assert!(matches!(&retry.outcome, Outcome::Failed(_)));
+            assert!(!r.on_decoded(retry));
+        }
+        assert_eq!(r.shown(0).unwrap().size(), (32, 24));
+        assert!(!r.pending[0] && !r.resize_retry[0]);
+        assert!(!r.settle(&[]));
+        no_decode(&rx);
+        r.refresh();
+        assert!(matches!(receive(&rx).outcome, Outcome::Unchanged));
+        r.stop(&event_loop.handle());
+    }
+
+    #[test]
+    fn adequate_corrupt_growth_failure_stops() {
+        failed_growth_stops(false, false);
+    }
+    #[test]
+    fn adequate_missing_growth_failure_stops() {
+        failed_growth_stops(true, false);
+    }
+    #[test]
+    fn stale_failure_retries_current_target_once() {
+        failed_growth_stops(false, true);
+    }
+
+    #[test]
+    fn stale_failed_trial_waits_then_retries_without_final_frame_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("picture.png");
+        image::RgbaImage::new(400, 300).save(&path).unwrap();
+        let (_, event_loop, mut r) = fixture(&format!(
+            "background {{ path \"{}\"; reload-ms 0; }}",
+            path.display()
+        ));
+        let (tx, rx) = calloop::channel::channel();
+        r.decode_tx = tx;
+        r.set_screens(Screens {
+            buffer: (32, 24),
+            scale: 1.,
+        });
+        let small = receive(&rx);
+        r.set_screens(Screens {
+            buffer: (128, 96),
+            scale: 1.,
+        });
+        assert!(r.on_decoded(small));
+        assert!(r.on_trial(0) && r.resize_retry[0]);
+        // Calling settlement without outcomes must not start an automatic look either.
+        assert!(!r.settle(&[]));
+        no_decode(&rx);
+        let generation = r.generation(0);
+        assert!(r.settle(&[(0, false), (0, true)]));
+        assert!(r.shown(0).is_none() && r.generation(0) > generation);
+        let large = receive(&rx);
+        assert!(matches!(&large.outcome, Outcome::Loaded((128, 96, _))));
+        assert!(r.on_decoded(large));
+        assert!(!r.resize_retry[0]);
+        assert!(r.settle(&[(0, false), (0, false)]));
+        assert!(!r.on_trial(0) && r.shown(0).is_none());
+        assert!(!r.settle(&[(0, false), (0, false)]));
+        assert!(!r.settle(&[]));
+        no_decode(&rx);
+        r.refresh();
+        assert!(matches!(receive(&rx).outcome, Outcome::Unchanged));
+        r.stop(&event_loop.handle());
+    }
+
+    fn no_decode(rx: &calloop::channel::Channel<Decode>) {
+        let deadline = Instant::now() + Duration::from_millis(300);
+        while Instant::now() < deadline {
+            assert!(
+                rx.try_recv().is_err(),
+                "started another decode while held/pending"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    #[test]
+    fn tick_does_not_decode_during_held_crossfade() {
+        let (_, event_loop, mut r) =
+            fixture("background { path \"/a.png\"; reload-ms 0; crossfade-ms 3000; }");
+        assert!(r.on_decoded(loaded()));
+        r.settle(&[(0, true)]);
+        assert!(!r.on_decoded(loaded()));
+        assert!(r.held[0].is_some() && r.pending[0]);
+        r.screens = Screens {
+            buffer: (320, 240),
+            scale: 1.,
+        };
+        let (tx, rx) = calloop::channel::channel();
+        r.decode_tx = tx;
+        r.tick(0);
+        no_decode(&rx);
+        r.stop(&event_loop.handle());
+    }
+    #[test]
+    fn queued_command_output_does_not_decode_during_held_crossfade() {
+        let (_, event_loop, mut r) =
+            fixture("background { reload-cmd \"echo\"; reload-ms 0; crossfade-ms 3000; }");
+        assert!(r.on_decoded(loaded()));
+        r.settle(&[(0, true)]);
+        assert!(!r.on_decoded(loaded()));
+        assert!(r.held[0].is_some() && r.pending[0]);
+        let (tx, rx) = calloop::channel::channel();
+        r.decode_tx = tx;
+        r.on_output(CmdOutput {
+            id: 0,
+            text: "/queued.png".into(),
+        });
+        no_decode(&rx);
+        r.stop(&event_loop.handle());
+    }
+    #[test]
+    fn prune_keeps_shared_startup_then_releases_last_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("startup.png");
+        image::RgbaImage::new(1, 1).save(&path).unwrap();
+        let text = format!(
+            "background {{ path \"{}\"; reload-ms 0; }}\nimage {{ path \"{}\"; reload-ms 0; }}",
+            path.display(),
+            path.display()
+        );
+        let (config, event_loop, mut r) = fixture(&text);
+        let mut images = Images::load_all(&config);
+        assert!(images.contains(&path));
+        assert!(r.on_decoded(loaded()));
+        r.settle(&[(0, true)]);
+        r.prune(&config, &mut images);
+        assert!(
+            images.contains(&path),
+            "unreloaded widget still needs startup picture"
+        );
+        let mut decoded = loaded();
+        decoded.id = 1;
+        assert!(r.on_decoded(decoded));
+        r.settle(&[(1, true)]);
+        r.prune(&config, &mut images);
+        assert!(
+            !images.contains(&path),
+            "all widgets have replaced startup picture"
+        );
+        r.stop(&event_loop.handle());
     }
 }
 
@@ -608,9 +1392,9 @@ mod tests {
         .unwrap();
         let (items, warnings) = plan(&config);
         assert_eq!(items.iter().map(|i| i.index).collect::<Vec<_>>(), [2, 3]);
-        assert_eq!(warnings.len(), 2, "{warnings:?}");
-        assert!(warnings[0].contains("screenshot"), "{warnings:?}");
-        assert!(warnings[1].contains("needs a `path`"), "{warnings:?}");
+        // Screenshot warnings are emitted at decode time, including by `validate`, not twice.
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("needs a `path`"), "{warnings:?}");
     }
 
     #[test]
@@ -627,6 +1411,7 @@ mod tests {
 
     fn loaded(id: usize) -> Decode {
         Decode {
+            target: None,
             id,
             path: "/new.png".into(),
             mtime: None,
@@ -634,13 +1419,13 @@ mod tests {
         }
     }
 
-    /// A new picture is on trial until a frame draws it: kept if every output rendered it,
+    /// A new picture is on trial until a frame draws it: kept if every reported outcome succeeded,
     /// dropped (the old one stays) if any could not. One that arrives during the crossfade to
     /// the last waits for it to end.
     #[test]
     fn a_new_picture_is_kept_only_once_it_renders() {
         let config = Config::parse_mem(
-            "background { path \"/a.png\"; reload-cmd \"echo\"; reload-ms 0; crossfade-ms 60000; }",
+            "background { path \"/a.png\"; reload-cmd \"echo\"; reload-ms 0; crossfade-ms 3000; }",
         )
         .unwrap();
         let event_loop = calloop::EventLoop::<App>::try_new().unwrap();
@@ -653,11 +1438,11 @@ mod tests {
         .unwrap();
         assert!(r.newest(0).is_none() && !r.on_trial(0));
 
-        // Fails to render: dropped, nothing to redraw, the configured picture stays.
+        // Fails to render: dropped, redraw discards any provisional candidate cache.
         assert!(r.on_decoded(loaded(0)));
         assert!(r.on_trial(0) && r.newest(0).is_some() && r.shown(0).is_none());
         let g = r.generation(0);
-        assert!(!r.settle(&[(0, false)]));
+        assert!(r.settle(&[(0, false)]));
         assert!(!r.on_trial(0) && r.newest(0).is_none());
 
         // Rendered on one output, not on another: dropped, and the first redraws the old one.
@@ -683,6 +1468,7 @@ mod tests {
 
         // A failed decode keeps everything as it was.
         let failed = Decode {
+            target: None,
             id: 0,
             path: "/bad.png".into(),
             mtime: None,

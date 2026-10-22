@@ -90,6 +90,8 @@ impl SecretBuf {
 impl Drop for SecretBuf {
     fn drop(&mut self) {
         self.buf.zeroize();
+        #[cfg(test)]
+        tests::observe_drop(self);
         if self.locked {
             // SAFETY: same region as the `mlock` in `new`.
             unsafe { libc::munlock(self.buf.as_ptr().cast(), CAPACITY) };
@@ -106,6 +108,44 @@ impl std::fmt::Debug for SecretBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Compare allocation identities only while Drop owns the live allocation. The observer
+    // retains a count and a boolean, never the buffer or a pointer to freed bytes.
+    std::thread_local! {
+        static DROP_OBSERVER: std::cell::RefCell<Option<(usize, usize, bool)>> = const {
+            std::cell::RefCell::new(None)
+        };
+    }
+
+    pub(super) fn observe_drop(secret: &SecretBuf) {
+        DROP_OBSERVER.with_borrow_mut(|observation| {
+            if let Some((address, count, all_zero)) = observation {
+                if *address == secret.buf.as_ptr() as usize {
+                    *count += 1;
+                    *all_zero &= secret.buf.iter().all(|&byte| byte == 0);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn drop_zeroizes_the_entire_live_allocation_once() {
+        let mut secret = SecretBuf::new();
+        secret.buf.fill(0xa5);
+        // A short logical password must not leave the allocation's tail untouched.
+        secret.len = 7;
+        DROP_OBSERVER.with_borrow_mut(|observation| {
+            assert!(observation.is_none());
+            *observation = Some((secret.buf.as_ptr() as usize, 0, true));
+        });
+        drop(secret);
+        let (_, count, all_zero) = DROP_OBSERVER.with_borrow_mut(Option::take).unwrap();
+        assert_eq!(count, 1, "observe the real destructor exactly once");
+        assert!(
+            all_zero,
+            "Drop must zero all 1024 bytes before munlock/deallocation"
+        );
+    }
 
     #[test]
     fn pop_removes_whole_characters() {

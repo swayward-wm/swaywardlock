@@ -142,6 +142,9 @@ enum Command {
     },
 }
 
+#[cfg(feature = "test-auth")]
+mod lifecycle_probe;
+
 struct App {
     conn: Connection,
     handle: LoopHandle<'static, App>,
@@ -157,7 +160,7 @@ struct App {
     /// Keyboard and pointer of every seat (swaylock binds them all). A device belongs to its
     /// seat: losing a capability on one seat must not drop another seat's device.
     inputs: Vec<SeatInput>,
-    /// Counts key and modifiers events across keyboards, to tell which spoke last.
+    /// Counts key and subsequent modifiers events across keyboards, excluding enter snapshots.
     input_clock: u64,
     gpu: Gpu,
     config: Config,
@@ -440,7 +443,7 @@ fn run(
             )?)
         }
         None => {
-            tracing::warn!("PAM is disabled in the config; only SIGUSR1 can unlock");
+            tracing::warn!("PAM is disabled in the config; configured fingerprint authentication, an explicitly enabled grace period, or SIGUSR1 can unlock");
             None
         }
     };
@@ -578,6 +581,12 @@ fn run(
             break EXIT_FAILED_AFTER_LOCK;
         }
     };
+    #[cfg(feature = "test-auth")]
+    if code == 0 && std::env::var_os("SWAYWARDLOCK_TEST_EXIT_PROBE").is_some() {
+        // Retain the live App only through these synchronous checks: process teardown otherwise
+        // hides uncleared surfaces and prevents late callbacks from being observed.
+        lifecycle_probe::check(&mut app);
+    }
     app.daemon.report(code);
     Ok(code)
 }
@@ -827,6 +836,8 @@ impl App {
 
     /// Redraw and re-arm the timer for the next state deadline.
     fn state_changed(&mut self) {
+        #[cfg(feature = "test-auth")]
+        lifecycle_probe::state_changed();
         self.draw_all();
         if let Some(token) = self.timer.take() {
             self.handle.remove(token);
@@ -856,6 +867,8 @@ impl App {
     }
 
     fn draw_all(&mut self) {
+        #[cfg(feature = "test-auth")]
+        lifecycle_probe::draw_entry();
         if self.exit.is_some() {
             return;
         }
@@ -1146,14 +1159,18 @@ struct KeyboardState {
     modifiers: Modifiers,
     layout: u32,
     layout_names: Vec<String>,
-    /// When this keyboard last sent a key or modifiers (`App::input_clock`); 0 = never.
+    /// Last key or subsequent modifiers event (`App::input_clock`), excluding snapshots.
+    /// 0 = never.
     last_input: u64,
+    /// The first modifiers event after enter initializes state; it is not new input.
+    initial_modifiers_pending: bool,
     /// The surface with this keyboard's focus, for the repeat to stop if it dies.
     focus: Option<wl_surface::WlSurface>,
 }
 
-/// The keyboard whose state is shown: the one that last sent a key or modifiers, else one that
-/// has a keymap. `keyboards` are the ones still present.
+/// The keyboard whose cached state is shown: last key or subsequent modifiers event wins;
+/// enter/refocus snapshots and keymaps do not take precedence. With none used, prefer a
+/// keymap. `keyboards` are the ones still present.
 fn active_keyboard<'a>(
     keyboards: impl Iterator<Item = &'a KeyboardState>,
 ) -> Option<&'a KeyboardState> {
@@ -1289,7 +1306,7 @@ impl App {
     /// A key went down on `keyboard`: it becomes the keyboard whose state is shown, and a
     /// deletion key starts repeating.
     fn on_press(&mut self, keyboard: &wl_keyboard::WlKeyboard, event: KeyEvent) {
-        self.touch(keyboard, true, |_| {});
+        self.touch(keyboard, true, |k| k.initial_modifiers_pending = false);
         let handle = self.handle.clone();
         if let Some(input) = self.input_of(keyboard) {
             if repeats(event.keysym) {
@@ -1325,9 +1342,8 @@ impl App {
             .find(|i| i.keyboard.as_ref() == Some(keyboard))
     }
 
-    /// `keyboard` sent a key, modifiers or keymap: apply `update` to its state, mark it as the
-    /// one that spoke last if `speaks` (a keymap alone does not), and show the state of the
-    /// keyboard that spoke last.
+    /// Apply a key, modifiers snapshot/change or keymap to the cached state. Only `speaks`
+    /// updates precedence; enter/refocus snapshots and keymaps remain quiet.
     fn touch(
         &mut self,
         keyboard: &wl_keyboard::WlKeyboard,
@@ -1462,6 +1478,7 @@ impl KeyboardHandler for App {
         tracing::debug!("keyboard focus entered");
         if let Some(input) = self.input_of(keyboard) {
             input.keys.focus = Some(surface.clone());
+            input.keys.initial_modifiers_pending = true;
         }
     }
 
@@ -1477,6 +1494,7 @@ impl KeyboardHandler for App {
         let handle = self.handle.clone();
         if let Some(input) = self.input_of(keyboard) {
             input.keys.focus = None;
+            input.keys.initial_modifiers_pending = false;
             input.repeat.stop(&handle);
         }
     }
@@ -1539,7 +1557,13 @@ impl KeyboardHandler for App {
         _: RawModifiers,
         layout: u32,
     ) {
-        self.touch(keyboard, true, |k| {
+        // wl_keyboard sends a modifiers snapshot after every enter, including refocus.
+        // Cache that state without letting a quiet keyboard displace the one last used.
+        let speaks = self
+            .input_of(keyboard)
+            .is_some_and(|i| !i.keys.initial_modifiers_pending);
+        self.touch(keyboard, speaks, |k| {
+            k.initial_modifiers_pending = false;
             k.modifiers = modifiers;
             k.layout = layout;
         });

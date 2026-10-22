@@ -391,7 +391,7 @@ class Converter:
         # Split on LF only, as hyprlang's std::getline does: read_text() would also split on a
         # lone CR, turning the rest of a hyprlock value into a line of its own (e.g. an
         # auth:pam:enabled = false that hyprlock never sees).
-        text = path.read_bytes().decode("utf-8", errors="replace")
+        text = path.read_bytes().decode("utf-8")
         self.files.append(path)
         lines = text.split("\n")
         i = 0
@@ -612,8 +612,9 @@ class Converter:
                 continue
             try:
                 self.read_file(p)
-            except OSError as err:
-                self.warn(loc, "source", f"cannot read {p}: {err.strerror}")
+            except (OSError, UnicodeDecodeError) as err:
+                reason = err.strerror if isinstance(err, OSError) else "not valid UTF-8; rename or re-encode it"
+                self.warn(loc, "source", f"cannot read {p}: {reason}")
 
     def bezier(self, value: str, loc: str) -> None:
         args = [a.strip() for a in value.split(",")]
@@ -927,10 +928,18 @@ class Converter:
                            ("vibrancy", vibrancy), ("vibrancy_darkness", darkness)):
                 if v is not None:
                     self.warn(self.loc(s, key), key, "ignored: hyprlock applies it only with blur_passes > 0")
-        self.reload(s, "background")
-        crossfade = self.get(s, "crossfade_time", "float")
+        screenshot = s.vals.get("path", ("",))[0] == "screenshot"
+        if screenshot:
+            for key in ("reload_cmd", "reload_time", "crossfade_time"):
+                if key in s.vals:
+                    self.unsupported(s, key, s.vals[key][0], self.loc(s, key),
+                                     "swaywardlock keeps the screenshot; screenshot reload is unsupported (unlike hyprlock)")
+                    s.used.add(key)
+        else:
+            self.reload(s, "background")
+        crossfade = None if screenshot else self.get(s, "crossfade_time", "float")
         if crossfade is not None and crossfade > 0:
-            ms = int(self.clamp(s, "crossfade_time", round(crossfade * 1000), (1, 2**32 - 1), "crossfade"))
+            ms = int(self.clamp(s, "crossfade_time", round(crossfade * 1000), (0, MAX_ANIM_MS), "crossfade"))
             s.lines.append(f"crossfade-ms {ms}")
             self.note(self.loc(s, "crossfade_time"), "crossfade_time",
                       "hyprlock itself ignores this key (its crossfade follows the fadeIn animation); "
@@ -943,6 +952,10 @@ class Converter:
         hyprlock never acts on is left out with a warning, so the output does what hyprlock did."""
         t = self.get(s, "reload_time", "int")
         cmd = self.get(s, "reload_cmd", "str") or ""
+        if "\0" in cmd:
+            self.unsupported(s, "reload_cmd", cmd, self.loc(s, "reload_cmd"),
+                             "command contains NUL and cannot start")
+            cmd = ""
         has_time = t is not None and t > -1
         if kind == "background" and has_time and not cmd:
             self.warn(self.loc(s, "reload_time"), "reload_time",
@@ -1135,7 +1148,7 @@ class Converter:
                 s.comments.append(comment(f"hyprlock: auth:pam:module = {module} (ignored: PAM is off)"))
             if self.get(s, "fingerprint:enabled", "bool") is not True and not s.vals.get("fingerprint:enabled"):
                 self.warn(self.loc(s, "pam:enabled"), "auth:pam:enabled",
-                          "PAM is off and fingerprint is not enabled: only SIGUSR1 can unlock the session")
+                          "PAM is off and fingerprint is not enabled: an explicitly enabled grace period or SIGUSR1 can unlock the session")
         elif module is not None:
             if module == "hyprlock":
                 # swaywardlock ships its own /etc/pam.d/swaywardlock; /etc/pam.d/hyprlock may not exist.
@@ -1262,8 +1275,9 @@ def main() -> int:
     conv = Converter()
     try:
         conv.read_file(path)
-    except OSError as err:
-        print(f"hyprlock-to-kdl: cannot read {path}: {err.strerror}", file=sys.stderr)
+    except (OSError, UnicodeDecodeError) as err:
+        reason = err.strerror if isinstance(err, OSError) else "not valid UTF-8; rename or re-encode it"
+        print(escape_unsafe(f"hyprlock-to-kdl: cannot read {path}: {reason}"), file=sys.stderr)
         return 1
     kdl = conv.emit()
     sys.stdout.write(kdl)

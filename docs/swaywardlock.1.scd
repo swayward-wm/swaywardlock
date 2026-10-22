@@ -151,8 +151,10 @@ Top-level nodes:
 	*hide-cursor*, *ignore-empty-input*, *fail-timeout-ms* _MS_, *clear-input-after-ms* _MS_.
 
 *auth*
-	*pam service=*_NAME_ (or *pam { off; }* to disable PAM; *reuse-password* answers a repeated
-	question with the last answer), and *fingerprint { }*, with *ready-message*,
+	*pam service=*_NAME_ (or *pam { off; }* to disable PAM; *reuse-password* permits one reuse
+	of the preceding answer for an immediately repeated prompt with identical text. Reuse
+	consumes the cached answer; a third identical prompt needs a fresh answer), and
+	*fingerprint { }*, with *ready-message*,
 	*present-message* and *retry-delay-ms*. Without a *fingerprint* node there is no
 	fingerprint authentication.
 
@@ -216,7 +218,9 @@ _specs/2026-10-19-swaywardlock.md_ under /usr/share/doc/swaywardlock (see *SEE A
 *SIGUSR2*
 	Re-run the labels whose command is marked to refresh on this signal, *cmd[update:MS:1]*,
 	and reload the picture of every *background* and *image* with *reload-ms* or *reload-cmd*.
-	A picture that fails to load or to draw keeps the old one.
+	A picture that fails to load, or whose drawing batch fails, keeps the old one.
+	Configure-triggered frames settle independently; a later output unable to render an
+	already committed picture can have the widget missing.
 
 *SIGTERM*, *SIGINT*, *SIGHUP*
 	Keep their default action: the process ends and the compositor keeps the session locked.

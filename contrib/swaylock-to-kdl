@@ -444,7 +444,11 @@ def main() -> int:
 
     t = Translator()
     if opts.args is not None:
-        argv = shlex.split(opts.args)
+        try:
+            argv = shlex.split(opts.args)
+        except ValueError as err:
+            print(f"swaylock-to-kdl: invalid --args: {err}", file=sys.stderr)
+            return 1
         if argv and Path(argv[0]).name == "swaylock":
             argv = argv[1:]
         parse_args(t, argv)
@@ -461,8 +465,16 @@ def main() -> int:
             return 1
         parse_config(t, text)
 
-    sys.stdout.write(t.emit())
-    print("command: " + shlex.join(t.command), file=sys.stderr)
+    try:
+        output = t.emit().encode("utf-8")
+        command = shlex.join(t.command)
+        command.encode("utf-8")
+    except UnicodeEncodeError:
+        print("swaylock-to-kdl: input or expanded path is not valid UTF-8; rename or re-encode it",
+              file=sys.stderr)
+        return 1
+    sys.stdout.buffer.write(output)
+    print("command: " + command, file=sys.stderr)
     for w in t.warnings:
         print("warning: " + w, file=sys.stderr)
     return 0

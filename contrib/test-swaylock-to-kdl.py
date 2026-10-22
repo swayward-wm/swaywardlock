@@ -247,6 +247,42 @@ class Translate(unittest.TestCase):
         r = run("--args", "swaylock --indicator-radius 100 --indicator-thickness 7 --font-size 0")
         self.assertNotIn("warning:", r.stderr)
 
+    def test_invalid_args_fail_without_traceback_or_partial_output(self):
+        for args in ['swaylock -i "/a.png', os.fsdecode(b"--image /tmp/\xff.png")]:
+            r = subprocess.run([SCRIPT, "--args", args], text=True, capture_output=True, timeout=10)
+            self.assertEqual(r.returncode, 1)
+            self.assertEqual(r.stdout, "")
+            self.assertNotIn("Traceback", r.stderr)
+            self.assertIn("swaylock-to-kdl:", r.stderr)
+
+    def test_non_utf8_environment_and_cwd_fail_cleanly(self):
+        env = dict(os.environ, BAD=os.fsdecode(b"/tmp/\xff"))
+        r = subprocess.run([SCRIPT, "--args", "--image $BAD/a.png"], env=env,
+                           text=True, capture_output=True, timeout=10)
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual(r.stdout, "")
+        self.assertNotIn("Traceback", r.stderr)
+        with tempfile.TemporaryDirectory() as d:
+            cwd = Path(d) / os.fsdecode(b"bad-\xff")
+            cwd.mkdir()
+            conf = cwd / "config"
+            conf.write_text("image=a.png\n")
+            for args in [["--args", "--image a.png"], [str(conf)]]:
+                r = subprocess.run([SCRIPT, *args], cwd=cwd, text=True,
+                                   capture_output=True, timeout=10)
+                self.assertEqual(r.returncode, 1)
+                self.assertEqual(r.stdout, "")
+                self.assertNotIn("Traceback", r.stderr)
+                self.assertIn("not valid UTF-8", r.stderr)
+
+    def test_unicode_output_is_utf8_even_with_ascii_stdio(self):
+        env = dict(os.environ, PYTHONIOENCODING="ascii")
+        r = subprocess.run([SCRIPT, "--args", "--font café"], env=env,
+                           capture_output=True, timeout=10)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('café', r.stdout.decode("utf-8"))
+        self.validate(r.stdout.decode("utf-8"))
+
     def test_relative_image_paths_are_made_absolute(self):
         with tempfile.TemporaryDirectory() as d:
             r = subprocess.run([SCRIPT, "--args", "swaylock -i wall.png -i DP-1:sub/b.jpg"],

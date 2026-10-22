@@ -89,29 +89,53 @@ pub fn ensure_ticking(app: &mut App) {
     }
     app.fades.ticking = true;
     let handle: LoopHandle<'static, App> = app.handle.clone();
-    let _ = handle.insert_source(Timer::from_duration(FRAME), |_, _, app| {
-        if app.exit.is_some() {
-            // Unlocked (or finished) while animating: the surfaces are gone.
-            app.fades.ticking = false;
-            return TimeoutAction::Drop;
-        }
-        app.fades.tick_clock();
-        app.draw_all();
-        if app.fades.is_animating() {
-            return TimeoutAction::ToDuration(FRAME);
-        }
-        if app.fades.unlock_when_done {
-            app.fades.ticking = false;
-            app.fades.unlock_when_done = false;
-            app.finish_unlock();
-            return TimeoutAction::Drop;
-        }
-        if app.needs_frames() {
-            return TimeoutAction::ToDuration(FRAME);
-        }
+    let _ = handle.insert_source(Timer::from_duration(FRAME), |_, _, app| tick(app));
+}
+
+/// The registered redraw callback, also exercised on a retained, actually unlocked test App.
+fn tick(app: &mut App) -> TimeoutAction {
+    if app.exit.is_some() {
+        // Unlocked (or finished) while animating: the surfaces are gone.
         app.fades.ticking = false;
-        TimeoutAction::Drop
+        return TimeoutAction::Drop;
+    }
+    app.fades.tick_clock();
+    app.draw_all();
+    if app.fades.is_animating() {
+        return TimeoutAction::ToDuration(FRAME);
+    }
+    if app.fades.unlock_when_done {
+        app.fades.ticking = false;
+        app.fades.unlock_when_done = false;
+        app.finish_unlock();
+        return TimeoutAction::Drop;
+    }
+    if app.needs_frames() {
+        return TimeoutAction::ToDuration(FRAME);
+    }
+    app.fades.ticking = false;
+    TimeoutAction::Drop
+}
+
+#[cfg(feature = "test-auth")]
+pub(crate) fn check_exited_ticker(app: &mut App) {
+    let mut config = Animations::default();
+    config.fade_in.kind = crate::config::AnimationKind::Easing(crate::config::EasingParams {
+        duration_ms: 60_000,
+        curve: crate::config::AnimationCurve::Linear,
     });
+    app.fades = Fades::new(config);
+    app.fades.fade_in();
+    app.fades.ticking = true;
+    assert!(
+        app.fades.is_animating(),
+        "unfinished fade required for ticker probe"
+    );
+    assert!(
+        matches!(tick(app), TimeoutAction::Drop),
+        "exited ticker must return Drop"
+    );
+    assert!(!app.fades.ticking, "exited ticker must stop ticking");
 }
 
 #[cfg(test)]

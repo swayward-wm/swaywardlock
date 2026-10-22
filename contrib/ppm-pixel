@@ -3,6 +3,7 @@
 
     grim -t ppm - | ppm-pixel [X Y]     print the pixel at (X, Y) as "r g b" (default: centre)
     ppm-pixel --write-test-png PATH     write a 64x64 PNG, top half red, bottom half blue
+    ppm-pixel --write-quadrant-png PATH write red/green above blue/white
 """
 
 import struct
@@ -43,9 +44,13 @@ def pixel(args):
     print(*data[o : o + 3])
 
 
-def write_test_png(path):
+def write_test_png(path, quadrants=False):
     # Large enough that bilinear filtering only blends the few rows at the seam.
-    rows = [bytes([0] + [255, 0, 0] * 64)] * 32 + [bytes([0] + [0, 0, 255] * 64)] * 32
+    if quadrants:
+        rows = ([bytes([0] + [255, 0, 0] * 32 + [0, 255, 0] * 32)] * 32
+                + [bytes([0] + [0, 0, 255] * 32 + [255, 255, 255] * 32)] * 32)
+    else:
+        rows = [bytes([0] + [255, 0, 0] * 64)] * 32 + [bytes([0] + [0, 0, 255] * 64)] * 32
 
     def chunk(tag, body):
         return struct.pack(">I", len(body)) + tag + body + struct.pack(">I", zlib.crc32(tag + body))
@@ -57,7 +62,7 @@ def write_test_png(path):
 
 
 if __name__ == "__main__":
-    if sys.argv[1:2] == ["--write-test-png"]:
-        write_test_png(sys.argv[2])
+    if sys.argv[1:2] in (["--write-test-png"], ["--write-quadrant-png"]):
+        write_test_png(sys.argv[2], sys.argv[1] == "--write-quadrant-png")
     else:
         pixel(sys.argv[1:])

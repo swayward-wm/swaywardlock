@@ -738,6 +738,7 @@ impl<S: knuffel::traits::ErrorSpan> knuffel::Decode<S> for Background {
         let mut bg = Background::default();
         // Post-processing options that were written, for the warning when blur is off.
         let mut post_set = Vec::new();
+        let mut reload_set = Vec::new();
         for child in decode_common(node, ctx, &mut bg.common)? {
             match &**child.node_name {
                 "color" => bg.color = color(child, ctx)?,
@@ -754,8 +755,20 @@ impl<S: knuffel::traits::ErrorSpan> knuffel::Decode<S> for Background {
                     bg.vibrancy_darkness = arg::<_, FloatOrInt<0, 1>>(child, ctx)?.0;
                     post_set.push("vibrancy-darkness");
                 }
-                "reload-ms" | "reload-cmd" => decode_reload(child, ctx, &mut bg.reload)?,
-                "crossfade-ms" => bg.crossfade_ms = arg(child, ctx)?,
+                "reload-ms" | "reload-cmd" => {
+                    decode_reload(child, ctx, &mut bg.reload)?;
+                    reload_set.push(&**child.node_name);
+                }
+                "crossfade-ms" => {
+                    bg.crossfade_ms = arg(child, ctx)?;
+                    if u128::from(bg.crossfade_ms) > super::decode::MAX_ANIMATION.as_millis() {
+                        ctx.emit_error(DecodeError::conversion(
+                            &child.arguments[0].literal,
+                            "must be between 0 and 3000 ms",
+                        ));
+                    }
+                    reload_set.push("crossfade-ms");
+                }
                 "blur" => {
                     // A `blur` block turns blur on unless it says `off`.
                     let part: BlurPart = knuffel::Decode::decode_node(child, ctx)?;
@@ -781,6 +794,14 @@ impl<S: knuffel::traits::ErrorSpan> knuffel::Decode<S> for Background {
             );
         } else if post_set.contains(&"vibrancy-darkness") && bg.vibrancy == 0. {
             tracing::warn!("background: vibrancy-darkness needs vibrancy above 0; ignored");
+        }
+        if bg.screenshot && !reload_set.is_empty() {
+            reload_set.sort_unstable();
+            reload_set.dedup();
+            tracing::warn!(
+                "background: {} ignored with `screenshot`; screenshot reload is unsupported",
+                reload_set.join(", ")
+            );
         }
         bg.reload.set_base(base_dir(ctx));
         Ok(bg)
@@ -808,6 +829,12 @@ fn decode_reload<S: knuffel::traits::ErrorSpan>(
             return Err(DecodeError::conversion(
                 &node.arguments[0].literal,
                 "the command must not be empty",
+            ));
+        }
+        if cmd.contains('\0') {
+            return Err(DecodeError::conversion(
+                &node.arguments[0].literal,
+                "the command must not contain NUL",
             ));
         }
         spec.cmd = Some(cmd);

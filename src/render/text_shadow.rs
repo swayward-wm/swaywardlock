@@ -241,6 +241,45 @@ mod tests {
         }
     }
 
+    /// Planning is independent of EGL and alpha rounding: each halving removes a pass until
+    /// one remains, then halves the offset instead. The rendered approximation stays separate.
+    #[test]
+    fn downscaled_plan_reduces_passes_before_offset() {
+        let sh = TextShadow {
+            passes: 3,
+            ..shadow(1., Color::from_rgba8_unpremul(255, 255, 255, 255))
+        };
+        let mut previous = plan(400, 300, &sh, 2., i64::MAX);
+        assert_eq!(
+            (previous.down, previous.passes, previous.offset),
+            (1, 3, 6.)
+        );
+        for (down, passes, offset) in [(2, 2, 6.), (4, 1, 6.), (8, 1, 3.), (16, 1, 1.5)] {
+            let next = plan(400, 300, &sh, 2., previous.w * previous.h - 1);
+            assert_eq!(
+                (next.down, next.passes, next.offset),
+                (down, passes, offset)
+            );
+            previous = next;
+        }
+    }
+
+    #[test]
+    fn policy_budget_downsamples_large_text_but_not_small_text() {
+        let sh = TextShadow {
+            passes: 1,
+            size: 0.,
+            ..shadow(1., Color::from_rgba8_unpremul(255, 255, 255, 255))
+        };
+        // Full resolution needs 912 * 612 = 558144 px: above the 524288 policy,
+        // but below a mistakenly doubled budget. Do not derive the oracle from MAX_PIXELS.
+        let large = plan(900, 600, &sh, 1., MAX_PIXELS);
+        assert!(large.down > 1, "above-policy text must be downsampled");
+        assert!(large.w * large.h <= 524_288);
+        let small = plan(100, 60, &sh, 1., MAX_PIXELS);
+        assert_eq!((small.down, small.w, small.h), (1, 112, 72));
+    }
+
     #[test]
     fn tint_boosts_alpha_clamps_and_premultiplies() {
         let red = Color::from_rgba8_unpremul(255, 0, 0, 255);

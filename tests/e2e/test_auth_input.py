@@ -13,6 +13,8 @@ import time
 import uuid
 from pathlib import Path
 
+import pytest
+
 from lib import IDLE_RING, PASSWORD, RING, WRONG_RING
 from lib.poll import poll
 from lib.screen import parse_ppm
@@ -57,10 +59,23 @@ def _keyboard(env, name, *args):
         )
     env.procs.append(proc)
 
+    submitted = 0
+
     def send(*commands):
+        nonlocal submitted
+        submitted += sum(bool(line.strip()) and line.strip() != "quit"
+                         for command in commands for line in command.split("\n"))
         proc.stdin.write("\n".join(commands) + "\n")
         proc.stdin.flush()
 
+    def wait(timeout=3.0):
+        def completed():
+            assert proc.poll() is None, f"vkbd {name} exited before completion\n{env.log_text(log)}"
+            return sum(line.startswith("done ") and line.endswith("\n")
+                       for line in env.log_text(log).splitlines(keepends=True)) >= submitted
+        assert poll(completed, timeout=timeout), f"vkbd {name}: waiting for {submitted} commands\n{env.log_text(log)}"
+
+    send.wait = wait
     send.proc = proc
     try:
         assert poll(lambda: "ready" in env.log_text(log)), f"vkbd {name} did not start\n{env.log_text(log)}"
@@ -99,6 +114,23 @@ def _wakeups(pid):
     # Both full 2 s windows are required to expose a surviving 25 Hz repeat timer.
     time.sleep(2)
     return switches() - before
+
+
+def test_keyboard_completion_ignores_stale_ack(lock_env):
+    # Only real vkbd can expose old done lines while a new command is still unprocessed.
+    with _keyboard(lock_env, "vk-completion") as send:
+        send("sleep 0\n\n", "sleep 0")
+        send.wait()
+        send.proc.send_signal(signal.SIGSTOP)
+        try:
+            assert poll(lambda: re.search(r"^State:\s+T", Path(
+                f"/proc/{send.proc.pid}/status").read_text(), re.M)), "vkbd did not stop"
+            send("sleep 0")
+            with pytest.raises(AssertionError, match="waiting for 3 commands"):
+                send.wait(timeout=0.2)
+        finally:
+            send.proc.send_signal(signal.SIGCONT)
+        send.wait()
 
 
 def test_keyboard(lock_env):
@@ -152,14 +184,38 @@ def test_modifiers(lock_env):
         assert locker.wait_exit() == 0, "modifiers: Ctrl+U and Ctrl+BackSpace clear, Ctrl+J submits"
 
 
-def test_keyboard_layout(lock_env):
+def test_unlocked_app_rejects_late_auth_and_stops_ticker(desktop):
+    env = desktop
+    locker = _locker(env, "unlocked App callbacks", OFF,
+                     env={"SWAYWARDLOCK_TEST_EXIT_PROBE": "1", "RUST_LOG": "swaywardlock=info"})
+    locker.type(PASSWORD)
+    assert locker.wait_exit() == 0, f"retained unlocked App checks failed\n{locker.log_text()}"
+    assert "test exit probe: late auth, surfaces and ticker checked" in locker.log_text()
+    env.expect_unlocked("unlocked App callbacks")
+
+
+@pytest.mark.parametrize("late_bind", [False, True], ids=["early", "late-bind"])
+def test_keyboard_layout(lock_env, late_bind):
     env = lock_env
     env.swaymsg("seat", "seat1", "fallback", "false")
     with _keyboard(env, "vk-de", "--seat", "seat0", "--layout", "de,us") as send0:
-        locker = _locker(env, "keyboard layout", LAYOUT)
+        locker = _locker(env, "keyboard layout", LAYOUT,
+                         env={"RUST_LOG": "swaywardlock=debug"})
+        assert locker.wait_log("keyboard focus entered"), "keyboard layout: seat0 has focus"
         send0("key Shift_L")
+        send0.wait()
         de = env.expect_width("keyboard layout: initial de layout", (255, 0, 0), BOX)
-        with _keyboard(env, "vk-us", "--seat", "seat1", "--layout", "us") as send1:
+        with contextlib.ExitStack() as stack:
+            if late_bind:
+                # Delay get_keyboard until vkbd has installed a real XKB keymap. Otherwise
+                # SCTK can discard enter/modifiers on the initial NoKeymap and hide the bug.
+                stack.callback(locker.signal, signal.SIGCONT)
+                locker.signal(signal.SIGSTOP)
+                assert poll(lambda: re.search(r"^State:\s+T", Path(
+                    f"/proc/{locker.pid}/status").read_text(), re.M)), "locker did not stop"
+            send1 = stack.enter_context(_keyboard(env, "vk-us", "--seat", "seat1", "--layout", "us"))
+            if late_bind:
+                locker.signal(signal.SIGCONT)
             # Keymap arrival must NOT take over: preserve the negative observation window.
             time.sleep(0.5)
             assert _width(env) == de, "keyboard layout: a keyboard that only arrived is not shown"
@@ -171,11 +227,92 @@ def test_keyboard_layout(lock_env):
             send1("mods 0 0 2")
             env.expect_width("keyboard layout: a modifiers change makes its keyboard the one shown", (255, 0, 0), BOX, us)
             send1("mods 0 0 0")
+            # Order the reset before sending input through the other keyboard's pipe.
+            send1.wait()
             send0("key Shift_L")
             env.expect_width("keyboard layout: seat0 before departure", (255, 0, 0), BOX, de)
             send1("key Shift_L")
             env.expect_width("keyboard layout: seat1 before departure", (255, 0, 0), BOX, us)
         env.expect_width("keyboard layout: the remaining keyboard's layout returns when the other goes", (255, 0, 0), BOX, de)
+        _unlock(locker)
+
+
+def _keyboard_ids(text, seat):
+    """Locker-created wl_keyboard ids belonging to the named seat."""
+    seats = {m[1] for m in re.finditer(r'wl_seat#(\d+)\.name\("([^\"]+)"\)', text)
+             if m[2] == seat}
+    return [m[2] for m in re.finditer(
+        r"wl_seat#(\d+)\.get_keyboard\(new id wl_keyboard#(\d+)\)", text) if m[1] in seats]
+
+
+def _keyboard_events(text, kid, kind):
+    return re.findall(rf"wl_keyboard#{kid}\.{kind}\(([^)]*)\)", text)
+
+
+def test_keyboard_refocus(lock_env):
+    # Losing the enter re-arm (m2: re-arm only when last_input == 0) must fail the
+    # no-takeover assertion, not merely a setup/trace prerequisite.
+    env = lock_env
+    env.swaymsg("create_output")
+    env.swaymsg("output", "HEADLESS-2", "resolution", "320x240", "position", "320", "0")
+    env.swaymsg("seat", "seat1", "fallback", "false")
+    config = 'background { color "#000000"; }\n' + OFF + (
+        'label { text "$LAYOUT"; font "Sans 20"; color "#ff0000"; valign "top"; position 0 -10; }\n'
+        'input-field { size 200 50; inner-color "#ffffff"; outline { width 4; color "#0000ff"; }; '
+        'capslock-color "#ff00ff"; fade-on-empty false; }\n'
+    )
+    layout_box, caps_at = (0, 0, 320, 60), (160, 92)
+    red, outline, caps = (255, 0, 0), (0, 0, 255), (255, 0, 255)
+    with _keyboard(env, "vk-refocus-de", "--seat", "seat0", "--layout", "de") as send0, \
+            _keyboard(env, "vk-refocus-fr", "--seat", "seat1", "--layout", "fr") as send1:
+        locker = _locker(env, "keyboard refocus", config,
+                         env={"WAYLAND_DEBUG": "1", "RUST_LOG": "swaywardlock=debug"})
+
+        def entered():
+            text = locker.log_text()
+            ids = _keyboard_ids(text, "seat0")[-1:] + _keyboard_ids(text, "seat1")[-1:]
+            return len(ids) == 2 and all(_keyboard_events(text, i, "enter") and
+                                         _keyboard_events(text, i, "modifiers") for i in ids)
+
+        assert poll(entered), "keyboard refocus: both keyboards entered with snapshots"
+        send0("mods 0 0 2")
+        send0.wait()
+        de = env.expect_width("keyboard refocus: seat0 spoke", red, layout_box)
+        env.expect_colour("keyboard refocus: seat0 Caps", caps, *caps_at)
+        send1("key Shift_L")
+        send1.wait()
+        fr = env.expect_width("keyboard refocus: seat1 key takes over", red, layout_box,
+                              lambda w: w > 0 and w != de)
+        env.expect_colour("keyboard refocus: seat1 has no Caps", outline, *caps_at)
+        k0 = _keyboard_ids(locker.log_text(), "seat0")[-1]
+        for target in ("HEADLESS-2", "HEADLESS-1"):
+            # Start a NEW trace slice: earlier enter/modifiers cannot satisfy this barrier.
+            before = len(locker.log_text())
+            env.swaymsg("focus", "output", target)
+
+            def refocused():
+                text = locker.log_text()[before:]
+                events = re.findall(rf"wl_keyboard#{k0}\.(leave|enter|modifiers)\(", text)
+                return events == ["leave", "enter", "modifiers"]
+
+            assert poll(refocused), f"keyboard refocus: no new seat0 leave/enter/snapshot for {target}"
+            snapshot = _keyboard_events(locker.log_text()[before:], k0, "modifiers")[-1]
+            assert snapshot.split(", ")[1:] == ["0", "0", "2", "0"], snapshot
+            time.sleep(0.5)
+            shot = env.snapshot()
+            assert shot.colour_width(red, layout_box) == fr, (
+                f"keyboard refocus: quiet seat0 ({target}) must not take over the layout")
+            assert shot.pixel(*caps_at) == outline, (
+                f"keyboard refocus: quiet seat0 ({target}) must not show its Caps")
+        # wlroots drops unchanged updates: change Caps to prove a genuine modifiers event.
+        before = len(_keyboard_events(locker.log_text(), k0, "modifiers"))
+        send0("mods 0 0 0")
+        send0.wait()
+        assert poll(lambda: len(_keyboard_events(locker.log_text(), k0, "modifiers")) > before)
+        env.expect_width("keyboard refocus: genuine modifiers speak", red, layout_box, de)
+        env.expect_colour("keyboard refocus: changed Caps cached", outline, *caps_at)
+        send1("key Shift_L")
+        env.expect_width("keyboard refocus: other key retakes", red, layout_box, fr)
         _unlock(locker)
 
 
@@ -186,22 +323,67 @@ def test_keyboard_repeat(lock_env):
     proxy = env.spawn([env.contrib("wl-drop-key-release")], log=proxy_log)
     assert poll(lambda: env.path("droprel-ready").exists()), f"keyboard repeat: proxy not ready\n{env.log_text(proxy_log)}"
     config = 'background { color "#000000"; }\n' + OFF + (
-        'input-field { size 200 50; inner-color "#ffffff"; font-color "#000000"; '
-        'outline { width 4; color "#0000ff"; }; dots size=0.4 spacing=0.5; fade-on-empty false; }\n'
+        'input-field { size 280 50; inner-color "#ffffff"; font-color "#000000"; '
+        'outline { width 4; color "#0000ff"; }; dots size=0.04 spacing=0.1; fade-on-empty false; }\n'
     )
     with _keyboard(env, "vk-seat0", "--seat", "seat0") as send:
         locker = _locker(env, "keyboard repeat", config,
-                         env={"WAYLAND_DISPLAY": "wayland-droprel-0", "RUST_LOG": "swaywardlock=debug"})
-        send("type abcdefghijkl")
+                         env={"WAYLAND_DISPLAY": "wayland-droprel-0", "WAYLAND_DEBUG": "1",
+                              "RUST_LOG": "swaywardlock=debug"})
+        send("type " + "a" * 80)
+        send.wait()
+        dots_box = (22, 112, 298, 128)
+        filled = env.expect_width("keyboard repeat: visible unsaturated dots", (0, 0, 0), dots_box,
+                                  lambda w: 0 < w < 276)
         # Exclude the known non-repeat burst ~1.75 s after typing, just as the bash case.
         time.sleep(2.5)
         base = _wakeups(locker.pid)
         assert base < 10, f"keyboard repeat: idle locker ({base} wakeups in 2 s)"
-        _tool(env, "vkbd", "--seat", "seat1", "hold BackSpace 1500")
+        with contextlib.ExitStack() as stack:
+            # As in late-bind layout: install a real keymap before get_keyboard, so
+            # SCTK does not discard enter on NoKeymap and silently prevent repeating.
+            stack.callback(locker.signal, signal.SIGCONT)
+            locker.signal(signal.SIGSTOP)
+            assert poll(lambda: re.search(r"^State:\s+T", Path(
+                f"/proc/{locker.pid}/status").read_text(), re.M)), "repeat: locker did not stop"
+            held = stack.enter_context(_keyboard(env, "vk-repeat-seat1", "--seat", "seat1"))
+            locker.signal(signal.SIGCONT)
+
+            def repeat_ready():
+                text = locker.log_text()
+                ids = _keyboard_ids(text, "seat1")
+                return (ids and _keyboard_events(text, ids[-1], "keymap") and
+                        _keyboard_events(text, ids[-1], "enter") and
+                        _keyboard_events(text, ids[-1], "modifiers") and
+                        re.search(r"keyboard focus entered", text[text.index(
+                            f"wl_keyboard#{ids[-1]}.enter("):]))
+
+            assert poll(repeat_ready), "keyboard repeat: seat1-specific dispatched enter with keymap"
+            k1 = _keyboard_ids(locker.log_text(), "seat1")[-1]
+            info = _keyboard_events(locker.log_text(), k1, "repeat_info")
+            assert info and int(info[-1].split(", ")[0]) > 0, f"repeat rate must be positive: {info}"
+            held("down BackSpace")
+            held.wait()
+            # This screen is deliberately changing: two settled samples can never be
+            # required at 25 Hz. Observe the first deletion before the 600 ms delay.
+            first = env.expect("keyboard repeat: immediate deletion",
+                               lambda shot: shot.colour_width((0, 0, 0), dots_box),
+                               lambda w: 0 < w < filled, timeout=0.5, settled=False)
+            env.expect("keyboard repeat: deletes beyond the first key",
+                       lambda shot: shot.colour_width((0, 0, 0), dots_box),
+                       lambda w: 0 < w < first, settled=False)
+            running = _wakeups(locker.pid)
+            remaining = _width(env, (0, 0, 0), dots_box)
+            assert running >= 20, f"keyboard repeat: held timer active ({running} wakeups in 2 s)"
+            assert 0 < remaining < first, "keyboard repeat: still nonempty and repeating before removal"
+            print(f"repeat seat1={k1} info={info} dots={filled}->{first}->{remaining} held-wakeups={running}")
+            # Quit with BackSpace still down. The proxy drops release AND leave;
+            # only capability removal (or the tick's missing-keyboard guard) can stop it.
         time.sleep(0.5)
-        w1 = _width(env, (0, 0, 0), (62, 112, 258, 128))
+        w1 = _width(env, (0, 0, 0), dots_box)
+        assert w1 > 0, "keyboard repeat: removal leaves visible dots"
         woke = _wakeups(locker.pid)
-        w2 = _width(env, (0, 0, 0), (62, 112, 258, 128))
+        w2 = _width(env, (0, 0, 0), dots_box)
         assert w2 == w1, "keyboard repeat: the dots stop changing once the keyboard is gone"
         assert woke < 10, f"keyboard repeat: no repeat timer left running ({woke} wakeups in 2 s)"
         assert "seat capability removed" in locker.log_text(), "keyboard repeat: no capability removal seen"

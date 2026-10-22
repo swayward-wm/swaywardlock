@@ -1089,6 +1089,25 @@ fn reload_keys_decode() {
 }
 
 #[test]
+fn crossfade_duration_is_bounded() {
+    for ms in [0, 1, 3000] {
+        let c = Config::parse_mem(&format!("background {{ crossfade-ms {ms}; }}")).unwrap();
+        assert_eq!(background(&c).crossfade_ms, ms);
+    }
+    for ms in ["-1", "3001", "4294967295", "4294967296"] {
+        assert!(Config::parse_mem(&format!("background {{ crossfade-ms {ms}; }}")).is_err());
+    }
+}
+
+#[test]
+fn reload_commands_reject_nul() {
+    for node in ["background", "image"] {
+        let kdl = format!("{node} {{ reload-cmd \"echo \\u{{0}}x\"; }}");
+        assert!(Config::parse_mem(&kdl).is_err(), "{kdl}");
+    }
+}
+
+#[test]
 fn reload_keys_are_checked() {
     for bad in [
         // crossfade belongs to the background.

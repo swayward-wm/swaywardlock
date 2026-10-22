@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Check an INSTALLED swaywardlock package, as the release workflow's verify jobs do after
-# installing the .deb, .rpm or Arch package in a clean container. Run it from a checkout of the
-# release tag (it compares the installed PAM file with pam/swaywardlock).
+# installing the .deb on a fresh Ubuntu GitHub runner or the .rpm / Arch package in a clean
+# container. Run it from a checkout of the release tag (it compares the installed PAM file).
 #
 #   contrib/verify-installed [VERSION]
 #
@@ -68,6 +68,33 @@ done
 # The man page and the completions are installed.
 man=(/usr/share/man/man1/swaywardlock.1*)
 [ "${#man[@]}" -gt 0 ] || fail "no man page"
+# Read the installed roff, including package-manager gzip compression. No man/scdoc dependency
+# is needed on the installed system; a filename alone must not certify a corrupted page.
+python3 - "${man[@]}" <<'PY' || fail "invalid man page"
+import gzip
+from pathlib import Path
+import re
+import sys
+
+for name in sys.argv[1:]:
+    path = Path(name)
+    try:
+        data = gzip.decompress(path.read_bytes()) if path.suffix == ".gz" else path.read_bytes()
+        text = data.decode("utf-8")
+        if not re.search(r'^\.TH\s+"?swaywardlock"?\s+"?1"?(?:\s|$)', text, re.M | re.I):
+            raise ValueError("missing swaywardlock(1) title")
+        for section in ("NAME", "SYNOPSIS", "DESCRIPTION"):
+            if not re.search(r'^\.SH\s+"?' + section + r'"?\s*$', text, re.M):
+                raise ValueError("missing " + section + " section")
+    except (OSError, EOFError, UnicodeError, ValueError) as error:
+        print(f"{path}: {error}", file=sys.stderr)
+        sys.exit(1)
+PY
+# Debian uses vendor-completions; Arch and Fedora use site-functions.
+zsh=(/usr/share/zsh/vendor-completions/_swaywardlock \
+    /usr/share/zsh/site-functions/_swaywardlock)
+[ -s "${zsh[0]}" ] || [ -s "${zsh[1]}" ] \
+    || fail "no nonempty zsh completion at ${zsh[*]}"
 completions=(/usr/share/bash-completion/completions/swaywardlock \
     /usr/share/fish/vendor_completions.d/swaywardlock.fish)
 for file in "${completions[@]}"; do

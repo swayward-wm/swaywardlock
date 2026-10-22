@@ -11,7 +11,10 @@ import time
 import zlib
 from pathlib import Path
 
+import pytest
+
 from lib.poll import alive, poll
+from lib.screen import parse_ppm
 
 
 BLACK = (0, 0, 0)
@@ -57,6 +60,44 @@ def _png(path, colour, width=64, height=64):
     header = struct.pack('>IIBBBBB', width, height, 8, 0 if grey else 2, 0, 0, 0)
     Path(path).write_bytes(b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', header)
                            + chunk(b'IDAT', data) + chunk(b'IEND', b''))
+
+
+
+
+def test_failed_decode_keeps_committed_on_relayout(lock_env):
+    env = lock_env
+    red, green, bad, cur = [env.path(n) for n in ('red.png', 'green.png', 'bad.png', 'cur')]
+    _png(red, RED)
+    _png(green, GREEN)
+    bad.write_text('not a png\n')
+    cur.write_text(str(red) + '\n')
+    locker = _start(env, 'refute failed decode', 'animations { off; }\n' + f'background {{ color "#000000"; fit "fill"; reload-cmd "cat {cur}"; reload-ms 0; }}', debug=True, no_fade=False)
+    env.expect_colour('first picture', RED, 160, 10)
+    cur.write_text(str(green) + '\n')
+    locker.signal(signal.SIGUSR2)
+    env.expect_colour('committed new picture', GREEN, 160, 10)
+    cur.write_text(str(bad) + '\n')
+    locker.signal(signal.SIGUSR2)
+    assert locker.wait_log('bad.png'), 'failed decode must complete before relayout'
+    env.swaymsg('output', 'HEADLESS-1', 'resolution', '400x300')
+    env.expect_colour('committed survives failure and relayout', GREEN, 160, 10)
+    _stop(locker)
+
+
+def test_shared_startup_kept_on_relayout(lock_env):
+    env = lock_env
+    red, green, cur = [env.path(n) for n in ('red.png', 'green.png', 'cur')]
+    _png(red, RED)
+    _png(green, GREEN)
+    cur.write_text(str(red) + '\n')
+    locker = _start(env, 'refute shared startup', HEAD + f'background {{ path "{red}"; fit "fill"; reload-cmd "cat {cur}"; reload-ms 0; }}\nimage {{ path "{red}"; size 60; corner-radius 0; }}', no_fade=False)
+    env.expect_colour('startup', RED)
+    cur.write_text(str(green) + '\n')
+    locker.signal(signal.SIGUSR2)
+    env.expect_colour('background reload settled', GREEN, 10, 10)
+    env.swaymsg('output', 'HEADLESS-1', 'resolution', '400x300')
+    env.expect_colour('shared startup remains for static widget', RED, 200, 150)
+    _stop(locker)
 
 
 def _swap(path, colour):
@@ -112,6 +153,53 @@ def _samples(env, duration, update=None):
             switched = True
         samples.append((elapsed * 1000, *env.snapshot().pixel(160, 10)))
     return samples
+
+
+@pytest.mark.parametrize('width,angle,keeping', [
+    (8192, 90, True),   # Upload fits at @2; rotated offscreen padding does not.
+    (8191, 90, False),  # Both padded textures fit.
+    (8192, 0, False),   # No encompassing texture needed.
+    (8200, 90, True),   # The image upload itself exceeds the limit.
+])
+def test_reload_rotated_rollback(lock_env, width, angle, keeping):
+    env = lock_env
+    env.swaymsg('create_output')
+    env.swaymsg('output', 'HEADLESS-2', 'resolution', '640x480', 'scale', '2',
+                'position', '400', '0')
+    env.start_desktop()
+    red, blue, current = (env.path(n) for n in ('red.png', 'blue.png', 'current'))
+    _png(red, RED, 32, 32)
+    _png(blue, BLUE, width, 100)
+    current.write_text(str(red) + '\n')
+    config = HEAD + f'image {{ path "{red}"; reload-cmd "cat {current}"; reload-ms 0; size 100; rotate {angle}; corner-radius 0; }}'
+    locker = _start(env, 'rotated rollback', config, debug=True)
+
+    def pixels():
+        return [parse_ppm(env.run(['grim', '-o', output, '-t', 'ppm', '-']).stdout).pixel()
+                for output in ('HEADLESS-1', 'HEADLESS-2')]
+
+    assert poll(lambda: pixels() == [RED, RED]), pixels()
+    # Let the startup command finish before SIGUSR2 requests the changed path.
+    time.sleep(.6)
+    current.write_text(str(blue) + '\n')
+    locker.signal(signal.SIGUSR2)
+    assert poll(lambda: 'blue.png" for widget' in locker.log_text()), locker.log_text()
+    if keeping:
+        assert poll(lambda: 'cannot be drawn; keeping the picture' in locker.log_text()), locker.log_text()
+    want = [RED, RED] if keeping else [BLUE, BLUE]
+    assert poll(lambda: pixels() == want), (want, pixels())
+    # Negative retention window: settlement must not leave a failed picture committed.
+    time.sleep(.3)
+    assert pixels() == want
+    assert ('cannot be drawn; keeping the picture' in locker.log_text()) == keeping
+    if width == 8192 and angle == 90:
+        assert re.search(r'image: rotated:.*GPU texture limit', locker.log_text())
+    env.swaymsg('output', 'HEADLESS-2', 'resolution', '642x480')
+    assert poll(lambda: '642x480 buffer' in locker.log_text()), locker.log_text()
+    assert poll(lambda: pixels() == want), ('after relayout', pixels())
+    assert locker.alive(), locker.log_text()
+    _stop(locker)
+    env.expect_unlocked('rotated reload rollback')
 
 
 def test_rotate(lock_env):

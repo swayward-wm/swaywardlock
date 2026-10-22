@@ -77,6 +77,11 @@ if [ "$mode" != --fast ]; then
     step release-password release_scan swaywardlock-test 'the test-auth password'
     step release-screencopy release_scan SWAYWARDLOCK_TEST_SCREENCOPY 'the screencopy test hook'
     step release-auth-delay release_scan SWAYWARDLOCK_TEST_AUTH_DELAY_MS 'the auth delay test hook'
+    step release-exit-probe release_scan SWAYWARDLOCK_TEST_EXIT_PROBE 'the retained App test hook'
+    step release-exit-observer release_scan 'test exit probe:' 'the lifecycle test observer'
+    step release-late-prompt release_scan 'late test prompt' 'the late-auth test prompt'
+    step release-drop-observer release_scan DROP_OBSERVER 'the secret-buffer test observer'
+    step release-drop-assertion release_scan 'Drop must zero all 1024 bytes before munlock/deallocation' 'the secret-buffer test assertion'
 fi
 
 echo "gate: $mode ok (see output for privileged or scdoc skips)"

@@ -405,8 +405,10 @@ class Convert(unittest.TestCase):
         r = self.ok("auth {\n pam {\n enabled = false\n module = login\n }\n}")
         self.assertIn('pam "off"', r.stdout)
         self.assertNotIn("service=", r.stdout)
-        # PAM off without a fingerprint leaves SIGUSR1 as the only way out: say so.
-        self.assertTrue(any("PAM" in w for w in warnings(r)), r.stderr)
+        # PAM off without a fingerprint still permits explicitly enabled CLI grace.
+        self.assertTrue(any("PAM" in w and "grace" in w and "SIGUSR1" in w
+                            for w in warnings(r)), r.stderr)
+        self.assertNotIn("only SIGUSR1", r.stderr)
         r = self.ok("auth {\n pam {\n enabled = false\n }\n fingerprint {\n enabled = true\n }\n}")
         self.assertEqual(warnings(r), [])
         self.assertIn("fingerprint", r.stdout)
@@ -926,6 +928,65 @@ class Convert(unittest.TestCase):
                                  env={"X": "/" + x})
                 self.assert_not_injected(r)
                 self.assert_no_surrogate_escape(r)
+
+    def test_invalid_utf8_file_and_include_are_not_rewritten(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "bad.conf"
+            p.write_bytes(b"background {\n path = /tmp/\xff.png\n}\n")
+            r = subprocess.run([SCRIPT, str(p)], text=True, capture_output=True, timeout=10)
+            self.assertEqual(r.returncode, 1)
+            self.assertEqual(r.stdout, "")
+            self.assertIn("not valid UTF-8", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+            main = Path(d) / "main.conf"
+            main.write_text("source = bad.conf\nlabel {\n text = café\n}\n")
+            r = self.run_file(main)
+            self.assertIn("not valid UTF-8", r.stderr)
+            self.assertNotIn("\ufffd", r.stdout)
+            self.assertIn('text "café"', r.stdout)
+            self.validate(r.stdout)
+
+    def test_crossfade_is_clamped_to_three_seconds(self):
+        for seconds, ms in [(0.001, 1), (3, 3000), (4, 3000), (1e30, 3000)]:
+            with self.subTest(seconds=seconds):
+                r = self.conf(f"background {{\n crossfade_time = {seconds}\n}}\n")
+                self.assertIn(f"crossfade-ms {ms}", r.stdout)
+                if seconds > 3:
+                    self.assertTrue(mentions(r, "crossfade_time"), r.stderr)
+                self.validate(r.stdout)
+
+    def test_nul_reload_command_is_commented(self):
+        for widget in ["background", "image"]:
+            r = self.conf(f"{widget} {{\n path = /a.png\n reload_cmd = echo \x00x\n reload_time = 5\n}}\n")
+            self.assertTrue(mentions(r, "reload_cmd"), r.stderr)
+            self.assertNotRegex(r.stdout, r"(?m)^\s*reload-cmd ")
+            self.assertIn("NUL", r.stderr)
+            self.validate(r.stdout)
+
+    def test_screenshot_reload_is_explicitly_unsupported(self):
+        r = self.conf("background {\n path = screenshot\n reload_cmd = echo /a.png\n reload_time = 5\n crossfade_time = 1\n}\n")
+        self.assertIn("screenshot", r.stdout)
+        for key in ["reload_cmd", "reload_time", "crossfade_time"]:
+            self.assertTrue(mentions(r, key), r.stderr)
+        self.assertNotRegex(r.stdout, r"(?m)^\s*(reload-cmd|reload-ms|crossfade-ms) ")
+        self.validate(r.stdout)
+
+    def test_validate_warns_for_screenshot_keys_in_either_order(self):
+        if not BIN.exists():
+            self.skipTest(f"{BIN} not built")
+        for children in [
+            'screenshot; reload-ms 0; reload-cmd "echo x"; crossfade-ms 0;',
+            'crossfade-ms 0; reload-cmd "echo x"; reload-ms 0; screenshot;',
+        ]:
+            with tempfile.TemporaryDirectory() as d:
+                p = Path(d) / "config.kdl"
+                p.write_text(f"background {{ {children} }}")
+                r = subprocess.run([BIN, "validate", "-c", p], text=True,
+                                   capture_output=True, timeout=10)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                for key in ["reload-ms", "reload-cmd", "crossfade-ms"]:
+                    self.assertIn(key, r.stderr)
+                self.assertEqual(r.stderr.count("ignored with `screenshot`"), 1, r.stderr)
 
     def test_missing_input_and_bad_lines(self):
         r = self.ok("this line has no equals sign\nlabel {\n text = x\n}")

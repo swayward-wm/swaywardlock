@@ -10,6 +10,8 @@ import signal
 import time
 from pathlib import Path
 
+import pytest
+
 from lib.poll import poll
 from lib.screen import parse_ppm
 
@@ -284,37 +286,86 @@ def test_screenshot(lock_env):
     _unlock(lock)
 
 
+@pytest.mark.parametrize("mode", ("wlr", "ext-session", "ext-frame"))
+def test_capture_timeout_destroys_inflight_objects(lock_env, mode):
+    env = lock_env
+    env.start_desktop()
+    name = f"wayland-stall-{mode}"
+    proxy_log = f"stall-{mode}.log"
+    env.spawn(["python3", Path(__file__).parent / "lib/stall_capture.py", mode, name], log=proxy_log)
+    assert poll(lambda: "ready" in env.log_text(proxy_log)), env.log_text(proxy_log)
+    lock = env.locker('background { color "#204060"; screenshot; }\n', args=("--no-fade-in",),
+                      env={"WAYLAND_DISPLAY": name, "WAYLAND_DEBUG": "1",
+                           "RUST_LOG": "swaywardlock=debug",
+                           **({"SWAYWARDLOCK_TEST_SCREENCOPY": "ext"} if mode != "wlr" else {})},
+                      log=f"timeout-{mode}.log")
+    lock.wait_locked(f"capture timeout {mode}")
+    _log(lock, f"capture timeout {mode}: production timeout", "screenshots did not finish in time")
+    env.expect_colour(f"capture timeout {mode}: falls back to colour", BG, 160, 120)
+    assert "suppressed" in env.log_text(proxy_log), env.log_text(proxy_log)
+    # Negative observation: retain an interval after locked. The proxy still forwards
+    # callbacks/input/fds; this checks no capture retry while the static lock is observed.
+    time.sleep(0.3)
+    assert lock.alive(), lock.log_text()
+    _unlock(lock, f"capture timeout {mode}")
+    env.expect_unlocked(f"capture timeout {mode}")
+
+    trace = lock.log_text()
+    request = re.search(r"ext_session_lock_manager_v1#[0-9]+\.lock\(", trace)
+    assert request, trace
+    start = re.search(r"\.(capture_output|create_session)\(", trace)
+    assert start, trace
+    before, after = trace[start.start():request.start()], trace[request.start():]
+    types = ["zwlr_screencopy_frame_v1"] if mode == "wlr" else ["ext_image_copy_capture_session_v1"]
+    if mode == "ext-frame":
+        types += ["ext_image_copy_capture_frame_v1", "wl_buffer", "wl_shm_pool"]
+    for iface in types:
+        ids = re.findall(r"new id " + iface + r"#([0-9]+)", before)
+        assert len(ids) == 1, f"{mode}: expected one owned {iface}, saw {ids}\n{trace}"
+        destroy = iface + "#" + ids[0] + ".destroy()"
+        assert before.count(destroy) == 1, f"{mode}: {destroy} must precede lock exactly once\n{trace}"
+        # Mesa reuses capture IDs for render buffers. Count until the next creation of
+        # that interface/ID, not the whole log; a second destroy before reuse is a failure.
+        reused = re.search(r"new id " + iface + "#" + ids[0] + r"\b", after)
+        lifetime_end = request.start() + reused.start() if reused else len(trace)
+        assert trace[start.start():lifetime_end].count(destroy) == 1, trace
+    if mode != "ext-frame":
+        assert "new id wl_buffer#" not in before, trace
+    if mode == "ext-session":
+        assert "new id ext_image_copy_capture_frame_v1#" not in before, trace
+    assert not re.search(r"\.(capture_output|capture_output_region|create_session|create_frame|capture|copy|copy_with_damage)\(", after), trace
+    assert "protocol error" not in trace.lower(), trace
+
+
 def test_screenshot_rotation(lock_env):
     env = lock_env
     image = env.path("bg.png")
-    env.run(["python3", env.contrib("ppm-pixel"), "--write-test-png", image])
+    env.run(["python3", env.contrib("ppm-pixel"), "--write-quadrant-png", image])
     env.spawn(["swaybg", "-i", image, "-m", "stretch"], log="rotation-desktop.log")
     conf = 'background { color "#204060"; screenshot; fit "fill"; }\n'
-    for tf in ("90", "flipped-180"):
+    colours = ((255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 255))
+
+    def quadrants(shot):
+        return (shot.width, shot.height, tuple(
+            shot.pixel(x, y) for y in (shot.height // 4, 3 * shot.height // 4)
+            for x in (shot.width // 4, 3 * shot.width // 4)))
+
+    for tf in ("normal", "90", "180", "270", "flipped", "flipped-90", "flipped-180", "flipped-270"):
         env.swaymsg("output", "HEADLESS-1", "transform", tf)
         assert poll(lambda: next(o["transform"] for o in json.loads(env.swaymsg("-r", "-t", "get_outputs"))
                                  if o["name"] == "HEADLESS-1") == tf), f"rotation {tf}: transform never applied"
 
-        dimensions = []
-
-        def desktop(shot):
-            dimensions[:] = [shot.width, shot.height]
-            return (shot.width, shot.height, shot.pixel(shot.width // 2, 10),
-                    shot.pixel(shot.width // 2, shot.height - 10))
-
-        try:
-            w, h, top, bottom = env.expect(
-                f"rotation {tf}: desktop is red on top, blue below",
-                desktop, lambda v: (tf != "90" or v[0] < v[1]) and v[2:] == ((255, 0, 0), (0, 0, 255)))
-        except AssertionError as error:
-            raise AssertionError(
-                f"rotation {tf}: desktop is red on top, blue below ({dimensions[0]}x{dimensions[1]})\n{error}"
-            ) from error
+        dimensions = (240, 320) if tf.endswith(("90", "270")) else (320, 240)
+        # swaybg presents the fixture upright in logical output coordinates. Read the actual
+        # settled desktop rather than deriving a golden image from screencopy::untransform.
+        reference = env.expect(
+            f"rotation {tf}: settled distinct desktop quadrants", quadrants,
+            lambda v: v[:2] == dimensions and v[2] == colours)
         for hook in ("wlr", "ext"):
             lock = _shot_lock(env, conf, f"rotation-{tf}-{hook}", "ext" if hook == "ext" else None)
             label = "ext run uses ext-image-copy-capture" if hook == "ext" else "default run uses wlr-screencopy"
             _log(lock, f"rotation {tf}: {label}", f"screenshots via {'ext-image-copy-capture' if hook == 'ext' else 'wlr-screencopy'}")
-            env.expect_colour(f"rotation {tf} {hook}: lock top matches the desktop", top, w // 2, 10)
-            env.expect_colour(f"rotation {tf} {hook}: lock bottom matches the desktop", bottom, w // 2, h - 10)
+            env.expect(f"rotation {tf} {hook}: dimensions and four interiors match desktop",
+                       quadrants, reference)
             _unlock(lock)
         env.swaymsg("output", "HEADLESS-1", "transform", "normal")
