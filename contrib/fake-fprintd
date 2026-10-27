@@ -67,6 +67,7 @@ class Device(dbus.service.Object):
         self.logind = logind
         self.verifying = False
         self.claimed = False
+        self.bus = bus
         if self.statuses and self.statuses[0] == "preparing":
             # logind is already preparing for sleep when the locker starts; wake after 1 s.
             self.statuses.pop(0)
@@ -130,6 +131,15 @@ class Device(dbus.service.Object):
             if self.statuses:
                 GLib.timeout_add(400, self.emit, self.statuses.pop(0))
             return False
+        if status == "matchsleep":
+            self.burst(["verify-match", "SLEEP"])
+            GLib.timeout_add(300, self.sleep, False)
+            return False
+        if status == "matchatwake":
+            # Asleep now; 0.3 s later match and wake in one burst.
+            self.sleep(True)
+            GLib.timeout_add(300, self.burst, ["verify-match", "WAKE"])
+            return False
         if status == "finger-present":
             self.log("finger-present")
             self.PropertiesChanged(DEV, {"finger-present": dbus.Boolean(True)}, dbus.Array([], signature="s"))
@@ -143,6 +153,29 @@ class Device(dbus.service.Object):
             GLib.timeout_add(600, self.sleep, False)
             if self.statuses:
                 GLib.timeout_add(300, self.emit, self.statuses.pop(0))
+        if then == "matchwake":
+            # Asleep at 0.1 s; at 0.3 s a match and the wake back to back (bus order: match first).
+            GLib.timeout_add(100, self.sleep, True)
+            GLib.timeout_add(300, self.burst, ["verify-match", "WAKE"])
+        if then == "wakematch":
+            # Asleep at 0.1 s; at 0.3 s the wake then a match back to back (legit: match after wake).
+            GLib.timeout_add(100, self.sleep, True)
+            GLib.timeout_add(300, self.burst, ["WAKE", "verify-match"])
+        if then == "matchsleep":
+            # Scanning: a match and a sleep back to back (match first: may unlock).
+            pass
+        if then == "double":
+            GLib.timeout_add(100, self.sleep, True)
+            GLib.timeout_add(150, self.sleep, True)
+            GLib.timeout_add(200, self.burst, ["verify-match"])
+            GLib.timeout_add(300, self.sleep, False)
+            GLib.timeout_add(350, self.sleep, False)
+        if then == "wakeonly":
+            GLib.timeout_add(100, self.sleep, False)
+            GLib.timeout_add(150, self.sleep, False)
+        if then == "vanishasleep":
+            GLib.timeout_add(100, self.sleep, True)
+            GLib.timeout_add(200, self.burst, ["verify-match", "EXIT"])
         if then in ("sleep", "quicksleep"):
             GLib.timeout_add(100, self.sleep, True)
             GLib.timeout_add(2000 if then == "sleep" else 400, self.sleep, False)
@@ -154,6 +187,21 @@ class Device(dbus.service.Object):
         # for another VerifyStart.
         if not done and self.statuses:
             GLib.timeout_add(400, self.emit, self.statuses.pop(0))
+        return False
+
+    def burst(self, items):
+        for it in items:
+            if it == "WAKE":
+                self.sleep(False)
+            elif it == "SLEEP":
+                self.sleep(True)
+            elif it == "EXIT":
+                self.log("EXIT")
+                self.bus.flush()
+                import os; os._exit(0)
+            else:
+                self.log("status " + it)
+                self.VerifyStatus(it, True)
         return False
 
     @dbus.service.signal(DEV, signature="sb")

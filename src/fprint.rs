@@ -6,9 +6,11 @@
 //! short, ...) update the prompt and keep scanning. It stops scanning before sleep and starts
 //! again after (logind `PrepareForSleep`). It does not start while logind is already preparing
 //! for sleep, and ignores a match unless it is scanning and awake. Device, logind and fprintd-gone
-//! signals go through one queue handled on one thread, so a match sent during sleep is never
-//! seen after the wake. If fprintd or a device is missing, it logs and exits;
-//! PAM keeps working.
+//! signals are handled on one thread, but each comes from its own match-rule stream, so handling
+//! order is not bus order. Instead a match is accepted only if its bus receive position is after
+//! the reply to the current `VerifyStart`; a match sent while asleep (or before the restart)
+//! is therefore rejected even if the wake is handled first. If fprintd or a device is missing, it
+//! logs and exits; PAM keeps working.
 //!
 //! Only `verify-match` produces [`FprintEvent::Matched`], which the main loop turns into an
 //! unlock request, the same path as a PAM success.
@@ -239,7 +241,9 @@ fn run(o: &Options, events: &Sender<FprintEvent>, prompted: &mut bool) -> anyhow
         if scan.asleep || scan.scanning {
             return Ok(());
         }
-        let () = device.call("VerifyStart", &("any",))?;
+        let reply = device.call_method("VerifyStart", &("any",))?;
+        // Statuses received before this reply belong to an older session.
+        scan.since = reply.recv_position();
         scan.scanning = true;
         let _ = events.send(FprintEvent::Prompt(prompt.to_owned()));
         Ok(())
@@ -331,7 +335,7 @@ fn run(o: &Options, events: &Sender<FprintEvent>, prompted: &mut bool) -> anyhow
                 let (result, _done): (String, bool) = msg.body().deserialize()?;
                 match classify(&result, retries) {
                     Next::Matched => {
-                        if scan.asleep || !scan.scanning {
+                        if scan.asleep || !scan.scanning || msg.recv_position() < scan.since {
                             tracing::warn!("fprint: ignoring a match while not scanning");
                             continue;
                         }
@@ -378,7 +382,7 @@ fn run(o: &Options, events: &Sender<FprintEvent>, prompted: &mut bool) -> anyhow
     Ok(())
 }
 
-/// A signal for the device loop, in arrival order.
+/// A signal for the device loop (queue order is scheduler order, not bus order).
 enum Item {
     Device(zbus::Message),
     Sleep(zbus::Message),
@@ -393,6 +397,8 @@ struct Scan {
     scanning: bool,
     /// Between PrepareForSleep(true) and (false).
     asleep: bool,
+    /// Receive position of the current VerifyStart reply.
+    since: zbus::message::Sequence,
 }
 
 /// Run `f` on drop.
