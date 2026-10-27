@@ -2586,11 +2586,13 @@ name = "swaywardlock"
 version = "26.10.0-beta.1"
 dependencies = [
  "anyhow",
+ "async-io",
  "calloop",
  "clap",
  "clap_complete",
  "csscolorparser",
  "fastrand",
+ "futures-lite",
  "glam",
  "image",
  "jxl-oxide",

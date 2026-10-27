@@ -8,6 +8,10 @@ After VerifyStart it replays the given VerifyStatus results, one every 0.4 s, e.
 stdout so tests can check the device was released. It also owns org.freedesktop.login1, so the
 locker's PrepareForSleep handling runs (and a forged one can be told apart from ours).
 
+`sleepmatch` sends PrepareForSleep(true) and a match back to back (wake 0.3 s later);
+`verify-no-match+matchburstwake` sleeps at 0.1 s, then at 0.3 s sends twenty matches and the wake
+back to back.
+
 A status with a `+sleep` suffix (`verify-no-match+sleep`) is followed 0.1 s later by logind's
 PrepareForSleep(true) and 2 s later by PrepareForSleep(false), logged as SLEEP and WAKE.
 `+race` sends the next status 0.3 s after, asleep (sleep at 0.1 s, wake at 0.6 s).
@@ -135,6 +139,11 @@ class Device(dbus.service.Object):
             self.burst(["verify-match", "SLEEP"])
             GLib.timeout_add(300, self.sleep, False)
             return False
+        if status == "sleepmatch":
+            # Scanning: PrepareForSleep(true) then a match, back to back (bus order: sleep first).
+            self.burst(["SLEEP", "verify-match"])
+            GLib.timeout_add(300, self.sleep, False)
+            return False
         if status == "matchatwake":
             # Asleep now; 0.3 s later match and wake in one burst.
             self.sleep(True)
@@ -157,6 +166,10 @@ class Device(dbus.service.Object):
             # Asleep at 0.1 s; at 0.3 s a match and the wake back to back (bus order: match first).
             GLib.timeout_add(100, self.sleep, True)
             GLib.timeout_add(300, self.burst, ["verify-match", "WAKE"])
+        if then == "matchburstwake":
+            # Asleep at 0.1 s; at 0.3 s twenty matches and the wake back to back.
+            GLib.timeout_add(100, self.sleep, True)
+            GLib.timeout_add(300, self.burst, ["verify-match"] * 20 + ["WAKE"])
         if then == "wakematch":
             # Asleep at 0.1 s; at 0.3 s the wake then a match back to back (legit: match after wake).
             GLib.timeout_add(100, self.sleep, True)

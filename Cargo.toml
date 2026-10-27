@@ -18,6 +18,8 @@ fastrand = "2"
 glam = "0.33"
 keyframe = { version = "1.1.1", default-features = false }
 zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }
+async-io = "2"
+futures-lite = "2"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp", "tiff", "ico"] }
 # JPEG XL (Fedora's stock wallpaper format), pure Rust, through the image crate's decoder hook.
 jxl-oxide = { version = "0.12", default-features = false, features = ["image"] }

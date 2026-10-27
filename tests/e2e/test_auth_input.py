@@ -727,15 +727,6 @@ def test_fingerprint(desktop):
         assert _ordered(log(), "status verify-no-match", "SLEEP", "status verify-match", "WAKE"), f"fingerprint: race order\n{log()}"
         assert locker.alive(), f"fingerprint: a match queued while asleep must not unlock after wake\n{log()}"
         _unlock(locker)
-    # No gap: the match and the wake leave back to back, so only the bus receive position
-    # tells the match was sent while asleep. Nondeterministic, so repeat.
-    for i in range(40):
-        with _fake(env, child_env, f"matchwake{i}", "verify-no-match+matchwake") as log:
-            locker = _locker(env, f"fingerprint matchwake {i}", race_config, env=child_env)
-            assert poll(lambda: "WAKE" in log(), timeout=6), f"fingerprint: no wake\n{log()}"
-            time.sleep(0.5)
-            assert locker.alive(), f"fingerprint: match+wake burst unlocked (run {i})\n{log()}"
-            _unlock(locker)
     with _fake(env, child_env, "preparing", "preparing", "verify-match") as log:
         locker = _locker(env, "fingerprint preparing", sleep_config, env=child_env)
         assert poll(lambda: "WAKE" in log(), timeout=6), f"fingerprint: no wake\n{log()}"
@@ -773,3 +764,33 @@ def test_fingerprint(desktop):
     locker = _locker(env, "fingerprint: locks without fprintd", misses, env=child_env)
     _unlock(locker)
     _stop(bus)
+
+
+def _burst_race(env, i, name, *statuses):
+    """One run of a no-gap burst scenario: the lock must stay after the burst."""
+    busdir = env.path("bus")
+    busdir.mkdir()
+    address = f"unix:path={busdir / 'sock'}"
+    env.spawn(["dbus-daemon", "--session", "--nofork", f"--address={address}"], log=_log("dbus"))
+    assert poll(lambda: (busdir / "sock").is_socket()), "fingerprint: bus not ready"
+    child_env = {"DBUS_SYSTEM_BUS_ADDRESS": address}
+    config = OFF + 'auth { fingerprint { retry-delay-ms 1000; }; }\n'
+    with _fake(env, child_env, name, *statuses) as log:
+        locker = _locker(env, f"fingerprint {name} {i}", config, env=child_env)
+        assert poll(lambda: "WAKE" in log(), timeout=6), f"fingerprint: no wake\n{log()}"
+        time.sleep(0.5)
+        assert locker.alive(), f"fingerprint: {name} burst unlocked (run {i})\n{log()}"
+        _unlock(locker)
+
+
+# These races are nondeterministic (about 1-4% per run on the old code), hence many runs.
+@pytest.mark.parametrize("i", range(100))
+def test_fingerprint_matches_then_wake(desktop, i):
+    """Asleep, then twenty matches and the WAKE back to back: the matches were sent asleep."""
+    _burst_race(desktop, i, "matchburstwake", "verify-no-match+matchburstwake")
+
+
+@pytest.mark.parametrize("i", range(400))
+def test_fingerprint_sleep_then_match(desktop, i):
+    """PrepareForSleep(true) then a match back to back while scanning: the match is asleep."""
+    _burst_race(desktop, i, "sleepmatch", "sleepmatch")
