@@ -16,6 +16,10 @@ Like fprintd (device.c can_start_action), a VerifyStart while a verify session i
 until VerifyStop, fails with net.reactivated.Fprint.Error.AlreadyInUse (logged as REFUSED), and
 one before Claim fails with net.reactivated.Fprint.Error.ClaimDevice (logged as REFUSED too).
 
+The status `sleepnow` sends PrepareForSleep(true) at once (and false 2 s later), and the next
+status follows 0.4 s later, while asleep. A first argument `preparing` makes logind's
+PreparingForSleep property true at start, with the wake signal 1 s later.
+
 The status `finger-present` is not a VerifyStatus: it sets the device's finger-present property
 (PropertiesChanged), as fprintd does when a finger touches the reader, and the next status
 follows 0.4 s later. `pause` sends nothing and waits 2 s before the next status.
@@ -44,6 +48,12 @@ class Manager(dbus.service.Object):
 
 
 class Logind(dbus.service.Object):
+    preparing = False
+
+    @dbus.service.method("org.freedesktop.DBus.Properties", in_signature="ss", out_signature="v")
+    def Get(self, iface, name):
+        return dbus.Boolean(self.preparing)
+
     @dbus.service.signal("org.freedesktop.login1.Manager", signature="b")
     def PrepareForSleep(self, starting):
         pass
@@ -56,6 +66,15 @@ class Device(dbus.service.Object):
         self.logind = logind
         self.verifying = False
         self.claimed = False
+        if self.statuses and self.statuses[0] == "preparing":
+            # logind is already preparing for sleep when the locker starts; wake after 1 s.
+            self.statuses.pop(0)
+            logind.preparing = True
+            GLib.timeout_add(1000, self.wake)
+
+    def wake(self):
+        self.logind.preparing = False
+        return self.sleep(False)
 
     def log(self, what):
         print(int((time.monotonic() - T0) * 1000), what, flush=True)
@@ -102,6 +121,13 @@ class Device(dbus.service.Object):
         if status == "pause":
             if self.statuses:
                 GLib.timeout_add(2000, self.emit, self.statuses.pop(0))
+            return False
+        if status == "sleepnow":
+            # Sleep now, wake after 2 s; the next status (a match, say) arrives while asleep.
+            self.sleep(True)
+            GLib.timeout_add(2000, self.sleep, False)
+            if self.statuses:
+                GLib.timeout_add(400, self.emit, self.statuses.pop(0))
             return False
         if status == "finger-present":
             self.log("finger-present")
