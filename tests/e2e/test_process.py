@@ -18,6 +18,8 @@ from pathlib import Path
 from lib.lockenv import Locker, ROOT
 from lib.poll import alive, poll
 
+GREY = (163, 163, 163)
+
 
 def _launch(env, argv, log, **kw):
     """Narrow launcher for descriptors not supported by LockEnv.spawn."""
@@ -89,9 +91,6 @@ def test_validate(lock_env):
         path = env.path(name + ".kdl")
         path.write_text(text)
         _exit(_launch(env, [env.binary, "validate", "-c", path], name + ".log"), 0, message)
-    lock = _launch(env, [env.binary, "-c", bad], "bad-lock.log")
-    _exit(lock, 1, "validate: locker refuses a bad config")
-    assert "session locked" not in lock.log_text(), "validate: never locked with a bad config"
     blocks = re.findall(r"```kdl\n(.*?)```", (ROOT / "docs/specs/2026-10-19-swaywardlock.md").read_text(), re.S)
     failures = []
     paths = []
@@ -111,15 +110,33 @@ def test_validate(lock_env):
           "validate: glow with the swaylock style is refused")
 
 
-def test_no_wayland_egl(lock_env):
-    env = lock_env
+def test_no_wayland_egl(desktop):
+    env = desktop
     lib = env.path("fake-egl")
     lib.mkdir()
     result = env.run(["cc", "-shared", "-o", lib / "libwayland-egl.so.1", "-x", "c", "/dev/null"], check=False)
     assert result.returncode == 0, f"no wayland-egl: needs a C compiler: {result.stderr!r}"
     lock = env.locker(env={"LD_LIBRARY_PATH": str(lib)}, log="fake-egl.log")
-    _exit(lock, 1, "no wayland-egl: exit code")
-    assert "session locked" not in lock.log_text(), "no wayland-egl: failed before locking"
+    lock.wait_locked("no wayland-egl")
+    env.expect_colour("no wayland-egl: a solid frame covers the desktop", GREY)
+    lock.signal(signal.SIGUSR1)
+    _exit(lock, 0, "no wayland-egl: SIGUSR1 unlocks")
+    env.expect_unlocked("no wayland-egl")
+
+
+def test_bad_config_still_locks(desktop):
+    env = desktop
+    lock = env.locker('ring-indicator { radius 0; }', log="bad-lock.log")
+    lock.wait_locked("bad config")
+    assert "warn" in lock.log_text().lower() and "default" in lock.log_text(), "bad config: the log warns about the defaults"
+    env.expect_colour("bad config: default look covers the desktop", GREY)
+    lock.signal(signal.SIGUSR1)
+    _exit(lock, 0, "bad config: SIGUSR1 unlocks")
+    env.expect_unlocked("bad config")
+    lock = env.locker(args=["-c", env.path("does-not-exist.kdl")], log="missing-config.log")
+    lock.wait_locked("missing config file")
+    lock.signal(signal.SIGUSR1)
+    _exit(lock, 0, "missing config file: SIGUSR1 unlocks")
 
 
 def test_sigterm(lock_env):
@@ -232,8 +249,10 @@ def test_fd_limit(lock_env):
     lock.signal(signal.SIGUSR1)
     _exit(lock, 0, "fd limit: a soft limit of 16 is raised and the lock works")
     lock = _launch(env, ["bash", "-c", 'ulimit -n 16; exec "$0"', env.binary], "hard-limit.log")
-    _exit(lock, 1, "fd limit: a hard limit of 16 exits 1")
-    assert "session locked" not in lock.log_text(), "fd limit: a hard limit of 16 is refused before locking"
+    lock.wait_locked("fd limit: hard 16")
+    assert "open file limit" in lock.log_text(), "fd limit: the log warns"
+    lock.signal(signal.SIGUSR1)
+    _exit(lock, 0, "fd limit: a hard limit of 16 still locks")
 
 
 def test_compositor_death(lock_env):

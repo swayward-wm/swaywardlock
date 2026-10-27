@@ -162,7 +162,8 @@ struct App {
     inputs: Vec<SeatInput>,
     /// Counts key and subsequent modifiers events across keyboards, excluding enter snapshots.
     input_clock: u64,
-    gpu: Gpu,
+    /// `None` when EGL or the renderer failed to start: surfaces get a solid colour over shm.
+    gpu: Option<Gpu>,
     config: Config,
     images: Images,
     auth: Option<Authenticator>,
@@ -230,6 +231,13 @@ fn main() -> ExitCode {
     };
     let (config, config_files) = match loaded {
         Ok(loaded) => loaded,
+        // A locker that refuses to lock leaves `swayidle before-sleep` suspending an unlocked
+        // session: lock with the defaults instead (validate and --preview still fail).
+        Err(err) if cli.command.is_none() && !cli.preview => {
+            eprintln!("{err:?}");
+            tracing::warn!("the config is unusable; locking with the default config instead");
+            (Config::default(), Vec::new())
+        }
         Err(err) => {
             eprintln!("{err:?}");
             return ExitCode::from(EXIT_NEVER_LOCKED);
@@ -243,11 +251,16 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    // Running out of descriptors after `lock()` would leave a session nobody can unlock.
-    if let Err(err) = process::ensure_fd_limit() {
-        tracing::error!("{err:#}");
-        return ExitCode::from(EXIT_NEVER_LOCKED);
-    }
+    // Too few descriptors may break auth or labels later, but refusing to lock is worse.
+    let low_fds = match process::ensure_fd_limit() {
+        Ok(()) => false,
+        Err(err) => {
+            tracing::warn!(
+                "{err:#}; locking anyway with a solid colour, without PAM; only SIGUSR1 can unlock"
+            );
+            true
+        }
+    };
     match boottime() {
         Some(now) if grace_deadline(now, cli.grace).is_none() => {
             tracing::error!("--grace {}: too large", cli.grace);
@@ -278,7 +291,7 @@ fn main() -> ExitCode {
         files: config_files,
         output: cli.preview_output.clone(),
     });
-    match run(cli, config, daemon, preview) {
+    match run(cli, config, daemon, preview, low_fds) {
         Ok(code) => ExitCode::from(code),
         Err(err) => {
             tracing::error!("{err:#}");
@@ -372,14 +385,25 @@ impl<W: std::io::Write> std::io::Write for Lossy<W> {
 /// Everything up to the event loop. Errors here happen before `lock()` and map to exit 1.
 fn run(
     cli: Cli,
-    config: Config,
+    mut config: Config,
     mut daemon: Daemon,
     preview: Option<preview::Options>,
+    low_fds: bool,
 ) -> anyhow::Result<u8> {
-    // A missing PAM service file falls back to /etc/pam.d/other, which refuses every password:
-    // say so and never lock.
+    if low_fds {
+        // GL, PAM and fingerprint threads each need descriptors that are not there.
+        config.auth.pam_service = None;
+        config.auth.fingerprint = None;
+    }
+    // A missing PAM service file falls back to /etc/pam.d/other, which refuses every password.
+    // Lock anyway, without PAM: only SIGUSR1 (or a fingerprint, or grace) can unlock.
     if let (Some(service), None) = (&config.auth.pam_service, &preview) {
-        auth::check_service_installed(service).map_err(anyhow::Error::msg)?;
+        if let Err(err) = auth::check_service_installed(service) {
+            tracing::warn!(
+                "{err}; locking without PAM: only SIGUSR1 can unlock (passwords are refused)"
+            );
+            config.auth.pam_service = None;
+        }
     }
 
     if let Some(display) = &cli.display {
@@ -411,11 +435,21 @@ fn run(
 
     // Renderer and shaders before lock: a GL failure must never leave a locked session showing
     // nothing.
-    let mut gpu = Gpu::new(&conn)?;
-    render::init(&mut gpu.renderer);
-    let scratch = compositor.create_surface(&qh);
-    gpu.check_surface(&scratch)?;
-    scratch.destroy();
+    // A GL failure is not a reason to leave the session unlocked: lock with a solid colour from
+    // shared memory instead (the preview needs GL).
+    let gpu_result = if low_fds {
+        Err(anyhow::anyhow!("too few file descriptors for GL"))
+    } else {
+        setup_gpu(&conn, &compositor, &qh)
+    };
+    let gpu = match gpu_result {
+        Ok(gpu) => Some(gpu),
+        Err(err) if preview.is_none() => {
+            tracing::warn!("{err:#}; locking with a solid colour instead of the lock screen");
+            None
+        }
+        Err(err) => return Err(err),
+    };
     // Decoding is synchronous and has no time limit (as in swaylock); --immediate-render skips
     // it, and image widgets fall back to their colour.
     let images = if cli.immediate_render {
@@ -474,6 +508,7 @@ fn run(
         // transaction has asked one. Preview shows it too, for layout work.
         state.pam_prompt = auth::DEFAULT_PROMPT.to_owned();
     }
+    let no_fade_in = cli.no_fade_in || gpu.is_none();
     let mut app = App {
         conn: conn.clone(),
         handle: handle.clone(),
@@ -493,7 +528,7 @@ fn run(
         state,
         fades: fade::Fades::new(config.animations),
         grace_until: None,
-        no_fade_in: cli.no_fade_in,
+        no_fade_in,
         grace: cli.grace,
         shm: smithay_client_toolkit::shm::Shm::bind(&globals, &qh).ok(),
         screencopy: None,
@@ -589,6 +624,36 @@ fn run(
     }
     app.daemon.report(code);
     Ok(code)
+}
+
+/// The colour of the first `background` widget, else swaylock's grey: what a lock surface shows
+/// without a GL renderer.
+fn fallback_color(config: &Config) -> [u8; 4] {
+    let color = config
+        .widgets
+        .iter()
+        .find_map(|w| match w {
+            config::Widget::Background(b) => Some(b.color),
+            _ => None,
+        })
+        .unwrap_or_else(|| config::Background::default().color);
+    let [r, g, b, a] = color.to_array_premul();
+    // ARGB8888 little endian: B, G, R, A.
+    [b, g, r, a].map(|c| (c.clamp(0., 1.) * 255.).round() as u8)
+}
+
+fn setup_gpu(
+    conn: &Connection,
+    compositor: &CompositorState,
+    qh: &QueueHandle<App>,
+) -> anyhow::Result<Gpu> {
+    let mut gpu = Gpu::new(conn)?;
+    render::init(&mut gpu.renderer);
+    let scratch = compositor.create_surface(qh);
+    let checked = gpu.check_surface(&scratch);
+    scratch.destroy();
+    checked?;
+    Ok(gpu)
 }
 
 /// One pass of the event loop. A protocol error from the compositor (`wl_display.error`) is an
@@ -869,13 +934,14 @@ impl App {
     fn draw_all(&mut self) {
         #[cfg(feature = "test-auth")]
         lifecycle_probe::draw_entry();
-        if self.exit.is_some() {
+        if self.exit.is_some() || self.gpu.is_none() {
             return;
         }
         tracing::trace!("draw_all");
         // Animations started during this draw must start at the current time, not at whenever
         // the clock was last read.
         self.fades.tick_clock();
+        let Some(gpu) = &mut self.gpu else { return };
         for surface in &mut self.surfaces {
             let dynamic = Dynamic {
                 vars: self.labels.vars(&self.state),
@@ -885,7 +951,7 @@ impl App {
                 clock: self.fades.clock(),
             };
             if let Err(err) = surface.draw(
-                &mut self.gpu.renderer,
+                &mut gpu.renderer,
                 &self.config,
                 &self.images,
                 &self.state,
@@ -988,10 +1054,21 @@ impl App {
         }
         self.reload.set_screens(screens);
         let surface = &mut self.surfaces[index];
-        if let Err(err) = surface.ensure_egl(&self.gpu) {
+        if let Err(err) = surface.ensure_egl(self.gpu.as_ref()) {
             tracing::error!("cannot create a surface for an output: {err:#}");
             return;
         }
+        let Some(gpu) = &mut self.gpu else {
+            let color = fallback_color(&self.config);
+            if let Some(shm) = &self.shm {
+                if let Err(err) = self.surfaces[index].draw_solid(shm, color) {
+                    tracing::error!("cannot draw the solid colour: {err:#}");
+                }
+            } else {
+                tracing::error!("no wl_shm and no GL: the lock surface stays empty");
+            }
+            return;
+        };
         self.fades.tick_clock();
         let dynamic = Dynamic {
             vars: self.labels.vars(&self.state),
@@ -1001,7 +1078,7 @@ impl App {
             clock: self.fades.clock(),
         };
         if let Err(err) = surface.draw(
-            &mut self.gpu.renderer,
+            &mut gpu.renderer,
             &self.config,
             &self.images,
             &self.state,

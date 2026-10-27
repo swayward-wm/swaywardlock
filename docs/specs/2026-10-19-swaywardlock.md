@@ -106,7 +106,7 @@ Exit codes:
 | Code | When |
 |---|---|
 | 0 | Unlocked after auth, grace, or SIGUSR1 |
-| 1 | Config error, missing or unreadable PAM service file, missing `ext-session-lock-v1`, EGL/renderer setup failure, a `--ready-fd` that is not open, a `--grace` too large for the clock, an open-file limit (`ulimit -n`) under 64 even after raising the soft limit: never locked |
+| 1 | Never locked: missing `ext-session-lock-v1`, no Wayland connection, a `--ready-fd` that is not open, a `--grace` too large for the clock; `validate` and `--preview` also exit 1 on a bad config or failed GL. Everything else degrades and still locks (see below) |
 | 2 | The compositor sent `finished` (another locker holds the lock, or the lock was refused). swaylock uses the same code |
 | 3 | An error after `lock()` (the compositor died, a protocol error from the compositor, an event-loop error). The compositor keeps the session locked |
 
@@ -115,6 +115,14 @@ SIGUSR1 and SIGUSR2 are blocked as the first thing `main` does. One that arrives
 and ends the process before it locks (exit status 138 or 140 from the shell). Nothing is
 unlocked, but a launcher that signals the locker right after starting it should wait for
 `--ready-fd` or for `-f` to return first.
+
+Degraded locking: a failure that could be survived never leaves the session unlocked (a
+`swayidle before-sleep` would otherwise suspend with no lock). Each logs a warning and locks:
+a config that does not load uses the built-in defaults; an EGL or renderer failure (including a
+missing libwayland-egl) draws the first `background` colour (swaylock grey by default) from
+shared memory, with no widgets; a missing or unreadable PAM service file acts as `pam { off; }`,
+so only SIGUSR1 (or fingerprint or grace) unlocks and passwords are refused; an open-file limit
+under 64 even after raising the soft limit does both the solid colour and no PAM.
 
 `swaywardlock validate` parses the config, prints miette diagnostics and
 exits 0 or 1 without connecting to Wayland.
@@ -136,9 +144,10 @@ Path: `--config`, then `SWAYWARDLOCK_CONFIG`, then
 `/etc/swaywardlock/config.kdl`, then a compiled-in default. When none of the two
 default paths exists, the compiled-in default config applies (a plain swaylock-style
 look). A file named explicitly, by `--config` or `SWAYWARDLOCK_CONFIG`, that is
-missing is an error (`error reading`, exit 1), and so is a path that cannot be read;
-an empty `SWAYWARDLOCK_CONFIG=` is a command-line error (clap, exit 2). Errors abort with exit 1 before locking: a lock screen that fails to
-parse its config must not leave the user with a broken lock.
+missing is an error (`error reading`), and so is a path that cannot be read;
+an empty `SWAYWARDLOCK_CONFIG=` is a command-line error (clap, exit 2). A config error does not stop the lock: the locker prints the diagnostic, warns, and locks with
+the built-in defaults (`validate` and `--preview` exit 1), because a locker that exits unlocked
+lets `swayidle before-sleep` suspend an unlocked session.
 
 ### Shared vocabulary (copied from swayward-config)
 
@@ -573,12 +582,13 @@ thread (auth and commands/resources). Modules:
 
 ### Startup sequence
 
-1. Parse args and config. Error → exit 1. Unless PAM is off, the PAM service file must be one
+1. Parse args and config. Error → warn and use the defaults (`validate`/`--preview`: exit 1).
+   Unless PAM is off, the PAM service file should be one
    libpam reads: the service name lowercased (as `pam_start` does), the first of
    `/etc/pam.d/<service>` and `/usr/lib/pam.d/<service>` that this process can open. Without
    it Linux-PAM uses `/etc/pam.d/other`, which denies on Fedora and Arch, so no password could
-   unlock. Missing or unreadable (installed mode 600 root) → an error naming the file, exit 1,
-   never locked.
+   unlock. Missing or unreadable (installed mode 600 root) → a warning naming the file, and lock without
+   PAM (SIGUSR1 only).
 2. Connect. Bind globals. If `ext_session_lock_manager_v1` is missing,
    exit 1.
 3. Unless `--immediate-render` is set: take a screenshot of each output that
@@ -590,8 +600,8 @@ thread (auth and commands/resources). Modules:
 4. Create the EGL display, context and renderer. Compile the copied
    shaders (`shaders::init`, `resources::init`). Check that libwayland-egl
    loads, and create and drop an EGL window surface on a scratch
-   `wl_surface`. Error → exit 1. This comes before `lock()`, so a GL
-   failure never leaves a locked session showing nothing.
+   `wl_surface`. Error → warn and lock with a solid shm colour instead. This comes before
+   `lock()`, so a GL failure never leaves a locked session showing nothing.
 5. Call `lock()`. Create a lock surface for each output. Render the first
    frame on each configure.
 6. On `locked`: write the ready fd, daemonize, start the grace timer. The
