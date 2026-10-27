@@ -20,8 +20,8 @@ fingerprint unlock. It is configured in KDL; see *CONFIGURATION* below, and the 
 *SEE ALSO*. Background and image files are
 shown upright: their EXIF orientation is applied, as swaylock does.
 
-Passwords are checked through PAM with the service _swaywardlock_. swaywardlock refuses to lock
-(exit status 1) when the PAM service file is missing.
+Passwords are checked through PAM with the service _swaywardlock_. When the PAM service file is
+missing swaywardlock still locks, logs a warning, and refuses all passwords; only SIGUSR1 unlocks.
 
 The session stays locked if swaywardlock dies for any reason: the compositor, not the locker,
 holds the lock.
@@ -232,9 +232,11 @@ _specs/2026-10-19-swaywardlock.md_ under /usr/share/doc/swaywardlock (see *SEE A
 	Unlocked after authentication, grace, or SIGUSR1.
 
 *1*
-	Never locked: a config error, a missing PAM service file, no Wayland display to connect to,
-	no ext-session-lock-v1 in the compositor, a renderer setup failure, a *--ready-fd* that is not open, a *--grace* too
-	large for the clock, or too low an open-file limit.
+	Never locked: no Wayland display to connect to, no ext-session-lock-v1 in the compositor, a
+	*--ready-fd* that is not open, or a *--grace* too large for the clock. A bad config, a
+	missing PAM service file, a renderer failure or a low open-file limit do not stop the lock:
+	swaywardlock warns and locks with the defaults, a solid colour, or without PAM (SIGUSR1
+	only). *validate* and *--preview* still exit 1 on a bad config.
 
 *2*
 	The compositor sent _finished_: another locker holds the lock, or the lock was refused. It

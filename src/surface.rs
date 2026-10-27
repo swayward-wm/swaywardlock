@@ -165,6 +165,11 @@ pub struct Surface {
     pub ring_animating: bool,
     /// Set by `draw`: each widget whose new (reloaded) picture it tried, and whether it rendered.
     pub trials: Vec<(usize, bool)>,
+    /// The shm pool and buffer of a GL-less solid frame, kept while the compositor may read them.
+    solid: Option<(
+        smithay_client_toolkit::shm::slot::SlotPool,
+        smithay_client_toolkit::shm::slot::Buffer,
+    )>,
     fallback: SolidColorBuffer,
     fade: SolidColorBuffer,
     /// Screenshot of this output taken before locking, for `background { screenshot }`.
@@ -190,6 +195,7 @@ impl Surface {
             field_wake: None,
             ring_animating: false,
             trials: Vec::new(),
+            solid: None,
             fallback: SolidColorBuffer::default(),
             fade: SolidColorBuffer::default(),
             screenshot: None,
@@ -305,7 +311,7 @@ impl Surface {
     /// the EGL surface goes, so nothing draws until a configure with one: a buffer of the old
     /// size committed against the acked configure is a protocol error, and the compositor
     /// disconnects the locker.
-    pub fn ensure_egl(&mut self, gpu: &crate::egl::Gpu) -> anyhow::Result<()> {
+    pub fn ensure_egl(&mut self, gpu: Option<&crate::egl::Gpu>) -> anyhow::Result<()> {
         let size = self.buffer_size();
         if size.w <= 0 || size.h <= 0 {
             self.damage = None;
@@ -325,13 +331,14 @@ impl Surface {
                 size.h
             );
         }
-        match &self.egl {
-            Some(egl) => {
+        match (&self.egl, gpu) {
+            (Some(egl), _) => {
                 egl.resize(size.w, size.h, 0, 0);
             }
-            None => {
+            (None, Some(gpu)) => {
                 self.egl = Some(gpu.create_surface(self.wl_surface(), size.w, size.h)?);
             }
+            (None, None) => {}
         }
         match &self.fractional {
             Some(f) => {
@@ -354,6 +361,9 @@ impl Surface {
                 self.wl_surface().set_buffer_scale(scale);
             }
         }
+        if gpu.is_none() {
+            return Ok(());
+        }
         // EGL window surfaces are y-up; smithay renders them with Flipped180, as in its winit
         // examples. Without it everything is upside down (symmetric widgets hide this).
         self.damage = Some(OutputDamageTracker::new(
@@ -361,6 +371,37 @@ impl Surface {
             self.scale,
             Transform::Flipped180,
         ));
+        Ok(())
+    }
+
+    /// Without a GL renderer: attach one opaque `color` (B, G, R, A bytes) shm buffer covering the
+    /// surface, so the session is still locked behind something. Call after `ensure_egl(None)`.
+    pub fn draw_solid(
+        &mut self,
+        shm: &smithay_client_toolkit::shm::Shm,
+        color: [u8; 4],
+    ) -> anyhow::Result<()> {
+        use smithay_client_toolkit::shm::slot::SlotPool;
+        let size = self.buffer_size();
+        let stride = size.w * 4;
+        let mut pool = SlotPool::new((stride * size.h) as usize, shm).context("shm pool")?;
+        let (buffer, canvas) = pool
+            .create_buffer(
+                size.w,
+                size.h,
+                stride,
+                wayland_client::protocol::wl_shm::Format::Argb8888,
+            )
+            .context("shm buffer")?;
+        for px in canvas.chunks_exact_mut(4) {
+            px.copy_from_slice(&color);
+        }
+        let surface = self.wl_surface();
+        buffer.attach_to(surface).context("attach")?;
+        surface.damage_buffer(0, 0, size.w, size.h);
+        surface.commit();
+        self.solid = Some((pool, buffer));
+        self.presented = true;
         Ok(())
     }
 

@@ -240,7 +240,7 @@ test ! -e /etc/pam.d/swaywardlock && test ! -L /etc/pam.d/swaywardlock &&
 
 Without it, PAM would fall back to `/etc/pam.d/other`, which refuses every password; swaywardlock
 checks that the file is there and readable (as libpam looks for it: the service name
-lowercased) and exits with an error before locking. The file is swaylock's and
+lowercased) and, if it is not, warns and still locks, with passwords refused (only SIGUSR1 unlocks). The file is swaylock's and
 hyprlock's: `auth include login`, so `/etc/pam.d/login` (util-linux) must exist too. `auth { pam service="login"; }` uses another service instead,
 and `auth { pam { off; }; }` disables PAM (SIGUSR1, a fingerprint or an explicitly enabled
 grace period can unlock then).

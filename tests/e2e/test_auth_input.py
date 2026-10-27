@@ -410,16 +410,22 @@ def test_pam_off(desktop):
     env.expect_unlocked("pam off")
 
 
-def test_pam_service(lock_env):
-    env = lock_env
+def test_pam_service(desktop):
+    env = desktop
     directory = env.path("pam.d")
     directory.mkdir()
     child_env = {"SWAYWARDLOCK_TEST_PAM_DIR": str(directory)}
     config = 'auth { pam service="swl-missing"; }\n'
     locker = env.locker(config, env=child_env, log=_log("pam-missing"))
-    assert locker.wait_exit() == 1, "pam service: missing file exits 1"
-    assert "session locked" not in locker.log_text(), "pam service: never locked without a PAM service file"
-    assert str(directory / "swl-missing") in locker.log_text(), "pam service: the error names the file"
+    locker.wait_locked("pam service: locks without the file")
+    assert str(directory / "swl-missing") in locker.log_text(), "pam service: the warning names the file"
+    assert "SIGUSR1" in locker.log_text(), "pam service: the warning says how to unlock"
+    env.wtype(PASSWORD)
+    env.wtype("-k", "Return")
+    time.sleep(.5)
+    assert locker.alive(), "pam service: Enter does not unlock without PAM"
+    _unlock(locker)
+    env.expect_unlocked("pam service: missing file")
     (directory / "swl-missing").touch()
     locker = _locker(env, "pam service: locks when the file exists", config, env=child_env)
     _unlock(locker)
