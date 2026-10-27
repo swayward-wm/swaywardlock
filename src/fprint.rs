@@ -4,7 +4,10 @@
 //! `VerifyStart("any")`, and turns `VerifyStatus` into events on a calloop channel. A non-match
 //! retries after `retry_delay` up to three times; retry statuses (finger not centred, swipe too
 //! short, ...) update the prompt and keep scanning. It stops scanning before sleep and starts
-//! again after (logind `PrepareForSleep`). If fprintd or a device is missing, it logs and exits;
+//! again after (logind `PrepareForSleep`). It does not start while logind is already preparing
+//! for sleep, and ignores a match unless it is scanning and awake. Device, logind and fprintd-gone
+//! signals go through one queue handled on one thread, so a match sent during sleep is never
+//! seen after the wake. If fprintd or a device is missing, it logs and exits;
 //! PAM keeps working.
 //!
 //! Only `verify-match` produces [`FprintEvent::Matched`], which the main loop turns into an
@@ -17,9 +20,9 @@
 //! process. If fprintd restarts (a new unique name), fingerprint unlock stops for this lock: the
 //! bus's `NameOwnerChanged` for the old unique name clears the prompt and sets `$FPRINTFAIL`.
 
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use calloop::channel::Sender;
 use zbus::blocking::{Connection, MessageIterator, Proxy};
@@ -123,6 +126,7 @@ fn preparing_for_sleep(conn: &Connection, logind: &OwnedUniqueName) -> bool {
             &("org.freedesktop.login1.Manager", "PreparingForSleep"),
         )
     })
+    .map_err(|err| tracing::warn!("fprint: cannot read PreparingForSleep: {err}"))
     .ok()
     .and_then(|v| bool::try_from(&v).ok())
     .unwrap_or(false)
@@ -168,7 +172,7 @@ fn run(o: &Options, events: &Sender<FprintEvent>, prompted: &mut bool) -> anyhow
         .sender(fprintd.clone())?
         .path(path.as_str())?
         .build();
-    let mut device_signals = MessageIterator::for_match_rule(rule, &conn, None)?;
+    let device_signals = MessageIterator::for_match_rule(rule, &conn, None)?;
     let logind = owner(&conn, "org.freedesktop.login1").ok();
     let sleep_signals = logind.clone().and_then(|logind| {
         let rule = MatchRule::builder()
@@ -200,13 +204,39 @@ fn run(o: &Options, events: &Sender<FprintEvent>, prompted: &mut bool) -> anyhow
         let _ = device.call_method("Release", &());
     });
 
-    // Shared by this loop and the sleep thread, so a retry never restarts scanning while the
-    // machine sleeps and nothing touches the device after the loop has released it.
-    let scan = Arc::new(Mutex::new(Scan::default()));
+    // One ordered queue for device, logind and fprintd-vanish signals, handled on this thread
+    // alone. Arrival order is what matters: a match fprintd sent while the machine slept must
+    // be seen before the wake, however long a retry delay was running.
+    let (tx, rx) = mpsc::channel::<Item>();
+    let forward = |name: &str, stream: MessageIterator, wrap: fn(zbus::Message) -> Item| {
+        let tx = tx.clone();
+        let spawned = thread::Builder::new().name(name.into()).spawn(move || {
+            for msg in stream {
+                let item = match msg {
+                    Ok(msg) => wrap(msg),
+                    Err(err) => Item::Failed(err.to_string()),
+                };
+                if tx.send(item).is_err() {
+                    return;
+                }
+            }
+        });
+        if let Err(err) = spawned {
+            tracing::warn!("fprint: cannot start {name} watcher: {err}");
+        }
+    };
+    forward("fprint-dev", device_signals, Item::Device);
+    forward("fprint-vanish", vanish_signals, Item::Vanish);
+    if let Some(sleep_signals) = sleep_signals {
+        forward("fprint-sleep", sleep_signals, Item::Sleep);
+    }
+    drop(tx);
+
+    let mut scan = Scan::default();
     let start = |scan: &mut Scan, prompt: &str| -> anyhow::Result<()> {
         // Asleep: waking restarts it. Scanning: a wake inside the retry delay already restarted
         // it, and fprintd refuses a second VerifyStart (AlreadyInUse).
-        if scan.asleep || scan.done || scan.scanning {
+        if scan.asleep || scan.scanning {
             return Ok(());
         }
         let () = device.call("VerifyStart", &("any",))?;
@@ -218,84 +248,72 @@ fn run(o: &Options, events: &Sender<FprintEvent>, prompted: &mut bool) -> anyhow
     if let Some(logind) = &logind {
         if preparing_for_sleep(&conn, logind) {
             tracing::info!("fprint: preparing for sleep; not scanning until wake");
-            scan.lock().unwrap().asleep = true;
+            scan.asleep = true;
         }
     }
-    start(&mut scan.lock().unwrap(), &o.ready_message)?;
+    start(&mut scan, &o.ready_message)?;
     *prompted = true;
 
-    // fprintd vanishing: the device loop below would wait for its signals forever, so tell the
-    // user from here. Nothing is released: the claim died with fprintd's connection.
-    {
-        let scan = scan.clone();
-        let events = events.clone();
-        let fprintd = fprintd.clone();
-        // A failed thread::spawn panics, and panic=abort would take the locker down after lock.
-        let spawned = thread::Builder::new()
-            .name("fprint-vanish".into())
-            .spawn(move || {
-                for msg in vanish_signals.flatten() {
-                    if !is_gone(&msg, &fprintd) {
-                        continue;
-                    }
-                    let mut s = scan.lock().unwrap();
-                    if !s.done {
-                        tracing::warn!("fprint: fprintd went away; fingerprint unlock stops");
-                        s.done = true;
-                        s.scanning = false;
+    let mut retries = 0;
+    // When a scan restarts after a non-match.
+    let mut restart_at: Option<Instant> = None;
+    loop {
+        let item = match restart_at {
+            None => match rx.recv() {
+                Ok(item) => item,
+                Err(_) => break,
+            },
+            Some(at) => match rx.recv_timeout(at.saturating_duration_since(Instant::now())) {
+                Ok(item) => item,
+                Err(RecvTimeoutError::Timeout) => {
+                    restart_at = None;
+                    if let Err(err) = start(&mut scan, "Could not match fingerprint. Try again.") {
+                        // Keep the claim and the loop: a wake from sleep tries again.
+                        tracing::warn!("fprint: could not restart scanning: {err:#}");
                         let _ = events.send(FprintEvent::Unavailable(UNAVAILABLE.into()));
                     }
-                    return;
+                    continue;
                 }
-            });
-        if let Err(err) = spawned {
-            tracing::warn!("fprint: cannot watch for fprintd going away: {err}");
-        }
-    }
-
-    // Sleep handling on its own thread: stop before sleep, restart after.
-    if let Some(sleep_signals) = sleep_signals {
-        let scan = scan.clone();
-        let device = device.clone();
-        let ready = o.ready_message.clone();
-        let events = events.clone();
-        let spawned = thread::Builder::new()
-            .name("fprint-sleep".into())
-            .spawn(move || {
-                let Some(logind) = logind else { return };
-                for msg in sleep_signals.flatten() {
-                    if !sent_by(&msg, &logind) {
-                        tracing::warn!("fprint: ignoring PrepareForSleep not from logind");
-                        continue;
+                Err(RecvTimeoutError::Disconnected) => break,
+            },
+        };
+        let msg = match item {
+            Item::Failed(err) => anyhow::bail!("{err}"),
+            Item::Vanish(msg) => {
+                if is_gone(&msg, &fprintd) {
+                    // The claim died with fprintd's connection.
+                    tracing::warn!("fprint: fprintd went away; fingerprint unlock stops");
+                    let _ = events.send(FprintEvent::Unavailable(UNAVAILABLE.into()));
+                    std::mem::forget(release);
+                    return Ok(());
+                }
+                continue;
+            }
+            Item::Sleep(msg) => {
+                if !logind.as_ref().is_some_and(|l| sent_by(&msg, l)) {
+                    tracing::warn!("fprint: ignoring PrepareForSleep not from logind");
+                    continue;
+                }
+                let Ok(starting) = msg.body().deserialize::<bool>() else {
+                    continue;
+                };
+                tracing::info!("fprint: PrepareForSleep({starting})");
+                scan.asleep = starting;
+                if starting {
+                    if scan.scanning {
+                        let _ = device.call_method("VerifyStop", &());
+                        scan.scanning = false;
                     }
-                    let Ok(starting) = msg.body().deserialize::<bool>() else {
-                        continue;
-                    };
-                    let mut s = scan.lock().unwrap();
-                    if s.done {
-                        return;
-                    }
-                    tracing::info!("fprint: PrepareForSleep({starting})");
-                    s.asleep = starting;
-                    if starting {
-                        if s.scanning {
-                            let _ = device.call_method("VerifyStop", &());
-                            s.scanning = false;
-                        }
-                    } else if !s.scanning && device.call_method("VerifyStart", &("any",)).is_ok() {
-                        s.scanning = true;
-                        let _ = events.send(FprintEvent::Prompt(ready.clone()));
+                } else {
+                    restart_at = None;
+                    if let Err(err) = start(&mut scan, &o.ready_message) {
+                        tracing::warn!("fprint: could not restart scanning after wake: {err:#}");
                     }
                 }
-            });
-        if let Err(err) = spawned {
-            tracing::warn!("fprint: cannot follow suspend and resume: {err}");
-        }
-    }
-
-    let mut retries = 0;
-    for msg in device_signals.by_ref() {
-        let msg = msg?;
+                continue;
+            }
+            Item::Device(msg) => msg,
+        };
         if !sent_by(&msg, &fprintd) {
             tracing::warn!(
                 "fprint: ignoring a device signal not from fprintd ({:?})",
@@ -313,12 +331,10 @@ fn run(o: &Options, events: &Sender<FprintEvent>, prompted: &mut bool) -> anyhow
                 let (result, _done): (String, bool) = msg.body().deserialize()?;
                 match classify(&result, retries) {
                     Next::Matched => {
-                        let s = scan.lock().unwrap();
-                        if s.asleep || s.done || !s.scanning {
+                        if scan.asleep || !scan.scanning {
                             tracing::warn!("fprint: ignoring a match while not scanning");
                             continue;
                         }
-                        drop(s);
                         let _ = events.send(FprintEvent::Matched);
                         break;
                     }
@@ -328,20 +344,11 @@ fn run(o: &Options, events: &Sender<FprintEvent>, prompted: &mut bool) -> anyhow
                     Next::Restart(why) => {
                         retries += 1;
                         let _ = events.send(FprintEvent::Failed(why.into()));
-                        {
-                            let mut s = scan.lock().unwrap();
-                            if s.scanning {
-                                let _ = device.call_method("VerifyStop", &());
-                                s.scanning = false;
-                            }
+                        if scan.scanning {
+                            let _ = device.call_method("VerifyStop", &());
+                            scan.scanning = false;
                         }
-                        thread::sleep(o.retry_delay);
-                        let mut s = scan.lock().unwrap();
-                        if let Err(err) = start(&mut s, "Could not match fingerprint. Try again.") {
-                            // Keep the claim and the loop: a wake from sleep tries again.
-                            tracing::warn!("fprint: could not restart scanning: {err:#}");
-                            let _ = events.send(FprintEvent::Unavailable(UNAVAILABLE.into()));
-                        }
+                        restart_at = Some(Instant::now() + o.retry_delay);
                     }
                     Next::Stop(why) => {
                         let _ = events.send(FprintEvent::Failed(why.into()));
@@ -367,20 +374,25 @@ fn run(o: &Options, events: &Sender<FprintEvent>, prompted: &mut bool) -> anyhow
             _ => {}
         }
     }
-    scan.lock().unwrap().done = true;
     drop(release);
     Ok(())
 }
 
-/// Scanning state shared with the sleep thread.
+/// A signal for the device loop, in arrival order.
+enum Item {
+    Device(zbus::Message),
+    Sleep(zbus::Message),
+    Vanish(zbus::Message),
+    Failed(String),
+}
+
+/// Scanning state.
 #[derive(Default)]
 struct Scan {
     /// A VerifyStart is outstanding.
     scanning: bool,
     /// Between PrepareForSleep(true) and (false).
     asleep: bool,
-    /// The main loop ended and released the device.
-    done: bool,
 }
 
 /// Run `f` on drop.

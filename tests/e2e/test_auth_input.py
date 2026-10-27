@@ -719,12 +719,21 @@ def test_fingerprint(desktop):
         assert "status verify-match" in log(), f"fingerprint: match not sent while asleep\n{log()}"
         assert locker.alive(), f"fingerprint: a match while asleep must not unlock\n{log()}"
         _unlock(locker)
+    race_config = OFF + 'auth { fingerprint { retry-delay-ms 1000; }; }\n'
+    with _fake(env, child_env, "race", "verify-no-match+race", "verify-match") as log:
+        locker = _locker(env, "fingerprint race", race_config, env=child_env)
+        assert poll(lambda: "WAKE" in log(), timeout=6), f"fingerprint: no wake\n{log()}"
+        time.sleep(1.5)
+        assert _ordered(log(), "status verify-no-match", "SLEEP", "status verify-match", "WAKE"), f"fingerprint: race order\n{log()}"
+        assert locker.alive(), f"fingerprint: a match queued while asleep must not unlock after wake\n{log()}"
+        _unlock(locker)
     with _fake(env, child_env, "preparing", "preparing", "verify-match") as log:
         locker = _locker(env, "fingerprint preparing", sleep_config, env=child_env)
         assert poll(lambda: "WAKE" in log(), timeout=6), f"fingerprint: no wake\n{log()}"
         before = log().split("WAKE", 1)[0]
         assert "VerifyStart" not in before, f"fingerprint: scan started while preparing for sleep\n{log()}"
         assert locker.wait_exit() == 0, f"fingerprint: scan starts on wake and a match unlocks\n{log()}"
+        assert log().split("WAKE", 1)[1].count("VerifyStart") == 1, f"fingerprint: one VerifyStart after wake\n{log()}"
 
     variables = env.path("fpvars")
     vanish = OFF + 'auth { fingerprint { ready-message "scan"; }; }\n' + (
