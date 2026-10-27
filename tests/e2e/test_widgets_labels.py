@@ -434,8 +434,9 @@ label {{ text "cmd[ HELLO"; font "Sans Bold 30"; color "#ffffff"; valign "bottom
         daemon = poll(lambda: _pid(pidfile), timeout=5)
         assert daemon and alive(daemon), f"widgets: -f -c {cfg}, no daemon pid\n{env.log_text(log)}"
         # Scope the discovered PID to this invocation before sending any signal.
-        environ = Path(f"/proc/{daemon}/environ").read_bytes()
-        assert f"XDG_RUNTIME_DIR={env.dir}\0".encode() in environ, "widgets: foreign daemon pid"
+        # /proc/<pid>/environ is unreadable (non-dumpable daemon); cmdline is not.
+        cmdline = Path(f"/proc/{daemon}/cmdline").read_bytes().split(b"\0")[:4]
+        assert cmdline == [os.fsencode(env.binary), b"-f", b"-c", cfg.encode()], f"widgets: foreign daemon pid {cmdline}"
         env.expect_colour(f"widgets: -f -c {cfg}, relative image path loads", RED, 160, 10)
         os.kill(daemon, signal.SIGUSR1)
         assert poll(lambda: not alive(daemon), timeout=5), f"widgets: -f -c {cfg}, daemon did not exit"

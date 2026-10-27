@@ -181,11 +181,10 @@ def test_unplug(lock_env):
         for n in range(first + 2, first - 1, -1):
             env.swaymsg("output", f"HEADLESS-{n}", "unplug")
         time.sleep(1.5)  # Multiple redraw ticks expose the swap-interval deadlock.
-        sc = Path(f"/proc/{lock.pid}/syscall").read_text().split()[0]
-        assert sc != "271", (
-            f"unplug {how}: main thread not stuck in ppoll (syscall {sc}); main thread stuck in ppoll"
-        )
-        # Success label preserves the measured syscall, not the historical 281.
+        # /proc/<pid>/syscall is unreadable (non-dumpable); the state and the unlock below
+        # (which needs a responsive main loop) detect the swap-interval deadlock.
+        state = Path(f"/proc/{lock.pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+        assert state in "SR", f"unplug {how}: main thread state {state}"
         if how == "password":
             lock.type(PASSWORD)
         else:
