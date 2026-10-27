@@ -109,6 +109,25 @@ fn owner(conn: &Connection, name: &str) -> anyhow::Result<OwnedUniqueName> {
     Ok(dbus.get_name_owner(name.try_into()?)?)
 }
 
+/// logind's `PreparingForSleep` property; false when it cannot be read.
+fn preparing_for_sleep(conn: &Connection, logind: &OwnedUniqueName) -> bool {
+    Proxy::new(
+        conn,
+        logind.clone(),
+        "/org/freedesktop/login1",
+        "org.freedesktop.DBus.Properties",
+    )
+    .and_then(|p| {
+        p.call::<_, _, OwnedValue>(
+            "Get",
+            &("org.freedesktop.login1.Manager", "PreparingForSleep"),
+        )
+    })
+    .ok()
+    .and_then(|v| bool::try_from(&v).ok())
+    .unwrap_or(false)
+}
+
 /// Whether `msg` was sent by `trusted` (a unique name).
 fn sent_by(msg: &zbus::Message, trusted: &OwnedUniqueName) -> bool {
     msg.header()
@@ -195,6 +214,13 @@ fn run(o: &Options, events: &Sender<FprintEvent>, prompted: &mut bool) -> anyhow
         let _ = events.send(FprintEvent::Prompt(prompt.to_owned()));
         Ok(())
     };
+    // Already preparing for sleep (logind property): wait for the wake signal instead.
+    if let Some(logind) = &logind {
+        if preparing_for_sleep(&conn, logind) {
+            tracing::info!("fprint: preparing for sleep; not scanning until wake");
+            scan.lock().unwrap().asleep = true;
+        }
+    }
     start(&mut scan.lock().unwrap(), &o.ready_message)?;
     *prompted = true;
 
@@ -287,6 +313,12 @@ fn run(o: &Options, events: &Sender<FprintEvent>, prompted: &mut bool) -> anyhow
                 let (result, _done): (String, bool) = msg.body().deserialize()?;
                 match classify(&result, retries) {
                     Next::Matched => {
+                        let s = scan.lock().unwrap();
+                        if s.asleep || s.done || !s.scanning {
+                            tracing::warn!("fprint: ignoring a match while not scanning");
+                            continue;
+                        }
+                        drop(s);
                         let _ = events.send(FprintEvent::Matched);
                         break;
                     }

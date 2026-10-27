@@ -712,6 +712,20 @@ def test_fingerprint(desktop):
         assert locker.wait_exit() == 0, "fingerprint: sleep inside the retry delay, then a match unlocks"
         assert "REFUSED" not in log(), f"fingerprint: one VerifyStart after a quick wake\n{log()}"
 
+    with _fake(env, child_env, "matchasleep", "sleepnow", "verify-match") as log:
+        locker = _locker(env, "fingerprint match asleep", sleep_config, env=child_env)
+        assert poll(lambda: "WAKE" in log(), timeout=6), f"fingerprint: no wake\n{log()}"
+        time.sleep(0.5)
+        assert "status verify-match" in log(), f"fingerprint: match not sent while asleep\n{log()}"
+        assert locker.alive(), f"fingerprint: a match while asleep must not unlock\n{log()}"
+        _unlock(locker)
+    with _fake(env, child_env, "preparing", "preparing", "verify-match") as log:
+        locker = _locker(env, "fingerprint preparing", sleep_config, env=child_env)
+        assert poll(lambda: "WAKE" in log(), timeout=6), f"fingerprint: no wake\n{log()}"
+        before = log().split("WAKE", 1)[0]
+        assert "VerifyStart" not in before, f"fingerprint: scan started while preparing for sleep\n{log()}"
+        assert locker.wait_exit() == 0, f"fingerprint: scan starts on wake and a match unlocks\n{log()}"
+
     variables = env.path("fpvars")
     vanish = OFF + 'auth { fingerprint { ready-message "scan"; }; }\n' + (
         f'label {{ text "cmd[update:200] echo \\"$FPRINTPROMPT|$FPRINTFAIL\\" > {variables}"; }}\n'
