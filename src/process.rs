@@ -114,6 +114,72 @@ pub fn notify_ready(fd: Option<i32>) -> std::io::Result<()> {
     result
 }
 
+/// Make every child this process forks start clean: an empty signal mask (the locker blocks
+/// SIGUSR1/2 for its signalfd, and the mask survives exec) and close-on-exec on every descriptor
+/// (Mesa and others leave theirs without). `cmd[]` children get the same in `reset_child`; this
+/// covers what libpam modules fork themselves (`pam_exec`, `unix_chkpwd`, fprintd helpers). It
+/// runs in the child after `fork`, so it only makes async-signal-safe calls. Idempotent.
+pub fn clean_forked_children() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    extern "C" fn child() {
+        // SAFETY: pthread_sigmask, close_range and fcntl are async-signal-safe; local data only.
+        unsafe {
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut set);
+            libc::pthread_sigmask(libc::SIG_SETMASK, &set, std::ptr::null_mut());
+            if libc::close_range(
+                3,
+                libc::c_uint::MAX,
+                libc::CLOSE_RANGE_CLOEXEC as libc::c_int,
+            ) != 0
+            {
+                for fd in 3..4096 {
+                    libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+                }
+            }
+        }
+    }
+    ONCE.call_once(|| {
+        // SAFETY: registers a plain `extern "C"` function.
+        unsafe { libc::pthread_atfork(None, None, Some(child)) };
+    });
+}
+
+/// The locker must run as the user and group it was started as. Refused: real and effective user
+/// ids differing, real and effective group ids differing (setuid, setgid and `sudo`-style launches
+/// with mixed ids), and a kernel-flagged secure exec (`AT_SECURE`, which also covers file
+/// capabilities). PAM, the user name and the config path would otherwise disagree about who is
+/// asked, and a privileged process would trust the invoker's environment.
+pub fn check_ids(ids: [u32; 4], secure: bool) -> anyhow::Result<()> {
+    let [uid, euid, gid, egid] = ids;
+    let why = if uid != euid {
+        format!("the real user id ({uid}) differs from the effective one ({euid})")
+    } else if gid != egid {
+        format!("the real group id ({gid}) differs from the effective one ({egid})")
+    } else if secure {
+        "the kernel flagged the start as privileged (setuid, setgid or file capabilities)".into()
+    } else {
+        return Ok(());
+    };
+    anyhow::bail!("refusing to run: {why}; swaywardlock must not be installed setuid or setgid")
+}
+
+/// The ids and the secure-exec flag of this process, for [`check_ids`].
+pub fn current_ids() -> ([u32; 4], bool) {
+    // SAFETY: id getters cannot fail; getauxval only reads the auxiliary vector.
+    unsafe {
+        (
+            [
+                libc::getuid(),
+                libc::geteuid(),
+                libc::getgid(),
+                libc::getegid(),
+            ],
+            libc::getauxval(libc::AT_SECURE) != 0,
+        )
+    }
+}
+
 /// At least this many descriptors must be available, or the locker refuses to lock. A locked
 /// session measured about 30 (Wayland, EGL/Mesa, eventfds, timers, PAM, `cmd[]` pipes); with
 /// 16 or 17 it locked and then crashed or failed, leaving a session nobody could unlock.
@@ -186,6 +252,15 @@ mod tests {
         assert_eq!(unsafe { libc::read(fds[0], buf.as_mut_ptr().cast(), 1) }, 0);
         // SAFETY: we own the read end.
         unsafe { libc::close(fds[0]) };
+    }
+
+    #[test]
+    fn mixed_ids_are_refused() {
+        assert!(check_ids([1000, 1000, 100, 100], false).is_ok());
+        assert!(check_ids([1000, 0, 100, 100], false).is_err());
+        assert!(check_ids([0, 1000, 100, 100], false).is_err());
+        assert!(check_ids([1000, 1000, 100, 0], false).is_err());
+        assert!(check_ids([1000, 1000, 100, 100], true).is_err());
     }
 
     #[test]

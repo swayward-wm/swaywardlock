@@ -98,8 +98,8 @@ struct Cli {
     #[arg(long)]
     no_fade_in: bool,
 
-    /// Seconds after locking during which any key, pointer button or motion unlocks without a
-    /// password (hyprlock's --grace).
+    /// Seconds after locking during which any key, or pointer motion of more than 5 px from where
+    /// it entered, unlocks without a password (hyprlock's --grace).
     #[arg(short, long, value_name = "SECONDS", default_value_t = 0)]
     grace: u64,
 
@@ -226,6 +226,11 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     init_logging(&cli);
+    let (ids, secure) = process::current_ids();
+    if let Err(err) = process::check_ids(ids, secure) {
+        tracing::error!("{err:#}");
+        return ExitCode::from(EXIT_NEVER_LOCKED);
+    }
     // Before anything opens a descriptor that could reuse the number, and before cmd[] children
     // exist (they must not inherit it).
     if let Some(fd) = cli.ready_fd {
@@ -892,12 +897,23 @@ impl App {
             return;
         }
         // Ctrl is per keyboard: holding it on one keyboard does not change keys from another.
-        let ctrl = self
-            .input_of(keyboard)
-            .is_some_and(|i| i.keys.modifiers.ctrl);
-        let outcome = self
-            .state
-            .on_key(event.keysym, event.utf8.as_deref(), ctrl, Instant::now());
+        let (ctrl, locked_ctrl) = self.input_of(keyboard).map_or((false, false), |i| {
+            (i.keys.ctrl, i.keys.modifiers.ctrl && !i.keys.ctrl)
+        });
+        // A locked Ctrl (sticky keys) is not a shortcut, but xkb still turns letters into control
+        // characters. Keep the composed text (dead keys, AltGr) when it is printable; only
+        // otherwise type the character the keysym stands for.
+        let printable = event
+            .utf8
+            .as_deref()
+            .filter(|t| !t.is_empty() && !t.chars().any(char::is_control));
+        let from_keysym = (locked_ctrl && printable.is_none())
+            .then(|| event.keysym.key_char().map(String::from))
+            .flatten();
+        let utf8 = printable
+            .or(from_keysym.as_deref())
+            .or(event.utf8.as_deref());
+        let outcome = self.state.on_key(event.keysym, utf8, ctrl, Instant::now());
         match outcome {
             KeyOutcome::None => return,
             KeyOutcome::Redraw => {}
@@ -1243,11 +1259,32 @@ impl OutputHandler for App {
     }
 }
 
+/// How far the pointer may stray from where it entered before grace ends, in surface pixels
+/// (hyprlock's `Seat.cpp`).
+const GRACE_POINTER_SLACK: f64 = 5.0;
+
+/// Whether `pos` is more than [`GRACE_POINTER_SLACK`] px (Euclidean) from `origin`.
+fn pointer_left_origin(origin: (f64, f64), pos: (f64, f64)) -> bool {
+    (pos.0 - origin.0).hypot(pos.1 - origin.1) > GRACE_POINTER_SLACK
+}
+
+/// xkb's Control is always real modifier 2.
+const MOD_CONTROL: u32 = 1 << 2;
+
+/// Whether Ctrl counts for the shortcuts: held or latched (sticky keys, one-shot), not locked.
+/// A locked Ctrl (StickyKeys' double-tap) would turn every typed letter into a shortcut, and the
+/// password could never be entered.
+fn ctrl_active(modifiers: Modifiers, raw: RawModifiers) -> bool {
+    modifiers.ctrl && (raw.depressed | raw.latched) & MOD_CONTROL != 0
+}
+
 /// What one keyboard says: its modifiers (Ctrl for the shortcuts, Caps/Num for the indicators),
 /// active xkb layout index and the keymap's layout names.
 #[derive(Default)]
 struct KeyboardState {
     modifiers: Modifiers,
+    /// Ctrl held or latched; see [`ctrl_active`].
+    ctrl: bool,
     layout: u32,
     layout_names: Vec<String>,
     /// Last key or subsequent modifiers event (`App::input_clock`), excluding snapshots.
@@ -1337,6 +1374,8 @@ struct SeatInput {
     pointer: Option<wl_pointer::WlPointer>,
     keys: KeyboardState,
     repeat: Repeater,
+    /// Surface position where the pointer entered, for the grace period's motion rule.
+    pointer_origin: Option<(f64, f64)>,
 }
 
 impl SeatInput {
@@ -1352,6 +1391,7 @@ impl SeatInput {
     }
 
     fn release_pointer(&mut self) {
+        self.pointer_origin = None;
         if let Some(pointer) = self.pointer.take() {
             if pointer.version() >= 3 {
                 pointer.release();
@@ -1371,6 +1411,7 @@ impl App {
                     pointer: None,
                     keys: KeyboardState::default(),
                     repeat: Repeater::default(),
+                    pointer_origin: None,
                 });
                 self.inputs.len() - 1
             }
@@ -1645,7 +1686,7 @@ impl KeyboardHandler for App {
         keyboard: &wl_keyboard::WlKeyboard,
         _: u32,
         modifiers: Modifiers,
-        _: RawModifiers,
+        raw: RawModifiers,
         layout: u32,
     ) {
         // wl_keyboard sends a modifiers snapshot after every enter, including refocus.
@@ -1656,6 +1697,7 @@ impl KeyboardHandler for App {
         self.touch(keyboard, speaks, |k| {
             k.initial_modifiers_pending = false;
             k.modifiers = modifiers;
+            k.ctrl = ctrl_active(modifiers, raw);
             k.layout = layout;
         });
     }
@@ -1701,16 +1743,31 @@ impl PointerHandler for App {
         pointer: &wl_pointer::WlPointer,
         events: &[PointerEvent],
     ) {
-        if self.in_grace()
-            && events.iter().any(|e| {
-                matches!(
-                    e.kind,
-                    PointerEventKind::Motion { .. } | PointerEventKind::Press { .. }
-                )
-            })
+        // Where the pointer entered a surface, per pointer: during grace only motion that gets
+        // away from it unlocks (hyprlock's rule), so a nudged desk or a click does not.
+        let in_grace = self.in_grace();
+        let mut wake = false;
+        if let Some(input) = self
+            .inputs
+            .iter_mut()
+            .find(|i| i.pointer.as_ref() == Some(pointer))
         {
+            for event in events {
+                match event.kind {
+                    PointerEventKind::Enter { .. } => input.pointer_origin = Some(event.position),
+                    PointerEventKind::Leave { .. } => input.pointer_origin = None,
+                    PointerEventKind::Motion { .. } => match input.pointer_origin {
+                        Some(origin) => wake |= pointer_left_origin(origin, event.position),
+                        // Never saw an enter: this is the first position we know.
+                        None => input.pointer_origin = Some(event.position),
+                    },
+                    _ => {}
+                }
+            }
+        }
+        if in_grace && wake {
             if !self.fades.unlock_when_done {
-                tracing::info!("pointer input during the grace period; unlocking");
+                tracing::info!("pointer motion during the grace period; unlocking");
                 self.request_unlock();
             }
             return;
@@ -1907,6 +1964,34 @@ mod tests {
         run(&mut event_loop, 100, &mut count);
         assert_eq!(count, 0);
         assert!(r.key.is_none());
+    }
+
+    #[test]
+    fn grace_pointer_slack_is_five_pixels_euclidean() {
+        let o = (100.0, 100.0);
+        assert!(!pointer_left_origin(o, o));
+        assert!(!pointer_left_origin(o, (105.0, 100.0)));
+        assert!(!pointer_left_origin(o, (103.0, 104.0))); // exactly 5
+        assert!(pointer_left_origin(o, (105.1, 100.0)));
+        assert!(pointer_left_origin(o, (104.0, 104.0))); // 5.66
+    }
+
+    /// A locked Ctrl (StickyKeys) is not Ctrl for the shortcuts; held or latched is.
+    #[test]
+    fn locked_ctrl_does_not_count() {
+        let ctrl = Modifiers {
+            ctrl: true,
+            ..Modifiers::default()
+        };
+        let raw = |depressed, latched, locked| RawModifiers {
+            depressed,
+            latched,
+            locked,
+        };
+        assert!(ctrl_active(ctrl, raw(4, 0, 0)));
+        assert!(ctrl_active(ctrl, raw(0, 4, 0)));
+        assert!(!ctrl_active(ctrl, raw(0, 0, 4)));
+        assert!(!ctrl_active(Modifiers::default(), raw(0, 0, 0)));
     }
 
     #[test]

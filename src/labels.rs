@@ -115,11 +115,14 @@ impl Labels {
         Ok(labels)
     }
 
-    /// Run label `i`'s command. Variables are substituted into the shell text first, like
-    /// hyprlock ("parsed before the command is ran"); the output is shown as is.
+    /// Run label `i`'s command. `$TIME` and `$ATTEMPTS` are substituted into the shell text
+    /// first, like hyprlock; the foreign values (`$USER`, `$FAIL`, `$PAMPROMPT`, ...) are
+    /// environment variables of the child, so they are data to the shell. The output is shown as
+    /// is.
     fn run(&self, i: usize, shell: &str, state: &LockState) {
-        let shell = textvars::substitute(shell, &self.vars(state));
-        self.runner.run(i, shell);
+        let vars = self.vars(state);
+        let shell = textvars::substitute_shell(shell, &vars);
+        self.runner.run(i, shell, textvars::shell_env(&vars));
     }
 
     /// SIGUSR2: re-run the commands marked `cmd[update:N:1]`.

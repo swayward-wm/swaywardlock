@@ -360,7 +360,7 @@ impl Reload {
         }
         self.resize_retry[item.index] = false;
         match &item.spec.cmd {
-            Some(cmd) => self.runner.run(item.index, cmd.clone()),
+            Some(cmd) => self.runner.run(item.index, cmd.clone(), Vec::new()),
             None => {
                 if let Some(path) = item.path.clone() {
                     self.consider(k, path);

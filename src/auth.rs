@@ -74,6 +74,7 @@ impl Authenticator {
         confdir: Option<PathBuf>,
         events: Sender<AuthEvent>,
     ) -> anyhow::Result<Self> {
+        crate::process::clean_forked_children();
         let (tx, rx) = mpsc::channel::<SecretBuf>();
         thread::Builder::new().name("auth".into()).spawn(move || {
             // Idle until the user submits: no transaction runs (and no module decides anything)
@@ -269,6 +270,9 @@ pub const TEST_PASSWORD: &str = "swaywardlock-test";
 const TEST_PASSWORD_2FA: &str = "swaywardlock-2fa";
 #[cfg(feature = "test-auth")]
 const TEST_OTP: &str = "123456";
+/// Typed with a dead key on the de layout (acute, e), to test composed text.
+#[cfg(feature = "test-auth")]
+const TEST_PASSWORD_DEAD: &str = "t\u{e9}st";
 
 #[cfg(feature = "test-auth")]
 fn transaction(
@@ -288,7 +292,7 @@ fn transaction(
         std::thread::sleep(std::time::Duration::from_millis(ms));
     }
     match secret.as_str() {
-        TEST_PASSWORD => Ok(()),
+        TEST_PASSWORD | TEST_PASSWORD_DEAD => Ok(()),
         TEST_PASSWORD_2FA => match conv.ask("OTP: ") {
             Some(code) if code.as_str() == TEST_OTP => Ok(()),
             _ => wrong(),
@@ -679,6 +683,42 @@ mod tests {
         fn log(&self, name: &str) -> String {
             std::fs::read_to_string(self.path(name)).unwrap_or_default()
         }
+    }
+
+    /// Children that PAM modules start (pam_exec, unix_chkpwd, fprintd helpers) run with an empty
+    /// signal mask and without the locker's descriptors: the locker blocks SIGUSR1/2 for its
+    /// signalfd and Mesa leaves descriptors without close-on-exec.
+    #[test]
+    fn pam_children_get_a_clean_signal_mask_and_no_stray_descriptors() {
+        // The auth thread inherits this thread's mask, as it does the locker's.
+        // SAFETY: plain signal-mask and descriptor calls; dup() never sets close-on-exec.
+        let (stray, old) = unsafe {
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            let mut old: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, libc::SIGUSR1);
+            libc::sigaddset(&mut set, libc::SIGUSR2);
+            libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut old);
+            (libc::dup(2), old)
+        };
+        let p = pam("auth required @/probe.so mode=sh script=@/script.sh\n");
+        // SAFETY: restore this thread's mask.
+        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut()) };
+        std::fs::write(
+            p.path("script.sh"),
+            format!(
+                "grep SigBlk /proc/self/status > '{0}/out'\ntest -e /proc/$$/fd/{stray} && echo leaked >> '{0}/out'\n",
+                p.dir.path().display()
+            ),
+        )
+        .unwrap();
+        p.auth.submit(secret("x"));
+        let _ = p.result();
+        // SAFETY: our own descriptor.
+        unsafe { libc::close(stray) };
+        let out = p.log("out");
+        assert!(out.contains("SigBlk:\t0000000000000000"), "{out:?}");
+        assert!(!out.contains("leaked"), "fd {stray} reached the PAM child");
     }
 
     /// The account line only matters to builds that run the account phase (they did once).

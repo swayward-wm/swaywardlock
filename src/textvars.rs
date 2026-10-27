@@ -89,13 +89,73 @@ pub struct Vars<'a> {
 
 /// Substitute every `$VARIABLE` in `text`.
 pub fn substitute(text: &str, v: &Vars<'_>) -> String {
-    let (h, m) = v.time;
-    let time24 = format!("{h:02}:{m:02}");
+    substitute_with(text, v)
+}
+
+/// Substitute for a `cmd[]` shell line. Only the values that cannot carry foreign text are
+/// spliced in (`$TIME`, `$TIME12`, `$ATTEMPTS`, and `$LAYOUT[...]` entries from the config).
+/// `$USER`, `$DESC`, `$FAIL`, `$PAMPROMPT`, `$PAMFAIL`, `$LAYOUT` and the fprint strings stay as
+/// they are: the shell expands them from the environment ([`shell_env`]), so their contents are
+/// data in every quoting context, never code.
+pub fn substitute_shell(text: &str, v: &Vars<'_>) -> String {
+    let (time24, time12) = times(v.time);
+    let out = text
+        .replace("<br/>", "\n")
+        .replace("$TIME12", &time12)
+        .replace("$TIME", &time24);
+    let out = replace_attempts(&out, v.attempts);
+    replace_with_arg(&out, "$LAYOUT", |arg| match arg {
+        None => "$LAYOUT".to_owned(),
+        Some(list) => match list.split(',').nth(v.layout_index as usize) {
+            Some("") | None => "$LAYOUT".to_owned(),
+            Some("!") => String::new(),
+            Some(text) => text.to_owned(),
+        },
+    })
+}
+
+/// The environment of a `cmd[]` child: the foreign values, under the names the labels use.
+/// NUL bytes are dropped (an environment string cannot hold one); values are cut to
+/// `ENV_VALUE_MAX` bytes so a huge one cannot make the spawn fail with E2BIG.
+const ENV_VALUE_MAX: usize = 1024;
+
+pub fn shell_env(v: &Vars<'_>) -> Vec<(&'static str, String)> {
+    [
+        ("USER", v.user),
+        ("DESC", v.desc),
+        ("FAIL", v.fail),
+        ("PAMPROMPT", v.pam_prompt),
+        ("PAMFAIL", v.pam_fail),
+        ("LAYOUT", v.layout_name),
+        ("FPRINTPROMPT", v.fprint_prompt),
+        ("FPRINTFAIL", v.fprint_fail),
+    ]
+    .into_iter()
+    .map(|(k, val)| {
+        let mut val = val.replace('\0', "");
+        let mut end = val.len().min(ENV_VALUE_MAX);
+        while !val.is_char_boundary(end) {
+            end -= 1;
+        }
+        val.truncate(end);
+        (k, val)
+    })
+    .collect()
+}
+
+fn times((h, m): (u32, u32)) -> (String, String) {
     let h12 = match h % 12 {
         0 => 12,
         x => x,
     };
-    let time12 = format!("{h12:02}:{m:02} {}", if h < 12 { "AM" } else { "PM" });
+    (
+        format!("{h:02}:{m:02}"),
+        format!("{h12:02}:{m:02} {}", if h < 12 { "AM" } else { "PM" }),
+    )
+}
+
+fn substitute_with(text: &str, v: &Vars<'_>) -> String {
+    let (time24, time12) = times(v.time);
 
     // Order matters where one name prefixes another ($TIME12 before $TIME, $FAIL last among
     // the *FAIL names is fine since those start with PAM/FPRINT).
@@ -105,7 +165,8 @@ pub fn substitute(text: &str, v: &Vars<'_>) -> String {
         .replace("$TIME", &time24);
     out = replace_attempts(&out, v.attempts);
     out = replace_layout(&out, v.layout_index, v.layout_name);
-    for (name, value) in [
+    // One pass: a value is never scanned again, so a prompt that reads "$DESC" stays text.
+    let names = [
         ("$PAMPROMPT", v.pam_prompt),
         ("$PAMFAIL", v.pam_fail),
         ("$FPRINTPROMPT", v.fprint_prompt),
@@ -113,10 +174,25 @@ pub fn substitute(text: &str, v: &Vars<'_>) -> String {
         ("$FAIL", v.fail),
         ("$USER", v.user),
         ("$DESC", v.desc),
-    ] {
-        out = out.replace(name, value);
+    ];
+    let mut result = String::with_capacity(out.len());
+    let mut rest = out.as_str();
+    while let Some(i) = rest.find('$') {
+        result.push_str(&rest[..i]);
+        rest = &rest[i..];
+        match names.iter().find(|(name, _)| rest.starts_with(name)) {
+            Some((name, value)) => {
+                result.push_str(value);
+                rest = &rest[name.len()..];
+            }
+            None => {
+                result.push('$');
+                rest = &rest[1..];
+            }
+        }
     }
-    out
+    result.push_str(rest);
+    result
 }
 
 /// `$ATTEMPTS` is the count; `$ATTEMPTS[text]` shows `text` instead of 0.
@@ -256,6 +332,55 @@ mod tests {
             "<i>Authentication failure</i>"
         );
         assert_eq!(substitute("$PAMPROMPT", &vars()), "Password: ");
+    }
+
+    #[test]
+    fn shell_lines_keep_foreign_names_for_the_shell() {
+        let v = Vars {
+            attempts: 2,
+            ..vars()
+        };
+        assert_eq!(
+            substitute_shell(
+                "echo \"$USER\" '$FAIL' $PAMPROMPT $TIME $ATTEMPTS $LAYOUT",
+                &v
+            ),
+            "echo \"$USER\" '$FAIL' $PAMPROMPT 09:05 2 $LAYOUT"
+        );
+        assert_eq!(
+            substitute_shell("$LAYOUT[us,de] $LAYOUT[x,]", &v),
+            "de $LAYOUT"
+        );
+        assert_eq!(substitute_shell("$LAYOUT[a,!]", &v), "");
+    }
+
+    #[test]
+    fn shell_env_carries_the_values_verbatim() {
+        let hostile = Vars {
+            user: "a'$(id)`id`\"b\n",
+            fail: "$DESC\0x",
+            layout_name: "$(x)",
+            ..vars()
+        };
+        let env: std::collections::HashMap<_, _> = shell_env(&hostile).into_iter().collect();
+        assert_eq!(env["USER"], "a'$(id)`id`\"b\n");
+        assert_eq!(env["FAIL"], "$DESC".to_owned() + "x");
+        assert_eq!(env["LAYOUT"], "$(x)");
+        assert_eq!(
+            substitute("$USER $FAIL", &hostile),
+            "a'$(id)`id`\"b\n $DESCx".replace("DESCx", "DESC\0x")
+        );
+    }
+
+    #[test]
+    fn shell_env_caps_long_values() {
+        let long = "é".repeat(2000);
+        let hostile = Vars {
+            layout_name: &long,
+            ..vars()
+        };
+        let env: std::collections::HashMap<_, _> = shell_env(&hostile).into_iter().collect();
+        assert!(env["LAYOUT"].len() <= ENV_VALUE_MAX && env["LAYOUT"].starts_with('é'));
     }
 
     /// hyprlock turns `<br/>` into a newline before Pango sees it.

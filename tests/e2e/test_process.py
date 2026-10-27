@@ -465,3 +465,20 @@ def test_abort_leaves_no_core(lock_env):
     # systemd-coredump records asynchronously; give it time to show up if it were going to.
     assert not poll(lambda: _coredumps(proc.pid), timeout=3), f"core dumped:\n{_coredumps(proc.pid)}"
     assert not list(Path(env.dir).glob("core*")), "core file written"
+
+
+# The faked ids must differ from the real ones, whoever runs the suite (CI runs it as root).
+@pytest.mark.parametrize("fake", [{"FAKE_EUID": str(os.getuid() + 1)}, {"FAKE_EGID": str(os.getgid() + 1)},
+                                  {"FAKE_SECURE": "1"}],
+                         ids=["euid", "egid", "at-secure"])
+def test_refuses_privileged_start(lock_env, fake):
+    """A setuid, setgid or capability-style launch exits 1 before it locks, with a clear message."""
+    env = lock_env
+    shim = env.path("euid-shim.so")
+    result = env.run(["cc", "-shared", "-fPIC", "-o", shim, env.contrib("euid-shim.c"), "-ldl"], check=False)
+    assert result.returncode == 0, f"cannot build the euid shim\n{result.stderr.decode()}"
+    lock = env.locker(env={"LD_PRELOAD": str(shim), **fake}, log="mixed-ids.log")
+    _exit(lock, 1, "privileged start: exit code")
+    log = lock.log_text()
+    assert "refusing to run" in log and "setuid" in log, f"privileged start: unclear message\n{log}"
+    assert "session locked" not in log, "privileged start: refused before locking"
