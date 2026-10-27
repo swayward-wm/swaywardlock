@@ -794,3 +794,26 @@ def test_fingerprint_matches_then_wake(desktop, i):
 def test_fingerprint_sleep_then_match(desktop, i):
     """PrepareForSleep(true) then a match back to back while scanning: the match is asleep."""
     _burst_race(desktop, i, "sleepmatch", "sleepmatch")
+
+
+@pytest.mark.parametrize("i", range(100))
+def test_fingerprint_forged_wake_stays_locked(desktop, i):
+    """Forged PrepareForSleep(false)/NameOwnerChanged (broadcast and unicast) change nothing:
+    a match sent while really asleep is ignored."""
+    _burst_race(desktop, i, "forgewake", "forgewake")
+
+
+@pytest.mark.parametrize("i", range(50))
+def test_fingerprint_signal_flood_does_not_stall(desktop, i):
+    """Hundreds of signals addressed to the locker while it is in VerifyStop must not stall the
+    bus reader: after the wake, a real match still unlocks."""
+    busdir = desktop.path("bus")
+    busdir.mkdir()
+    address = f"unix:path={busdir / 'sock'}"
+    desktop.spawn(["dbus-daemon", "--session", "--nofork", f"--address={address}"], log=_log("dbus"))
+    assert poll(lambda: (busdir / "sock").is_socket()), "fingerprint: bus not ready"
+    child_env = {"DBUS_SYSTEM_BUS_ADDRESS": address}
+    config = OFF + 'auth { fingerprint { retry-delay-ms 1000; }; }\n'
+    with _fake(desktop, child_env, "flood", "flood", "verify-match") as log:
+        locker = _locker(desktop, f"fingerprint flood {i}", config, env=child_env)
+        assert locker.wait_exit(10) == 0, f"fingerprint: flood stalled the locker\n{log()}"
