@@ -184,6 +184,69 @@ def test_modifiers(lock_env):
         assert locker.wait_exit() == 0, "modifiers: Ctrl+U and Ctrl+BackSpace clear, Ctrl+J submits"
 
 
+def _keyboard_entered(locker):
+    return poll(lambda: bool(re.search(r"wl_keyboard#\d+\.enter\(", locker.log_text())))
+
+
+def test_locked_ctrl_is_not_ctrl(lock_env):
+    """StickyKeys' locked Ctrl is not Ctrl: the password can still be typed and submitted with
+    Return, and j/u are letters, not Ctrl+J/Ctrl+U. A latched Ctrl still is Ctrl."""
+    env = lock_env
+    debug = {"WAYLAND_DEBUG": "1"}
+    with _keyboard(env, "vk-lockedctrl") as send:
+        locker = _locker(env, "locked ctrl typing", OFF, env=debug)
+        assert _keyboard_entered(locker), "locked ctrl: keyboard never entered"
+        send("mods 0 0 4", f"type {PASSWORD}", "key Return")
+        assert locker.wait_exit() == 0, f"locked Ctrl: the password cannot be typed\n{locker.log_text()}"
+
+        locker = _locker(env, "locked ctrl letters", OFF, env=debug)
+        assert _keyboard_entered(locker), "locked ctrl: keyboard never entered"
+        send(f"type {PASSWORD}", "mods 0 0 4", "key j", "key u")
+        send.wait()
+        assert locker.alive(), "locked Ctrl: j counted as Ctrl+J and submitted the password"
+        # j and u were typed as letters (password intact, plus "ju"): two Backspaces remove them.
+        send("key BackSpace", "key BackSpace", "mods 0 0 0", "key Return")
+        assert locker.wait_exit() == 0, f"locked Ctrl: Ctrl+U cleared the password\n{locker.log_text()}"
+
+        locker = _locker(env, "latched ctrl", OFF, env=debug)
+        assert _keyboard_entered(locker), "latched ctrl: keyboard never entered"
+        send(f"type {PASSWORD}", "mods 0 4 0", "key j")
+        assert locker.wait_exit() == 0, "latched Ctrl: Ctrl+J still submits"
+
+
+def test_locked_ctrl_keeps_composed_text(lock_env):
+    """With Ctrl locked, a dead-key sequence still types the composed character (de: acute, e)."""
+    env = lock_env
+    with _keyboard(env, "vk-deadkey", "--layout", "de") as send:
+        locker = _locker(env, "locked ctrl dead key", OFF, env={"WAYLAND_DEBUG": "1"})
+        assert _keyboard_entered(locker), "dead key: keyboard never entered"
+        send("mods 0 0 4", "type t", "key acute", "type e", "type st", "key Return")
+        assert locker.wait_exit() == 0, f"locked Ctrl: composed text was lost\n{locker.log_text()}"
+
+
+def test_layout_name_is_data_in_cmd_labels(lock_env):
+    """$LAYOUT comes from the keymap (foreign text): in cmd[] it is an environment variable the
+    shell expands as data, bare, double-quoted and single-quoted (where it stays literal)."""
+    env = lock_env
+    pwned = env.path("pwned")
+    out = env.path("layout-out")
+    payload = f"$(touch {pwned})`touch {pwned}`';touch {pwned} #"
+    config = OFF + (
+        'label { text "cmd[update:100] printf \'%s|\' \\"$LAYOUT\\" \\"Hi $LAYOUT\\" \'$LAYOUT\' '
+        f'>> {out}; : $LAYOUT"; }}\n'
+    )
+    with _keyboard(env, "vk-layout-name", "--group-name", payload) as send:
+        locker = _locker(env, "layout injection", config)
+        send("sleep 300")
+        send.wait()
+        # The first runs can precede the keymap (empty name); wait for a run that has it.
+        want = f"{payload}|Hi {payload}|$LAYOUT|"
+        assert poll(lambda: out.exists() and want in out.read_text()), f"layout: no data-only run: {out.read_text()!r}"
+        time.sleep(0.5)
+        assert not pwned.exists(), "layout: the keymap's group name ran as a command"
+        _unlock(locker)
+
+
 def test_unlocked_app_rejects_late_auth_and_stops_ticker(desktop):
     env = desktop
     locker = _locker(env, "unlocked App callbacks", OFF,
@@ -511,11 +574,17 @@ def _cursor_pixels(env):
 def test_pointer(desktop):
     env = desktop
     config = 'background { color "#204060"; }\n' + OFF
-    for how in (("move", "5", "5"), ("click",)):
-        locker = _locker(env, "pointer grace", config, args=("--grace", "30"))
-        _tool(env, "vptr", "move", "5", "5", "sleep", "300", *how)
-        assert locker.wait_exit() == 0, f"pointer: {' '.join(how)} within the grace period unlocks"
-        env.expect_unlocked(f"pointer {' '.join(how)}")
+    # Grace: the pointer entering, jitter of up to 5 px and clicks do not unlock; more than 5 px
+    # from the entry point does (hyprlock's rule).
+    locker = _locker(env, "pointer grace", config, args=("--grace", "30"))
+    _tool(env, "vptr", "move", "1", "0", "sleep", "300", "move", "3", "0", "move", "0", "4", "click", "sleep", "300")
+    assert locker.alive(), "pointer: entering, jitter within 5 px and a click do not unlock during grace"
+    _tool(env, "vptr", "move", "-2", "0", "sleep", "300", "move", "-9", "0", "sleep", "300")
+    assert locker.wait_exit() == 0, "pointer: motion of more than 5 px within the grace period unlocks"
+    env.expect_unlocked("pointer grace")
+    locker = _locker(env, "pointer grace key", config, args=("--grace", "30"))
+    env.wtype("x")
+    assert locker.wait_exit() == 0, "pointer: a key within the grace period still unlocks"
     locker = _locker(env, "pointer late", config, args=("--grace", "1"))
     time.sleep(1.5)
     _tool(env, "vptr", "move", "5", "5", "click")

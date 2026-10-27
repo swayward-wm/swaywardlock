@@ -45,8 +45,8 @@ holds the lock.
 	Skip the fade-in animation.
 
 *-g*, *--grace* _SECONDS_
-	Within this many seconds after the session is locked, any key, pointer button or pointer
-	motion unlocks without a password. The default is 0 (no grace). Time spent suspended
+	Within this many seconds after the session is locked, any key, or pointer motion of more
+	than 5 px from where the pointer entered, unlocks without a password; a click does not. The default is 0 (no grace). Time spent suspended
 	counts. If the clock cannot be read there is no grace.
 
 *--immediate-render*
@@ -100,6 +100,8 @@ holds the lock.
 
 *Escape*, *Ctrl+U*, *Ctrl+C*, *Ctrl+A*, *Ctrl+Backspace*, *Ctrl+Delete*
 	Clear the password (Ctrl+C and Ctrl+U are swaylock's, Ctrl+A is hyprlock's).
+
+Ctrl counts when held or latched, not when locked (StickyKeys).
 
 Any other key with text appends it. Keys typed while a password is being checked are dropped.
 
@@ -181,7 +183,14 @@ positive Y is up), *halign*, *valign*, *z-index* and, on *image*, *shape* and *i
 	*text* (with substitutions such as _$TIME_, _$USER_, _$FAIL_, _$ATTEMPTS_ and
 	_cmd[update:MS] COMMAND_), *font*, *color*, *align*, and hyprlock's text shadow
 	*text-shadow { passes N; size PX; color "C"; boost N; offset x=PX y=PX; }* (passes 0 to 4,
-	required, 0 is off; size 0 to 20).
+	required, 0 is off; size 0 to 20). In a *cmd[]* line, _$TIME_, _$TIME12_ and _$ATTEMPTS_
+	are substituted into the shell text. The values that can carry foreign text (_$USER_, _$DESC_,
+	_$FAIL_, _$PAMPROMPT_, _$PAMFAIL_, _$LAYOUT_, _$FPRINTPROMPT_, _$FPRINTFAIL_) are environment
+	variables of the command, which the shell expands itself: _echo "$USER"_ works as in
+	hyprlock, and a value such as _$(reboot)_ is data in any quoting, never code. Inside single
+	quotes they stay literal, as in any shell. _$LAYOUT[a,b]_ is substituted with the configured
+	text. Values are cut to 1024 bytes. In bash, a variable inside _[[ ... -eq ... ]]_ or
+	_$(( ))_ is evaluated as arithmetic and can run code: quote it or compare it as a string.
 
 *image*
 	*path*, *size*, *corner-radius*, *border { width N; color "C"; }*.
@@ -233,7 +242,7 @@ _specs/2026-10-19-swaywardlock.md_ under /usr/share/doc/swaywardlock (see *SEE A
 
 *1*
 	Never locked: no Wayland display to connect to, no ext-session-lock-v1 in the compositor, a
-	*--ready-fd* that is not open, or a *--grace* too large for the clock. A bad config, a
+	*--ready-fd* that is not open, a *--grace* too large for the clock, or started setuid, setgid or with file capabilities (real and effective user or group ids differ, or *AT_SECURE* is set). A bad config, a
 	missing PAM service file, a renderer failure or a low open-file limit do not stop the lock:
 	swaywardlock warns and locks with the defaults, a solid colour, or without PAM (SIGUSR1
 	only). *validate* and *--preview* still exit 1 on a bad config.

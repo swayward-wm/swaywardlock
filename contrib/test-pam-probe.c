@@ -20,12 +20,16 @@
  *                     TEXT_INFO "Place your finger on the fingerprint reader", then waits up to
  *                     5 s for <f> (a touch); a touch is consumed (<f> removed) and succeeds,
  *                     no touch returns PAM_AUTHINFO_UNAVAIL
+ *   auth mode=sh script=<f>  runs `sh <f>` as a child process (fork + exec, as pam_exec and
+ *                     unix_chkpwd are run), waits for it, then succeeds: a test script can look at
+ *                     the signal mask and descriptors it inherited
  *   setcred           appends "setcred <flags>" to out, so a test can see it was called
  */
 #include <security/pam_modules.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 static const char *arg(int argc, const char **argv, const char *key) {
@@ -111,6 +115,16 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *h, int flags, int argc, const c
             usleep(10000);
         }
         return PAM_AUTHINFO_UNAVAIL;
+    }
+    if (!strcmp(mode, "sh")) {
+        pid_t pid = fork();
+        if (pid == 0) {
+            execl("/bin/sh", "sh", arg(argc, argv, "script"), (char *)NULL);
+            _exit(127);
+        }
+        int status = 0;
+        if (pid < 0 || waitpid(pid, &status, 0) < 0) return PAM_AUTH_ERR;
+        return PAM_SUCCESS;
     }
     if (!strcmp(mode, "echoon"))
         return ask(h, PAM_PROMPT_ECHO_ON, "Token code: ", "right-pw") ? PAM_SUCCESS : PAM_AUTH_ERR;

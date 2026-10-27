@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """A virtual keyboard for tests, on a chosen seat and with a chosen xkb layout list.
 
-    vkbd [--seat NAME] [--layout us,de] COMMAND...
+    vkbd [--seat NAME] [--layout us,de] [--group-name TEXT] COMMAND...
 
 wtype cannot do either: it always uses the default seat and uploads a one-layout keymap of its
 own. Commands run in order; the keyboard exists until the last one has run:
@@ -38,6 +38,7 @@ KEYS = {
     "Escape": 1,
     "Control_L": 29,
     "Caps_Lock": 58,
+    "acute": 13,
 }
 ROWS = {"qwertyuiop": 16, "asdfghjkl": 30, "zxcvbnm": 44, "1234567890": 2}
 
@@ -130,13 +131,15 @@ def wl_string(s):
 
 def main():
     args = sys.argv[1:]
-    seat_name, layout = None, "us"
+    seat_name, layout, group_name = None, "us", None
     while args and args[0].startswith("--"):
         opt, val, args = args[0], args[1], args[2:]
         if opt == "--seat":
             seat_name = val
         elif opt == "--layout":
             layout = val
+        elif opt == "--group-name":
+            group_name = val
         else:
             sys.exit(f"vkbd: unknown option {opt}")
 
@@ -167,6 +170,8 @@ def main():
     kb = wl.new_id()
     wl.send(manager, 0, struct.pack("<II", seat, kb))
     text = keymap_text(layout)
+    if group_name is not None:  # the first layout's name, as a hostile keymap would set it
+        text = text.replace(b'name[1]="English (US)"', b'name[1]="' + group_name.encode() + b'"', 1)
     fd = os.memfd_create("vkbd-keymap")
     os.write(fd, text)
     wl.send(kb, 0, struct.pack("<II", 1, len(text)), [fd])

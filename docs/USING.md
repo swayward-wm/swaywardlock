@@ -11,7 +11,8 @@ are relative to this document. Packages install this guide at
 Typing follows hyprlock where the two lockers differ: only Backspace and Delete repeat, and
 keys typed while a password is being checked are dropped. swaylock's control keys are kept:
 Ctrl+J, Ctrl+M and Ctrl+D submit, Ctrl+C and Ctrl+U clear (as do Escape, Ctrl+A and
-Ctrl+Backspace). The man page's KEYS section and the spec's Input section have the details.
+Ctrl+Backspace). Ctrl counts when held or latched, not when locked (an accessibility
+StickyKeys lock would otherwise turn typed letters into shortcuts). The man page's KEYS section and the spec's Input section have the details.
 
 To try it without locking your own session, `../contrib/try-lock` starts a nested sway in a window
 and locks only that (password `swaywardlock-test`, or `--real-pam`; `--preview` for layout work;
@@ -243,7 +244,8 @@ checks that the file is there and readable (as libpam looks for it: the service 
 lowercased) and, if it is not, warns and still locks, with passwords refused (only SIGUSR1 unlocks). The file is swaylock's and
 hyprlock's: `auth include login`, so `/etc/pam.d/login` (util-linux) must exist too. `auth { pam service="login"; }` uses another service instead,
 and `auth { pam { off; }; }` disables PAM (SIGUSR1, a fingerprint or an explicitly enabled
-grace period can unlock then).
+grace period can unlock then). In the grace period (`--grace SECONDS`) a key press, or pointer motion
+of more than 5 px from where the pointer entered, unlocks; a click or smaller jitter does not.
 
 Like swaylock, swaywardlock starts PAM when you press Enter, so a stack with `pam_fprintd` first
 (Fedora's authselect `with-fingerprint`) reads the finger after Enter; `auth { fingerprint { }; }`

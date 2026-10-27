@@ -74,7 +74,7 @@ swaywardlock completions <SHELL>   # bash, zsh, fish, elvish or powershell
 | `-c, --config PATH` | both | Config path. Also `SWAYWARDLOCK_CONFIG`. Flag wins |
 | `-f, --daemonize` | swaylock | Fork into the background once locked |
 | `--ready-fd FD` | swaylock | Write `\n` to FD once locked, then close it. FD must be open at start, or exit 1 |
-| `-g, --grace SECONDS` | hyprlock | Any key, pointer button or motion unlocks within this window, without auth. Time asleep counts (`CLOCK_BOOTTIME`); if that clock cannot be read there is no grace |
+| `-g, --grace SECONDS` | hyprlock | Any key, or pointer motion of more than 5 px from where the pointer entered, unlocks within this window, without auth; a pointer button does not. Time asleep counts (`CLOCK_BOOTTIME`); if that clock cannot be read there is no grace |
 | `--no-fade-in` | hyprlock | Skip the fade-in animation |
 | `--immediate-render` | hyprlock | Lock without taking screenshots or decoding images; backgrounds and images fall back to their colour |
 | `--display NAME` | hyprlock | Wayland display to connect to |
@@ -106,7 +106,7 @@ Exit codes:
 | Code | When |
 |---|---|
 | 0 | Unlocked after auth, grace, or SIGUSR1 |
-| 1 | Never locked: missing `ext-session-lock-v1`, no Wayland connection, a `--ready-fd` that is not open, a `--grace` too large for the clock; `validate` and `--preview` also exit 1 on a bad config or failed GL. Everything else degrades and still locks (see below) |
+| 1 | Never locked: missing `ext-session-lock-v1`, no Wayland connection, a `--ready-fd` that is not open, a `--grace` too large for the clock, a start with real and effective user or group ids that differ or with `AT_SECURE` set (setuid, setgid, file capabilities: refused); `validate` and `--preview` also exit 1 on a bad config or failed GL. Everything else degrades and still locks (see below) |
 | 2 | The compositor sent `finished` (another locker holds the lock, or the lock was refused). swaylock uses the same code |
 | 3 | An error after `lock()` (the compositor died, a protocol error from the compositor, an event-loop error). The compositor keeps the session locked |
 
@@ -536,7 +536,7 @@ These apply to `label text`, `input-field` `placeholder-text`,
 | `$FPRINTPROMPT` / `$FPRINTFAIL` | fprintd prompt / failure |
 
 `cmd[update:MS] <shell>` (hyprlock's syntax, kept unchanged so users can
-copy it): substitute the tokens above into `<shell>`, run it with `sh -c`
+copy it): substitute `$TIME`, `$TIME12`, `$ATTEMPTS` and `$LAYOUT[...]` into `<shell>` as text; the foreign-text tokens (`$USER`, `$DESC`, `$FAIL`, `$PAMPROMPT`, `$PAMFAIL`, `$LAYOUT`, `$FPRINTPROMPT`, `$FPRINTFAIL`) are not substituted but exported as environment variables of the child under the same names, which the shell expands itself: `echo "$USER"` behaves as in hyprlock, and a value such as `$(cmd)` is data in a bare, double-quoted or single-quoted (literal) context, never code (NUL bytes are dropped and each value is cut to 1024 bytes). Inside bash `[[ ... -eq ... ]]` or `$(( ))` a variable is evaluated as arithmetic and can run code: quote it or compare it as a string. Run the command with `sh -c`
 every MS milliseconds and show stdout, trimmed, as is (NUL characters are dropped, as in every
 text Pango draws). `cmd[update:MS:1]` also refreshes on SIGUSR2. Text that starts with `cmd[`
 but has no `]` is plain text, as in hyprlock. Commands run as the
@@ -738,7 +738,10 @@ fprintd has its own channel and event type (`fprint::FprintEvent`, only `Matched
   empty and `ignore-empty-input` is set), and so do swaylock's Ctrl+J, Ctrl+M and Ctrl+D (Ctrl+D
   submits at once; it is not a delete). Backspace and Delete remove one
   character and repeat. Escape, Ctrl+U, Ctrl+C (swaylock's), Ctrl+Backspace, Ctrl+Delete and Ctrl+A
-  (hyprlock's) clear. Other keysyms append their UTF-8.
+  (hyprlock's) clear. Ctrl counts when held or latched in xkb's modifier state, not when locked
+  (StickyKeys' double tap would turn every typed letter into a shortcut); with Ctrl locked the
+  typed character comes from the keysym, since xkb would give a control character. Other keysyms
+  append their UTF-8.
 - Key repeat: a client-side repeat timer of our own per keyboard (`Repeater`), at that
   keyboard's `repeat_info` rate and delay (sway sends 25/s after 600 ms on `wl_seat` v9). It
   stops on key release, keyboard leave, the keyboard being released (capability change) and
@@ -763,8 +766,10 @@ fprintd has its own channel and event type (`fprint::FprintEvent`, only `Matched
   Limitation: a modifiers event without a preceding enter still counts as input. wlroots can
   send this when a seat gains its first keyboard; runtime reachability in sway 1.11 was not
   reproduced by the audit (UNVERIFIED), so no broader quiet-keyboard guarantee is claimed.
-- Grace period: until it ends, any key press, pointer button or motion calls
-  `request_unlock()`. Touch is not handled.
+- Grace period: until it ends, any key press, or pointer motion more than 5 px (Euclidean,
+  surface coordinates) from the position recorded at that pointer's `wl_pointer.enter`, calls
+  `request_unlock()` (hyprlock's `Seat.cpp` rule: a nudged desk or the entering pointer does not
+  end it). Pointer buttons do not. Touch is not handled.
 - `hide-cursor`: set a null cursor on pointer enter. Otherwise no cursor is
   set and the compositor draws its own; cursor-shape is not used.
 
@@ -1004,8 +1009,8 @@ Recorded after the spike; the sections above are unchanged.
   password during a fade-in with fade-out off left the process running forever, blocked in
   `eglSwapBuffers` on the destroyed surface); fades capped at 3 s at validate and a second unlock
   request finishes a running fade-out; `cmd[]` output capped at 64 KiB and 100 lines, labels at
-  100 lines (a 50k-line label held input for 18 s); `cmd[]` children get an empty signal mask and
-  close-on-exec descriptors, and are killed when SIGTERM, SIGINT or SIGHUP ends the locker. e2e
+  100 lines (a 50k-line label held input for 18 s); `cmd[]` children, and the processes PAM modules fork (`pthread_atfork` child handler), get an empty signal mask and
+  close-on-exec descriptors (the atfork handler also closes-on-exec descriptors >= 3 in children a PAM module forks, so a module that passes such a descriptor to a program it execs must dup it; `posix_spawn` children skip the handler), and are killed when SIGTERM, SIGINT or SIGHUP ends the locker. e2e
   tests: `dark-output`, `no-wayland-egl`, `cmd-output`, `sigterm`, two new `fade` checks.
   After review: the line cap counts CR, CR LF, U+2028 and U+2029 as well as LF (64 KiB of
   CR-separated progress output was 32k Pango lines and kept the password unread for over 120 s),
@@ -1113,8 +1118,8 @@ Recorded after the spike; the sections above are unchanged.
   runs before the unlock: `request_unlock` starts it, and `finish_unlock`, the only caller of
   `unlock_and_destroy`, runs when it ends. An unlock skips past the fade-out only when it is off
   or when a second unlock request arrives during it. A redraw timer at about 60 Hz runs only while something animates.
-- `--grace N`: within N seconds of `locked`, a key press, pointer motion or button unlocks without
-  a password, as in hyprlock. It is off by default. The grace window opens on `locked`, not at
+- `--grace N`: within N seconds of `locked`, a key press, or pointer motion of more than 5 px from
+  where the pointer entered, unlocks without a password (hyprlock's rule; buttons do not). It is off by default. The grace window opens on `locked`, not at
   start, so slow screenshots cannot use it up. It is measured on `CLOCK_BOOTTIME`, which counts
   time asleep (hyprlock uses the wall clock): with `Instant` (monotonic) a lock started with
   `--grace` just before a suspend still had its grace after the resume, and the wake key

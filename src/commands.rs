@@ -48,7 +48,7 @@ impl Runner {
 
     /// Run `shell` for label `id` unless the previous run (any process in its group) is still
     /// going.
-    pub fn run(&self, id: usize, shell: String) {
+    pub fn run(&self, id: usize, shell: String, env: Vec<(&'static str, String)>) {
         let mut running = self.running.lock().unwrap();
         if running.contains_key(&id) {
             return;
@@ -58,6 +58,7 @@ impl Runner {
         command
             .arg("-c")
             .arg(&shell)
+            .envs(env)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -295,9 +296,17 @@ mod tests {
 
     /// Run `shell` as label 7 and wait up to `secs` for its output.
     fn output_of(shell: &str, secs: u64) -> Option<CmdOutput> {
+        output_with_env(shell, Vec::new(), secs)
+    }
+
+    fn output_with_env(
+        shell: &str,
+        env: Vec<(&'static str, String)>,
+        secs: u64,
+    ) -> Option<CmdOutput> {
         let (tx, rx) = calloop::channel::channel();
         let runner = Runner::new(tx);
-        runner.run(7, shell.into());
+        runner.run(7, shell.into(), env);
         let mut event_loop: calloop::EventLoop<Option<CmdOutput>> =
             calloop::EventLoop::try_new().unwrap();
         event_loop
@@ -316,6 +325,66 @@ mod tests {
                 .unwrap();
         }
         got
+    }
+
+    /// Foreign values reach the shell as environment variables: data in a bare, "double" and
+    /// 'single' context, whatever they contain.
+    #[test]
+    fn foreign_values_are_data_in_every_quoting_context() {
+        let dir = std::env::temp_dir().join(format!("swl-inject-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pwned = dir.join("pwned");
+        let payloads = [
+            format!("$(touch {})", pwned.display()),
+            format!("`touch {}`", pwned.display()),
+            format!("'; touch {} #", pwned.display()),
+            format!("\"; touch {} #", pwned.display()),
+            format!("a\ntouch {}\nb", pwned.display()),
+        ];
+        for payload in payloads {
+            let vars = crate::textvars::Vars {
+                user: &payload,
+                desc: &payload,
+                fail: &payload,
+                pam_prompt: &payload,
+                pam_fail: &payload,
+                layout_name: &payload,
+                fprint_prompt: &payload,
+                fprint_fail: &payload,
+                ..Default::default()
+            };
+            for name in [
+                "USER",
+                "DESC",
+                "FAIL",
+                "PAMPROMPT",
+                "PAMFAIL",
+                "LAYOUT",
+                "FPRINTPROMPT",
+                "FPRINTFAIL",
+            ] {
+                for shell in [
+                    format!("printf %s ${name}"),
+                    format!("printf %s \"${name}\""),
+                    format!("printf %s 'x ${name}'"),
+                    format!("printf %s \"Hi ${name}\""),
+                ] {
+                    let shell = crate::textvars::substitute_shell(&shell, &vars);
+                    let got = output_with_env(&shell, crate::textvars::shell_env(&vars), 5)
+                        .unwrap_or_else(|| panic!("no output from {shell}"));
+                    assert!(!pwned.exists(), "{shell} ran the payload {payload:?}");
+                    if shell.contains("'x ") {
+                        assert_eq!(got.text, format!("x ${name}"), "single quotes stay literal");
+                    } else if !shell.contains('"')
+                        && !payload.contains('\n')
+                        && !payload.contains(' ')
+                    {
+                        assert_eq!(got.text, payload, "{shell}");
+                    }
+                }
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -388,7 +457,7 @@ mod tests {
     fn drop_kills_running_children() {
         let (tx, _rx) = calloop::channel::channel();
         let runner = Runner::new(tx);
-        runner.run(1, "sleep 30".into());
+        runner.run(1, "sleep 30".into(), Vec::new());
         let pid = runner.running.lock().unwrap()[&1].id();
         drop(runner);
         // The process is gone (reaped by the drop).
@@ -400,7 +469,7 @@ mod tests {
         let (tx, _rx) = calloop::channel::channel();
         let runner = Runner::new(tx);
         // `sh` stays alive as the parent of `sleep`; killing only `sh` would orphan `sleep`.
-        runner.run(1, "sleep 31 | cat".into());
+        runner.run(1, "sleep 31 | cat".into(), Vec::new());
         std::thread::sleep(Duration::from_millis(200));
         let pgid = runner.running.lock().unwrap()[&1].id();
         drop(runner);
@@ -422,7 +491,7 @@ mod tests {
     fn a_child_that_closes_stdout_neither_blocks_nor_escapes() {
         let (tx, _rx) = calloop::channel::channel();
         let runner = Arc::new(Runner::new(tx));
-        runner.run(1, "exec >/dev/null; sleep 32".into());
+        runner.run(1, "exec >/dev/null; sleep 32".into(), Vec::new());
         let pid = runner.running.lock().unwrap()[&1].id();
         // Wait (with a deadline, not a fixed sleep) until `sh` has closed the pipe: from then on
         // the worker sees EOF and moves on to waiting for the child.
@@ -439,7 +508,7 @@ mod tests {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let r = runner.clone();
         std::thread::spawn(move || {
-            r.run(1, "true".into());
+            r.run(1, "true".into(), Vec::new());
             // Before signalling: the test then takes sole ownership of the runner.
             drop(r);
             let _ = done_tx.send(());
@@ -469,9 +538,9 @@ mod tests {
     fn a_running_command_is_not_started_twice() {
         let (tx, _rx) = calloop::channel::channel();
         let runner = Runner::new(tx);
-        runner.run(1, "sleep 30".into());
+        runner.run(1, "sleep 30".into(), Vec::new());
         let pid = runner.running.lock().unwrap()[&1].id();
-        runner.run(1, "sleep 30".into());
+        runner.run(1, "sleep 30".into(), Vec::new());
         assert_eq!(runner.running.lock().unwrap()[&1].id(), pid);
     }
 
@@ -484,7 +553,7 @@ mod tests {
         // `sh -c` has exec'd by the time `spawn` returns, so its command line is this.
         let marker = format!("sleep 33.{}", std::process::id());
         FAIL_SPAWN.set(true);
-        runner.run(1, marker.clone());
+        runner.run(1, marker.clone(), Vec::new());
         FAIL_SPAWN.set(false);
         assert!(
             runner.running.lock().unwrap().is_empty(),
@@ -497,7 +566,7 @@ mod tests {
         });
         assert_eq!(left.collect::<Vec<_>>(), [], "the child was left running");
         // The next run gets its thread.
-        runner.run(1, "sleep 30".into());
+        runner.run(1, "sleep 30".into(), Vec::new());
         assert!(runner.running.lock().unwrap().contains_key(&1));
     }
 
@@ -507,7 +576,7 @@ mod tests {
     fn a_background_job_is_killed_on_drop_and_blocks_the_next_run() {
         let (tx, rx) = calloop::channel::channel();
         let runner = Runner::new(tx);
-        runner.run(1, "exec sleep 34 >/dev/null & echo $!".into());
+        runner.run(1, "exec sleep 34 >/dev/null & echo $!".into(), Vec::new());
         // The output arrives once `sh` exits, without waiting for the job.
         let got = recv_within(&rx, 3).expect("output");
         let job: u32 = got.text.parse().expect("the job's pid");
@@ -515,7 +584,7 @@ mod tests {
         assert!(alive(job));
         let pgid = runner.running.lock().unwrap().get(&1).map(Child::id);
         assert!(pgid.is_some(), "the group was untracked while the job runs");
-        runner.run(1, "true".into());
+        runner.run(1, "true".into(), Vec::new());
         assert_eq!(runner.running.lock().unwrap().get(&1).map(Child::id), pgid);
         drop(runner);
         std::thread::sleep(Duration::from_millis(100));
@@ -526,7 +595,7 @@ mod tests {
     fn a_finished_group_is_forgotten() {
         let (tx, rx) = calloop::channel::channel();
         let runner = Runner::new(tx);
-        runner.run(1, "sleep 0.2 >/dev/null & echo x".into());
+        runner.run(1, "sleep 0.2 >/dev/null & echo x".into(), Vec::new());
         recv_within(&rx, 3).expect("output");
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         while runner.running.lock().unwrap().contains_key(&1) {
