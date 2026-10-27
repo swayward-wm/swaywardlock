@@ -10,6 +10,7 @@ locker's PrepareForSleep handling runs (and a forged one can be told apart from 
 
 A status with a `+sleep` suffix (`verify-no-match+sleep`) is followed 0.1 s later by logind's
 PrepareForSleep(true) and 2 s later by PrepareForSleep(false), logged as SLEEP and WAKE.
+`+race` sends the next status 0.3 s after, asleep (sleep at 0.1 s, wake at 0.6 s).
 `+quicksleep` wakes after 0.4 s instead, inside a 1 s retry delay.
 
 Like fprintd (device.c can_start_action), a VerifyStart while a verify session is open, that is
@@ -136,6 +137,12 @@ class Device(dbus.service.Object):
                 GLib.timeout_add(400, self.emit, self.statuses.pop(0))
             return False
         status, _, then = status.partition("+")
+        if then == "race":
+            # Sleep at 0.1 s, the next status (a match) at 0.3 s while asleep, wake at 0.6 s.
+            GLib.timeout_add(100, self.sleep, True)
+            GLib.timeout_add(600, self.sleep, False)
+            if self.statuses:
+                GLib.timeout_add(300, self.emit, self.statuses.pop(0))
         if then in ("sleep", "quicksleep"):
             GLib.timeout_add(100, self.sleep, True)
             GLib.timeout_add(2000 if then == "sleep" else 400, self.sleep, False)
