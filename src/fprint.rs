@@ -7,7 +7,9 @@
 //! again after (logind `PrepareForSleep`). It does not start while logind is already preparing
 //! for sleep, and ignores a match unless it is scanning and awake. Device, logind and
 //! fprintd-gone signals are read from ONE stream of the connection's messages, so they are
-//! handled in bus receive order and there are no forwarder threads. A match sent after
+//! handled in bus receive order. A pump thread keeps that stream drained (so a flood of signals
+//! addressed to us cannot stall a method reply), drops what is not ours, and queues the rest in
+//! order for the worker. A match sent after
 //! `PrepareForSleep(true)` is therefore seen after it (asleep: ignored). A match is also
 //! accepted only if its receive position is after the reply to the current `VerifyStart`, as a
 //! second guard against a stale match sent before a restart. If fprintd or a device is missing,
@@ -23,6 +25,9 @@
 //! process. If fprintd restarts (a new unique name), fingerprint unlock stops for this lock: the
 //! bus's `NameOwnerChanged` for the old unique name clears the prompt and sets `$FPRINTFAIL`.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -170,7 +175,7 @@ fn run(o: &Options, events: &Sender<FprintEvent>, prompted: &mut bool) -> anyhow
     // Subscribe before claiming so no status is missed. One unfiltered stream of everything the
     // connection receives, in bus receive order; the match rules below only make the bus send
     // us these signals, and every message is classified and sender-checked locally.
-    let mut stream = zbus::MessageStream::from(conn.inner());
+    let stream = zbus::MessageStream::from(conn.inner());
     let logind = owner(&conn, "org.freedesktop.login1").ok();
     let dbus = zbus::blocking::fdo::DBusProxy::new(&conn)?;
     let signal = || MatchRule::builder().msg_type(zbus::message::Type::Signal);
@@ -208,6 +213,24 @@ fn run(o: &Options, events: &Sender<FprintEvent>, prompted: &mut bool) -> anyhow
         let _ = device.call_method("Release", &());
     });
 
+    // A pump thread reads the stream continuously, so a blocking method call below never
+    // leaves it unread (a flood of signals addressed to us would otherwise fill zbus's queue and
+    // stall the method reply). It drops everything that is not one of our signals from the
+    // trusted sender at once and forwards the rest, in receive order, on an unbounded queue.
+    let (tx, rx) = mpsc::channel();
+    let stop = Arc::new(AtomicBool::new(false));
+    let _stop_on_exit = {
+        let stop = stop.clone();
+        scopeguard(move || stop.store(true, Ordering::Relaxed))
+    };
+    {
+        let (path, fprintd, logind, stop) =
+            (path.clone(), fprintd.clone(), logind.clone(), stop.clone());
+        thread::Builder::new()
+            .name("fprint-pump".into())
+            .spawn(move || pump(stream, &path, &fprintd, logind.as_ref(), &stop, &tx))?;
+    }
+
     let mut scan = Scan::default();
     let start = |scan: &mut Scan, prompt: &str| -> anyhow::Result<()> {
         // Asleep: waking restarts it. Scanning: a wake inside the retry delay already restarted
@@ -236,10 +259,14 @@ fn run(o: &Options, events: &Sender<FprintEvent>, prompted: &mut bool) -> anyhow
     // When a scan restarts after a non-match.
     let mut restart_at: Option<Instant> = None;
     loop {
-        let msg = match next_message(&mut stream, restart_at) {
-            Wait::Message(msg) => msg,
-            Wait::Closed => break,
-            Wait::Timeout => {
+        let received = match restart_at {
+            Some(at) => rx.recv_timeout(at.saturating_duration_since(Instant::now())),
+            None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
+        };
+        let msg = match received {
+            Ok(msg) => msg,
+            Err(RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Timeout) => {
                 restart_at = None;
                 if let Err(err) = start(&mut scan, "Could not match fingerprint. Try again.") {
                     // Keep the claim and the loop: a wake from sleep tries again.
@@ -377,36 +404,50 @@ enum Item {
     Vanish,
 }
 
-enum Wait {
-    Message(zbus::Message),
-    Timeout,
-    Closed,
-}
-
-/// The next message in bus receive order, or `Timeout` at `deadline`.
-fn next_message(stream: &mut zbus::MessageStream, deadline: Option<Instant>) -> Wait {
+/// Read `stream` until `stop` or the receiver is gone; forward only signals we act on.
+fn pump(
+    mut stream: zbus::MessageStream,
+    path: &OwnedObjectPath,
+    fprintd: &OwnedUniqueName,
+    logind: Option<&OwnedUniqueName>,
+    stop: &AtomicBool,
+    tx: &mpsc::Sender<zbus::Message>,
+) {
     use futures_lite::StreamExt;
-    zbus::block_on(futures_lite::future::or(
-        async {
-            match stream.next().await {
-                Some(Ok(msg)) => Wait::Message(msg),
-                Some(Err(err)) => {
-                    tracing::warn!("fprint: bus stream error: {err}");
-                    Wait::Closed
-                }
-                None => Wait::Closed,
+    while !stop.load(Ordering::Relaxed) {
+        let next = zbus::block_on(futures_lite::future::or(
+            async { Some(stream.next().await) },
+            async {
+                async_io::Timer::after(Duration::from_millis(500)).await;
+                None
+            },
+        ));
+        let msg = match next {
+            None => continue,
+            Some(Some(Ok(msg))) => msg,
+            Some(Some(Err(err))) => {
+                tracing::warn!("fprint: bus stream error: {err}");
+                return;
             }
-        },
-        async {
-            match deadline {
-                Some(at) => {
-                    async_io::Timer::at(at).await;
-                    Wait::Timeout
-                }
-                None => std::future::pending().await,
+            Some(None) => return,
+        };
+        let header = msg.header();
+        let relevant = header.message_type() == zbus::message::Type::Signal && {
+            let interface = header.interface().map(|i| i.as_str()).unwrap_or_default();
+            let member = header.member().map(|m| m.as_str()).unwrap_or_default();
+            if interface == "org.freedesktop.DBus" && member == "NameOwnerChanged" {
+                is_gone(&msg, fprintd)
+            } else if interface == "org.freedesktop.login1.Manager" && member == "PrepareForSleep" {
+                logind.is_some_and(|l| sent_by(&msg, l))
+            } else {
+                header.path().is_some_and(|p| p.as_str() == path.as_str()) && sent_by(&msg, fprintd)
             }
-        },
-    ))
+        };
+        drop(header);
+        if relevant && tx.send(msg).is_err() {
+            return;
+        }
+    }
 }
 
 /// Scanning state.

@@ -95,8 +95,9 @@ class Device(dbus.service.Object):
         self.claimed = False
         self.log("Release")
 
-    @dbus.service.method(DEV, in_signature="s")
-    def VerifyStart(self, finger):
+    @dbus.service.method(DEV, in_signature="s", sender_keyword="caller")
+    def VerifyStart(self, finger, caller=None):
+        self.caller = caller
         if not self.claimed:
             self.log("VerifyStart REFUSED ClaimDevice")
             raise dbus.exceptions.DBusException(
@@ -134,6 +135,23 @@ class Device(dbus.service.Object):
             GLib.timeout_add(2000, self.sleep, False)
             if self.statuses:
                 GLib.timeout_add(400, self.emit, self.statuses.pop(0))
+            return False
+        if status == "forgewake":
+            # Really asleep; a forged PrepareForSleep(false) (broadcast and unicast) from another
+            # connection, then a real match while still asleep; real wake 1 s later.
+            self.sleep(True)
+            GLib.timeout_add(100, self.forge)
+            GLib.timeout_add(200, self.burst, ["verify-match"])
+            GLib.timeout_add(1000, self.sleep, False)
+            return False
+        if status == "flood":
+            # A no-match (the locker calls VerifyStop) while another connection floods unicast
+            # signals at the locker; a real match 1.5 s later must still unlock.
+            self.flood()
+            self.log("status verify-no-match")
+            self.VerifyStatus("verify-no-match", True)
+            GLib.timeout_add(100, self.flood)
+            GLib.timeout_add(300, self.sleep, False)
             return False
         if status == "matchsleep":
             self.burst(["verify-match", "SLEEP"])
@@ -200,6 +218,38 @@ class Device(dbus.service.Object):
         # for another VerifyStart.
         if not done and self.statuses:
             GLib.timeout_add(400, self.emit, self.statuses.pop(0))
+        return False
+
+    def forger(self):
+        if not hasattr(self, "fbus"):
+            self.fbus = dbus.bus.BusConnection(__import__("os").environ["DBUS_SYSTEM_BUS_ADDRESS"])
+        return self.fbus
+
+    def forge(self):
+        b = self.forger()
+        for dest in (None, self.caller):
+            m = dbus.lowlevel.SignalMessage("/org/freedesktop/login1", "org.freedesktop.login1.Manager", "PrepareForSleep")
+            m.append(False, signature="b")
+            if dest:
+                m.set_destination(dest)
+            b.send_message(m)
+            m = dbus.lowlevel.SignalMessage("/org/freedesktop/DBus", "org.freedesktop.DBus", "NameOwnerChanged")
+            m.append(self.bus.get_unique_name(), self.bus.get_unique_name(), "", signature="sss")
+            if dest:
+                m.set_destination(dest)
+            b.send_message(m)
+        b.flush()
+        self.log("FORGED " + self.fbus.get_unique_name())
+        return False
+
+    def flood(self):
+        b = self.forger()
+        for _ in range(300):
+            m = dbus.lowlevel.SignalMessage("/x", "x.y", "Z")
+            m.set_destination(self.caller)
+            b.send_message(m)
+        b.flush()
+        self.log("FLOOD")
         return False
 
     def burst(self, items):
