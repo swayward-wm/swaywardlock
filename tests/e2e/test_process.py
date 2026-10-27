@@ -302,18 +302,31 @@ def test_daemonize(lock_env):
     pidfile = env.path("daemon.pid")
     # The daemon's parent pid, written by its own command child: /proc/<pid>/environ is
     # unreadable (the process is non-dumpable), so identify it by pidfile + cmdline.
-    lock = env.locker(f'label {{ text "cmd[] echo $PPID >{pidfile}; echo x"; }}\n', args=["-f"], log="daemon-parent.log")
-    _exit(lock, 0, "daemonize: parent exit code")
-    assert "session locked" in lock.log_text(), "daemonize: locked before the parent exited"
+    conf = env.path("daemon.kdl")
+    conf.write_text(f'label {{ text "cmd[] echo $PPID >{pidfile}; echo x"; }}\n')
+    # stdout/stderr go to pipes we own: they only hit EOF once the daemon has dropped its copies.
+    parent = subprocess.Popen([env.binary, "-f", "-c", str(conf)], env=env.env, stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+    env.procs.append(parent)
+    assert parent.wait(5) == 0, f"daemonize: parent exit code\n{parent.stderr.read()!r}"
+    for name, stream in (("stdout", parent.stdout), ("stderr", parent.stderr)):
+        deadline = time.monotonic() + 5
+        while True:
+            ready = select.select([stream], [], [], max(0, deadline - time.monotonic()))[0]
+            assert ready, f"daemonize: the daemon still holds the parent's {name}"
+            if not os.read(stream.fileno(), 65536):
+                break
+    for stream in (parent.stdout, parent.stderr):
+        stream.close()
     decoy = env.spawn(["bash", "-c", 'exec -a "$1" sleep 30', "bash", env.binary + " -f"],
                       env={"XDG_RUNTIME_DIR": "/nonexistent"}, log="daemon-decoy.log")
 
     def discover():
         try:
             pid = int(pidfile.read_text())
-            args = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
-        except (OSError, ValueError):
+        except (FileNotFoundError, ValueError):  # not written yet, or partially written
             return []
+        args = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")  # PermissionError etc. fail loudly
         return [pid] if args[0] == os.fsencode(env.binary) and b"-f" in args and alive(pid) else []
 
     assert decoy.poll() is None, "daemonize: decoy did not start"
