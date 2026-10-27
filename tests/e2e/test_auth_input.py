@@ -727,6 +727,15 @@ def test_fingerprint(desktop):
         assert _ordered(log(), "status verify-no-match", "SLEEP", "status verify-match", "WAKE"), f"fingerprint: race order\n{log()}"
         assert locker.alive(), f"fingerprint: a match queued while asleep must not unlock after wake\n{log()}"
         _unlock(locker)
+    # No gap: the match and the wake leave back to back, so only the bus receive position
+    # tells the match was sent while asleep. Nondeterministic, so repeat.
+    for i in range(40):
+        with _fake(env, child_env, f"matchwake{i}", "verify-no-match+matchwake") as log:
+            locker = _locker(env, f"fingerprint matchwake {i}", race_config, env=child_env)
+            assert poll(lambda: "WAKE" in log(), timeout=6), f"fingerprint: no wake\n{log()}"
+            time.sleep(0.5)
+            assert locker.alive(), f"fingerprint: match+wake burst unlocked (run {i})\n{log()}"
+            _unlock(locker)
     with _fake(env, child_env, "preparing", "preparing", "verify-match") as log:
         locker = _locker(env, "fingerprint preparing", sleep_config, env=child_env)
         assert poll(lambda: "WAKE" in log(), timeout=6), f"fingerprint: no wake\n{log()}"
