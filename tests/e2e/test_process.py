@@ -8,14 +8,16 @@ import contextlib
 import os
 import pty
 import re
+import resource
 import select
+import shutil
 import signal
 import socket
 import subprocess
 import time
+from pathlib import Path
 
 import pytest
-from pathlib import Path
 
 from lib.lockenv import Locker, ROOT
 from lib.poll import alive, poll
@@ -297,32 +299,31 @@ def test_protocol_error(lock_env):
 
 def test_daemonize(lock_env):
     env = lock_env
-    lock = env.locker(args=["-f"], log="daemon-parent.log")
+    pidfile = env.path("daemon.pid")
+    # The daemon's parent pid, written by its own command child: /proc/<pid>/environ is
+    # unreadable (the process is non-dumpable), so identify it by pidfile + cmdline.
+    lock = env.locker(f'label {{ text "cmd[] echo $PPID >{pidfile}; echo x"; }}\n', args=["-f"], log="daemon-parent.log")
     _exit(lock, 0, "daemonize: parent exit code")
     assert "session locked" in lock.log_text(), "daemonize: locked before the parent exited"
     decoy = env.spawn(["bash", "-c", 'exec -a "$1" sleep 30', "bash", env.binary + " -f"],
                       env={"XDG_RUNTIME_DIR": "/nonexistent"}, log="daemon-decoy.log")
 
     def discover():
-        found = []
-        needle = f"XDG_RUNTIME_DIR={env.dir}".encode()
-        for path in Path("/proc").iterdir():
-            if not path.name.isdigit():
-                continue
-            try:
-                args = (path / "cmdline").read_bytes().split(b"\0")
-                if args[:2] == [os.fsencode(env.binary), b"-f"] and needle in (path / "environ").read_bytes().split(b"\0") and alive(int(path.name)):
-                    found.append(int(path.name))
-            except OSError:
-                pass
-        return found
+        try:
+            pid = int(pidfile.read_text())
+            args = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+        except (OSError, ValueError):
+            return []
+        return [pid] if args[0] == os.fsencode(env.binary) and b"-f" in args and alive(pid) else []
 
     assert decoy.poll() is None, "daemonize: decoy did not start"
     children = poll(discover)
     assert len(children) == 1 and children[0] != decoy.pid, f"daemonize: child keeps running ({children})"
     child = children[0]  # Exact executable + private runtime identifies our detached child.
     assert os.getsid(child) == child, "daemonize: the daemon leads its own session"
-    assert poll(lambda: [os.readlink(f"/proc/{child}/fd/{fd}") for fd in (0, 1, 2)] == ["/dev/null"] * 3), "daemonize: stdio on /dev/null"
+    # /proc/<pid>/fd is unreadable (non-dumpable), so check what stat still shows: no controlling tty.
+    stat = Path(f"/proc/{child}/stat").read_text().rsplit(")", 1)[1].split()
+    assert stat[4] == "0", f"daemonize: the daemon has no controlling terminal (tty_nr {stat[4]})"
     os.kill(child, signal.SIGUSR1)
     _gone(child, "daemonize: the daemon exits on SIGUSR1", timeout=5)
     assert decoy.poll() is None, "daemonize: the decoy was left alone"
@@ -425,3 +426,29 @@ def test_process_is_not_dumpable_and_has_no_core(lock_env):
     limits = Path(f"/proc/{pid}/limits").read_text()
     core = next(l for l in limits.splitlines() if l.startswith("Max core file size"))
     assert core.split()[4:6] == ["0", "0"], core
+
+
+def _coredumps(pid):
+    out = subprocess.run(["coredumpctl", "list", "--no-pager", "--no-legend", str(pid)],
+                         capture_output=True, text=True)
+    return out.stdout.strip()
+
+
+def test_abort_leaves_no_core(lock_env):
+    if not shutil.which("coredumpctl"):
+        pytest.skip("coredumpctl not available")
+    env = lock_env
+
+    def allow_cores():  # Make the harness allow cores so only the locker's own hardening stops one.
+        resource.setrlimit(resource.RLIMIT_CORE, (resource.RLIM_INFINITY, resource.RLIM_INFINITY))
+
+    conf = env.path("abort.kdl")
+    conf.write_text("animations { off; }\n")
+    proc = env.spawn([env.binary, "-c", conf], log="abort.log", cwd=env.dir, preexec_fn=allow_cores)
+    lock = Locker(env, proc, "abort.log")
+    lock.wait_locked("abort")
+    lock.signal(signal.SIGABRT)
+    assert lock.wait_exit() == 128 + signal.SIGABRT, lock.log_text()
+    # systemd-coredump records asynchronously; give it time to show up if it were going to.
+    assert not poll(lambda: _coredumps(proc.pid), timeout=3), f"core dumped:\n{_coredumps(proc.pid)}"
+    assert not list(Path(env.dir).glob("core*")), "core file written"
