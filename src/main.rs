@@ -190,7 +190,21 @@ struct App {
     exit: Option<u8>,
 }
 
+/// No core dump or same-uid ptrace/`/proc/<pid>/mem` read may expose the password.
+fn harden_process() {
+    let zero = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: plain syscalls with valid arguments.
+    unsafe {
+        libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
+        libc::setrlimit(libc::RLIMIT_CORE, &zero);
+    }
+}
+
 fn main() -> ExitCode {
+    harden_process();
     // Block SIGUSR1/2 before any thread exists so every thread inherits the mask. Otherwise the
     // kernel may deliver it to a Mesa or auth thread, whose default action kills the process; the
     // calloop signalfd below only sees signals blocked in every thread.

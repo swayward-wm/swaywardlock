@@ -453,7 +453,11 @@ mod pam {
                 let r = (*replies.add(i)).resp;
                 if !r.is_null() {
                     let len = libc::strlen(r);
-                    ptr::write_bytes(r, 0, len);
+                    // Volatile so the compiler cannot elide the wipe before `free`.
+                    for k in 0..len {
+                        ptr::write_volatile(r.add(k), 0);
+                    }
+                    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
                     libc::free(r.cast());
                 }
             }

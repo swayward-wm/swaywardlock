@@ -6,17 +6,71 @@ use zeroize::Zeroize as _;
 /// password in freed memory). Longer input is refused rather than reallocated.
 const CAPACITY: usize = 1024;
 
+/// One private anonymous page-aligned mapping per buffer, so `munlock` of one buffer can never
+/// unlock pages shared with another live buffer, and `MADV_DONTDUMP` covers only secrets.
+struct Mapping {
+    ptr: *mut u8,
+    size: usize,
+}
+
+impl Mapping {
+    fn new() -> Self {
+        // SAFETY: sysconf has no preconditions.
+        let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap_or(4096);
+        let size = CAPACITY.next_multiple_of(page.max(4096));
+        // SAFETY: a fresh anonymous private mapping; the result is checked.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert!(
+            ptr != libc::MAP_FAILED,
+            "mmap of the password buffer failed"
+        );
+        // SAFETY: the mapping was just created.
+        unsafe { libc::madvise(ptr, size, libc::MADV_DONTDUMP) };
+        Self {
+            ptr: ptr.cast(),
+            size,
+        }
+    }
+}
+
+// SAFETY: the mapping is exclusively owned; moving it between threads is fine.
+unsafe impl Send for Mapping {}
+
+impl std::ops::Deref for Mapping {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        // SAFETY: the mapping is at least CAPACITY bytes, zero-initialised, owned by `self`.
+        unsafe { std::slice::from_raw_parts(self.ptr, CAPACITY) }
+    }
+}
+
+impl std::ops::DerefMut for Mapping {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        // SAFETY: as above, and `&mut self` is exclusive.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, CAPACITY) }
+    }
+}
+
 pub struct SecretBuf {
-    buf: Box<[u8; CAPACITY]>,
+    buf: Mapping,
     len: usize,
     locked: bool,
 }
 
 impl SecretBuf {
     pub fn new() -> Self {
-        let buf = Box::new([0u8; CAPACITY]);
-        // SAFETY: the pointer and length describe the boxed array, which lives as long as `self`.
-        let locked = unsafe { libc::mlock(buf.as_ptr().cast(), CAPACITY) } == 0;
+        let buf = Mapping::new();
+        // SAFETY: the pointer and length describe the mapping, which lives as long as `self`.
+        let locked = unsafe { libc::mlock(buf.ptr.cast(), buf.size) } == 0;
         if !locked {
             tracing::warn!(
                 "mlock failed; the password buffer may be swapped to disk: {}",
@@ -94,8 +148,10 @@ impl Drop for SecretBuf {
         tests::observe_drop(self);
         if self.locked {
             // SAFETY: same region as the `mlock` in `new`.
-            unsafe { libc::munlock(self.buf.as_ptr().cast(), CAPACITY) };
+            unsafe { libc::munlock(self.buf.ptr.cast(), self.buf.size) };
         }
+        // SAFETY: the mapping is not used after this.
+        unsafe { libc::munmap(self.buf.ptr.cast(), self.buf.size) };
     }
 }
 
@@ -145,6 +201,48 @@ mod tests {
             all_zero,
             "Drop must zero all 1024 bytes before munlock/deallocation"
         );
+    }
+
+    #[test]
+    fn each_buffer_owns_its_own_pages() {
+        let a = SecretBuf::new();
+        let b = SecretBuf::new();
+        let (pa, pb) = (a.buf.ptr as usize, b.buf.ptr as usize);
+        assert_eq!(pa % 4096, 0, "mapping must be page aligned");
+        assert_eq!(pb % 4096, 0, "mapping must be page aligned");
+        assert!(
+            pa.abs_diff(pb) >= a.buf.size,
+            "buffers must not share a page"
+        );
+    }
+
+    #[test]
+    fn dropping_one_buffer_keeps_the_other_locked() {
+        let a = SecretBuf::new();
+        let b = SecretBuf::new();
+        if !a.locked || !b.locked {
+            return; // RLIMIT_MEMLOCK too low here
+        }
+        let pb = b.buf.ptr as usize;
+        drop(a);
+        let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
+        let mut in_b = false;
+        for line in smaps.lines() {
+            if let Some((range, _)) = line.split_once(' ') {
+                if let Some((lo, hi)) = range.split_once('-') {
+                    if let (Ok(lo), Ok(hi)) =
+                        (usize::from_str_radix(lo, 16), usize::from_str_radix(hi, 16))
+                    {
+                        in_b = lo <= pb && pb < hi;
+                    }
+                }
+            }
+            if in_b && line.starts_with("Locked:") {
+                assert!(!line.contains(" 0 kB"), "survivor lost its lock: {line}");
+                return;
+            }
+        }
+        panic!("mapping not found in smaps");
     }
 
     #[test]

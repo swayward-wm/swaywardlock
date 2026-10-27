@@ -13,6 +13,8 @@ import signal
 import socket
 import subprocess
 import time
+
+import pytest
 from pathlib import Path
 
 from lib.lockenv import Locker, ROOT
@@ -411,3 +413,15 @@ def test_broken_stderr(lock_env):
 def test_no_display(lock_env):
     lock = lock_env.locker(env={"WAYLAND_DISPLAY": "does-not-exist"}, log="no-display.log")
     _exit(lock, 1, "no display: exit code")
+
+
+def test_process_is_not_dumpable_and_has_no_core(lock_env):
+    env = lock_env
+    lock = env.locker('animations { off; }\n')
+    pid = lock.proc.pid
+    assert poll(lambda: "session locked" in lock.log_text()), lock.log_text()
+    with pytest.raises(PermissionError):
+        open(f"/proc/{pid}/mem", "rb").read(1)
+    limits = Path(f"/proc/{pid}/limits").read_text()
+    core = next(l for l in limits.splitlines() if l.startswith("Max core file size"))
+    assert core.split()[4:6] == ["0", "0"], core
