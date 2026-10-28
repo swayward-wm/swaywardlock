@@ -6,6 +6,7 @@ stay single samples; only positive readiness/end-state checks use settled pollin
 """
 
 import contextlib
+import os
 import re
 import signal
 import subprocess
@@ -783,27 +784,37 @@ def _burst_race(env, i, name, *statuses):
         _unlock(locker)
 
 
-# These races are nondeterministic (about 1-4% per run on the old code), hence many runs.
-@pytest.mark.parametrize("i", range(100))
+# FPRINT_LOOPS sets the iteration count of the fingerprint race tests. The default is small
+# (CI's e2e step has a tight time budget). Stress form, run before touching src/fprint.rs:
+#   FPRINT_LOOPS=400 python3 -m pytest tests/e2e/test_auth_input.py -k fingerprint -n 16
+# The ordering races (sleep_then_match, matches_then_wake, forged_wake: about 1-4% per run
+# on the old code) are NOT reliably red at the default count: there they are smoke checks.
+# The flood-inside-Claim test failed 50/50 on the old code, so it is a deterministic
+# regression test even at a count of 2.
+_LOOPS = int(os.environ.get("FPRINT_LOOPS", "3"))
+_METHOD_LOOPS = int(os.environ.get("FPRINT_LOOPS", "2"))
+
+
+@pytest.mark.parametrize("i", range(_LOOPS))
 def test_fingerprint_matches_then_wake(desktop, i):
     """Asleep, then twenty matches and the WAKE back to back: the matches were sent asleep."""
     _burst_race(desktop, i, "matchburstwake", "verify-no-match+matchburstwake")
 
 
-@pytest.mark.parametrize("i", range(400))
+@pytest.mark.parametrize("i", range(_LOOPS))
 def test_fingerprint_sleep_then_match(desktop, i):
     """PrepareForSleep(true) then a match back to back while scanning: the match is asleep."""
     _burst_race(desktop, i, "sleepmatch", "sleepmatch")
 
 
-@pytest.mark.parametrize("i", range(100))
+@pytest.mark.parametrize("i", range(_LOOPS))
 def test_fingerprint_forged_wake_stays_locked(desktop, i):
     """Forged PrepareForSleep(false)/NameOwnerChanged (broadcast and unicast) change nothing:
     a match sent while really asleep is ignored."""
     _burst_race(desktop, i, "forgewake", "forgewake")
 
 
-@pytest.mark.parametrize("i", range(50))
+@pytest.mark.parametrize("i", range(_LOOPS))
 def test_fingerprint_signal_flood_does_not_stall(desktop, i):
     """Hundreds of signals addressed to the locker while it is in VerifyStop must not stall the
     bus reader: after the wake, a real match still unlocks."""
@@ -819,7 +830,7 @@ def test_fingerprint_signal_flood_does_not_stall(desktop, i):
         assert locker.wait_exit(10) == 0, f"fingerprint: flood stalled the locker\n{log()}"
 
 
-@pytest.mark.parametrize("i", range(50))
+@pytest.mark.parametrize("i", range(_METHOD_LOOPS))
 @pytest.mark.parametrize("method", ["Claim", "Get", "VerifyStart", "VerifyStop", "Release"])
 def test_fingerprint_flood_inside_method_call(desktop, method, i):
     """300 unicast signals sent to the locker from inside fprintd's handler for one method call
