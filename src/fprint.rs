@@ -7,9 +7,9 @@
 //! again after (logind `PrepareForSleep`). It does not start while logind is already preparing
 //! for sleep, and ignores a match unless it is scanning and awake. Device, logind and
 //! fprintd-gone signals are read from ONE stream of the connection's messages, so they are
-//! handled in bus receive order. A pump thread keeps that stream drained (so a flood of signals
-//! addressed to us cannot stall a method reply), drops what is not ours, and queues the rest in
-//! order for the worker. A match sent after
+//! handled in bus receive order. A pump thread, started before any blocking call, keeps that
+//! stream drained (so a flood of signals addressed to us cannot stall a method reply), drops what
+//! is not ours, and queues the rest in order for the worker. A match sent after
 //! `PrepareForSleep(true)` is therefore seen after it (asleep: ignored). A match is also
 //! accepted only if its receive position is after the reply to the current `VerifyStart`, as a
 //! second guard against a stale match sent before a restart. If fprintd or a device is missing,
@@ -175,8 +175,21 @@ fn run(o: &Options, events: &Sender<FprintEvent>, prompted: &mut bool) -> anyhow
     // Subscribe before claiming so no status is missed. One unfiltered stream of everything the
     // connection receives, in bus receive order; the match rules below only make the bus send
     // us these signals, and every message is classified and sender-checked locally.
-    let stream = zbus::MessageStream::from(conn.inner());
     let logind = owner(&conn, "org.freedesktop.login1").ok();
+    let stream = zbus::MessageStream::from(conn.inner());
+    let (tx, rx) = mpsc::channel();
+    let stop = Arc::new(AtomicBool::new(false));
+    let _stop_on_exit = {
+        let stop = stop.clone();
+        scopeguard(move || stop.store(true, Ordering::Relaxed))
+    };
+    {
+        let (path, fprintd, logind, stop) =
+            (path.clone(), fprintd.clone(), logind.clone(), stop.clone());
+        thread::Builder::new()
+            .name("fprint-pump".into())
+            .spawn(move || pump(stream, &path, &fprintd, logind.as_ref(), &stop, &tx))?;
+    }
     let dbus = zbus::blocking::fdo::DBusProxy::new(&conn)?;
     let signal = || MatchRule::builder().msg_type(zbus::message::Type::Signal);
     dbus.add_match_rule(
@@ -212,24 +225,6 @@ fn run(o: &Options, events: &Sender<FprintEvent>, prompted: &mut bool) -> anyhow
         let _ = device.call_method("VerifyStop", &());
         let _ = device.call_method("Release", &());
     });
-
-    // A pump thread reads the stream continuously, so a blocking method call below never
-    // leaves it unread (a flood of signals addressed to us would otherwise fill zbus's queue and
-    // stall the method reply). It drops everything that is not one of our signals from the
-    // trusted sender at once and forwards the rest, in receive order, on an unbounded queue.
-    let (tx, rx) = mpsc::channel();
-    let stop = Arc::new(AtomicBool::new(false));
-    let _stop_on_exit = {
-        let stop = stop.clone();
-        scopeguard(move || stop.store(true, Ordering::Relaxed))
-    };
-    {
-        let (path, fprintd, logind, stop) =
-            (path.clone(), fprintd.clone(), logind.clone(), stop.clone());
-        thread::Builder::new()
-            .name("fprint-pump".into())
-            .spawn(move || pump(stream, &path, &fprintd, logind.as_ref(), &stop, &tx))?;
-    }
 
     let mut scan = Scan::default();
     let start = |scan: &mut Scan, prompt: &str| -> anyhow::Result<()> {

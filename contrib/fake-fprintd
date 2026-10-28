@@ -22,7 +22,8 @@ until VerifyStop, fails with net.reactivated.Fprint.Error.AlreadyInUse (logged a
 one before Claim fails with net.reactivated.Fprint.Error.ClaimDevice (logged as REFUSED too).
 
 The status `sleepnow` sends PrepareForSleep(true) at once (and false 2 s later), and the next
-status follows 0.4 s later, while asleep. A first argument `preparing` makes logind's
+status follows 0.4 s later, while asleep. Env FLOOD_IN=Claim|Get|VerifyStart|VerifyStop|Release makes that handler send 300
+unicast junk signals to the caller from a second connection before it replies. A first argument `preparing` makes logind's
 PreparingForSleep property true at start, with the wake signal 1 s later.
 
 The status `finger-present` is not a VerifyStatus: it sets the device's finger-present property
@@ -33,6 +34,7 @@ Log lines after "ready" start with the milliseconds since the fake started, e.g.
 "1234 VerifyStart any", so a test can check the delays between steps.
 """
 
+import os
 import sys
 import time
 
@@ -44,6 +46,27 @@ from gi.repository import GLib
 DEVICE_PATH = "/net/reactivated/Fprint/Device/0"
 DEV = "net.reactivated.Fprint.Device"
 T0 = time.monotonic()
+FLOOD_IN = os.environ.get("FLOOD_IN")
+_flood_bus = []
+
+
+def flood_to(dest, n=300):
+    """Send n unicast junk signals to dest from a second connection."""
+    if not _flood_bus:
+        _flood_bus.append(dbus.bus.BusConnection(os.environ["DBUS_SYSTEM_BUS_ADDRESS"]))
+    b = _flood_bus[0]
+    for _ in range(n):
+        m = dbus.lowlevel.SignalMessage("/x", "x.y", "Z")
+        m.set_destination(dest)
+        b.send_message(m)
+    b.flush()
+
+
+def flood_in(method, caller):
+    """FLOOD_IN=<method>: flood the caller from inside that method handler (before it returns)."""
+    if FLOOD_IN == method and caller:
+        flood_to(caller)
+        print("FLOOD in " + method, flush=True)
 
 
 class Manager(dbus.service.Object):
@@ -55,8 +78,9 @@ class Manager(dbus.service.Object):
 class Logind(dbus.service.Object):
     preparing = False
 
-    @dbus.service.method("org.freedesktop.DBus.Properties", in_signature="ss", out_signature="v")
-    def Get(self, iface, name):
+    @dbus.service.method("org.freedesktop.DBus.Properties", in_signature="ss", out_signature="v", sender_keyword="caller")
+    def Get(self, iface, name, caller=None):
+        flood_in("Get", caller)
         return dbus.Boolean(self.preparing)
 
     @dbus.service.signal("org.freedesktop.login1.Manager", signature="b")
@@ -85,19 +109,22 @@ class Device(dbus.service.Object):
     def log(self, what):
         print(int((time.monotonic() - T0) * 1000), what, flush=True)
 
-    @dbus.service.method(DEV, in_signature="s")
-    def Claim(self, user):
+    @dbus.service.method(DEV, in_signature="s", sender_keyword="caller")
+    def Claim(self, user, caller=None):
+        flood_in("Claim", caller)
         self.claimed = True
         self.log("Claim")
 
-    @dbus.service.method(DEV)
-    def Release(self):
+    @dbus.service.method(DEV, sender_keyword="caller")
+    def Release(self, caller=None):
+        flood_in("Release", caller)
         self.claimed = False
         self.log("Release")
 
     @dbus.service.method(DEV, in_signature="s", sender_keyword="caller")
     def VerifyStart(self, finger, caller=None):
         self.caller = caller
+        flood_in("VerifyStart", caller)
         if not self.claimed:
             self.log("VerifyStart REFUSED ClaimDevice")
             raise dbus.exceptions.DBusException(
@@ -114,8 +141,9 @@ class Device(dbus.service.Object):
             status = self.statuses.pop(0)
             GLib.timeout_add(400, self.emit, status)
 
-    @dbus.service.method(DEV)
-    def VerifyStop(self):
+    @dbus.service.method(DEV, sender_keyword="caller")
+    def VerifyStop(self, caller=None):
+        flood_in("VerifyStop", caller)
         self.verifying = False
         self.log("VerifyStop")
 
