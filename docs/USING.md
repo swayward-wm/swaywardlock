@@ -299,6 +299,12 @@ not permission to omit checks. The gate prints each step duration; use pytest's 
 to inspect slow cases. The suite runs in parallel with a separate compositor and runtime directory
 per test. The migration preserved the existing assertions and temporal checks.
 
+
+Review loops and stress counts live behind env vars with a small default (see
+`FPRINT_LOOPS` in `tests/e2e/test_auth_input.py`); run the large counts by
+hand, not in CI. Test-count and wall-time totals belong in any PR that
+touches `tests/e2e`. History is in [`test-health`](test-health/2026-10-28-course-check.md).
+
 For a targeted slow check after building the debug test-auth executable:
 
 ```sh
@@ -328,3 +334,18 @@ Builds stay private to this checkout: the gate overrides inherited `CARGO_TARGET
 share a writable target across workspaces. The sequential default run can reuse its warm
 test-auth build; standalone slow builds it independently. CI caches dependency downloads
 only; no shared target or compiler-cache service is required.
+
+
+## Review
+
+Review rounds are recorded as mu tasks: one per round, with the finding, the
+fix and the verdict, so they survive in the tracker. The pull request body
+carries one line:
+
+```text
+review: independent review, 2 rounds, 1 finding fixed (dead-key text under a locked Ctrl)
+```
+
+Severity: `high` = fix and re-review, `medium` = fix with evidence in the
+pull request, `low` = one batch of its own. Carry anything left over into a
+`docs/test-health/` report rather than leaving it open.
