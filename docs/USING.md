@@ -69,8 +69,8 @@ Prebuilt x86_64 packages are on the [release page](https://github.com/swayward-w
 | File | For |
 |---|---|
 | `swaywardlock_VERSION_amd64.deb` | Ubuntu 24.04 |
-| `swaywardlock-VERSION-fedora43-x86_64.rpm` | Fedora 43 |
 | `swaywardlock-VERSION-fedora44-x86_64.rpm` | Fedora 44 |
+| `swaywardlock-VERSION-fedora45-x86_64.rpm` | Fedora 45 |
 | `swaywardlock-VERSION-arch-x86_64.pkg.tar.zst` | Arch |
 | `swaywardlock-VERSION-ubuntu24.04-x86_64.tar.gz` | prebuilt binaries, with a `.sha256` |
 | `swaywardlock-VERSION-vendored-dependencies.tar.xz` | the Rust dependencies, for building offline |
@@ -83,7 +83,8 @@ and `--help`, and a search of the installed binary for the test-auth password an
 glibc 2.39 and the libraries listed in its `RUNTIME.txt`.
 
 ```
-sudo dnf install ./swaywardlock-VERSION-fedora44-x86_64.rpm       # Fedora (use fedora43 on 43)
+sudo dnf install ./swaywardlock-VERSION-fedora44-x86_64.rpm       # Fedora 44
+sudo dnf install ./swaywardlock-VERSION-fedora45-x86_64.rpm       # Fedora 45
 sudo pacman -U swaywardlock-VERSION-arch-x86_64.pkg.tar.zst       # Arch
 sudo apt install ./swaywardlock_VERSION_amd64.deb                 # Ubuntu 24.04
 ```
@@ -110,7 +111,7 @@ no design document; see its `RUNTIME.txt`.)
 
 The community-maintained `flake.nix` follows swayward's release/default, debug, checks,
 dev shell, formatter and overlay structure. `flake.lock` pins the same nixpkgs revision
-as swayward. Package versions come from Cargo (`26.10.0-beta.1`), not the checkout revision.
+as swayward. Package versions come from Cargo (`26.10.0-beta.2`), not the checkout revision.
 Both packages use real PAM; **neither enables `test-auth`**.
 
 ```sh

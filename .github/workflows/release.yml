@@ -211,7 +211,7 @@ jobs:
       matrix:
         # Fedora supports two releases at a time. Build for both, so a package
         # never targets an end-of-life release.
-        fedora: [43, 44]
+        fedora: [44, 45]
     container: fedora:${{ matrix.fedora }}
     steps:
       - name: Install RPM tooling
@@ -269,7 +269,7 @@ jobs:
     runs-on: ubuntu-24.04
     strategy:
       matrix:
-        fedora: [43, 44]
+        fedora: [44, 45]
     container: fedora:${{ matrix.fedora }}
     steps:
       - uses: actions/checkout@v6
